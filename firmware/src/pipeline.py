@@ -413,7 +413,7 @@ def _poll_yandex_operation(
 def parse_yandex_json_to_md(
     pages: list[dict] | None = None,
     json_path: str | Path | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], list[tuple[int, int]]]:
     """Разобрать Yandex OCR JSON в Markdown + список картинок.
 
     Приоритет:
@@ -423,12 +423,10 @@ def parse_yandex_json_to_md(
       3. Поле pictures — список bounding box'ов изображений
       4. Поле blocks — fallback, если markdown пуст
 
-    Args:
-        json_path: Путь к сохранённому JSON (используется, если pages None).
-        pages: Список страниц (от send_to_yandex_ocr).
-
     Returns:
-        (markdown_text, pictures_list)
+        (markdown_text, pictures_list, page_boundaries)
+        page_boundaries: [(start_line, end_line), ...] для каждой страницы
+                        в финальном md_text (0-индексированные строки, end exclusive)
         pictures_list: [{"page": int, "bbox": {"vertices": [...]}, ...}]
     """
     if pages is None:
@@ -436,7 +434,7 @@ def parse_yandex_json_to_md(
             pages = json.load(f)
 
     if not pages:
-        return "", []
+        return "", [], []
 
     # Извлекаем структурированные таблицы из cells
     structured_tables = _parse_structured_tables_per_page(pages)
@@ -458,26 +456,40 @@ def parse_yandex_json_to_md(
         tables_on_page = structured_tables.get(page_idx, [])
 
         if tables_on_page:
-            # Находим позицию первой таблицы в markdown (по секциям)
-            # Если таблицы были и их удалили — вставляем на их место
+            # Находим позиции всех удалённых таблиц в markdown
             orig_sections = _find_md_table_sections(md)
             if orig_sections:
-                # Вставляем структурированные таблицы на место первой удалённой
-                insert_line = orig_sections[0][0]
                 lines = page_text.split("\n")
-                insert_pos = min(insert_line, len(lines))
 
-                # Собираем все таблицы с примечаниями
-                table_blocks = []
-                for md_table, note_text in tables_on_page:
-                    block = md_table
-                    if note_text:
-                        block += f"\n\n> {note_text}"
-                    table_blocks.append(block)
+                if len(orig_sections) == len(tables_on_page):
+                    # Вставляем каждую структурированную таблицу
+                    # на место соответствующей удалённой raw-таблицы
+                    # Идём снизу вверх, чтобы не сбивать индексы
+                    for sec, (md_table, note_text) in reversed(
+                        list(zip(orig_sections, tables_on_page))
+                    ):
+                        block = md_table
+                        if note_text:
+                            block += f"\n\n> {note_text}"
+                        insert_line = min(sec[0], len(lines))
+                        lines.insert(insert_line, "")
+                        lines.insert(insert_line, block)
+                else:
+                    # Количество не совпадает — fallback: все на место первой
+                    insert_line = orig_sections[0][0]
+                    insert_pos = min(insert_line, len(lines))
 
-                tables_section = "\n\n".join(table_blocks)
-                lines.insert(insert_pos, "")
-                lines.insert(insert_pos, tables_section)
+                    table_blocks = []
+                    for md_table, note_text in tables_on_page:
+                        block = md_table
+                        if note_text:
+                            block += f"\n\n> {note_text}"
+                        table_blocks.append(block)
+
+                    tables_section = "\n\n".join(table_blocks)
+                    lines.insert(insert_pos, "")
+                    lines.insert(insert_pos, tables_section)
+
                 page_text = "\n".join(lines)
             else:
                 # Таблиц в markdown не было, но структурированные есть
@@ -500,17 +512,31 @@ def parse_yandex_json_to_md(
     # Собираем окончательный текст
     if page_parts:
         md_text = "\n\n".join(page_parts)
+        # Вычисляем реальные границы страниц в финальном тексте
+        # \n\n добавляет одну пустую строку между частями
+        page_boundaries = []
+        pos = 0
+        for idx, part in enumerate(page_parts):
+            start = pos
+            end = start + part.count("\n") + 1  # end exclusive
+            page_boundaries.append((start, end))
+            pos = end + 1  # +1 for the \n\n separator's extra \n
     else:
+        md_text = ""
+        page_boundaries = []
+
+    if not md_text.strip():
         # Fallback: если все страницы пусты — blocks
         md_text = _extract_markdown_field(pages)
         if not md_text.strip():
             log.warning("  Поле markdown пусто — fallback на blocks")
             md_text = _parse_blocks_to_text(pages)
+            page_boundaries = []  # неизвестны при fallback
 
     # Шаг: картинки
     pictures = _parse_pictures_from_json(pages)
 
-    return md_text, pictures
+    return md_text, pictures, page_boundaries
 
 
 def _extract_markdown_field(pages: list[dict]) -> str:
@@ -607,8 +633,10 @@ def _detect_and_remove_note_row(
 ) -> tuple[list[list[str]], str]:
     """Обнаружить и удалить строку 'Примечание' из матрицы таблицы.
 
-    Проверяет последнюю строку: если первая ячейка начинается с 'Примечание'
-    или 'Примечания', извлекает её и возвращает как note_text.
+    Проверяет последнюю строку двумя способами:
+    1. Первая ячейка начинается с 'Примечание' или 'Примечания'
+    2. Все непустые ячейки последней строки имеют одинаковый текст
+       (это примечание, вынесенное во все колонки)
 
     Returns:
         (matrix_without_note, note_text)
@@ -637,6 +665,14 @@ def _detect_and_remove_note_row(
         if extra:
             note_text += " " + " ".join(extra)
         return matrix[:-1], note_text
+
+    # Альтернативное условие: все непустые ячейки последней строки
+    # имеют одинаковый текст — это примечание
+    non_empty = [c.strip() for c in last_row if c.strip()]
+    if len(non_empty) >= 2:
+        first_text = non_empty[0]
+        if all(c == first_text for c in non_empty[1:]):
+            return matrix[:-1], first_text
 
     return matrix, ""
 
@@ -992,6 +1028,7 @@ def _insert_images_into_md(
     md_text: str,
     extracted: list[dict],
     pages: list[dict] = None,
+    page_boundaries: list[tuple[int, int]] | None = None,
 ) -> str:
     """Вставить ссылки на извлечённые изображения в Markdown по Y-координатам.
 
@@ -999,14 +1036,17 @@ def _insert_images_into_md(
     затем вставляет ссылки ![fig_N](image/fig_N.ext) на позиции,
     пропорциональные Y-положению изображения на странице.
 
-    ВАЖНО: работает с уже обработанным md_text (таблицы заменены),
-    использует pages только для получения page_height (масштабирования Y).
+    ВАЖНО: использует page_boundaries для точного определения границ страниц
+    в уже обработанном md_text. Если page_boundaries не передан — использует
+    пропорциональное отображение (менее точное).
 
     Args:
         md_text: Уже обработанный Markdown-текст (с заменёнными таблицами).
         extracted: Список от extract_images_from_pdf().
         pages: Список страниц от send_to_yandex_ocr() — нужен для
                Y-координат и размеров страниц.
+        page_boundaries: [(start_line, end_line), ...] — реальные границы
+                         страниц в md_text (end exclusive).
 
     Returns:
         Markdown с вставленными ссылками на изображения.
@@ -1034,39 +1074,11 @@ def _insert_images_into_md(
         parts.append("")
         return "\n".join(parts)
 
-    # Группируем изображения по страницам
-    imgs_by_page: dict[int, list[dict]] = {}
-    for img in sorted_imgs:
-        pg = img["page"]
-        if pg not in imgs_by_page:
-            imgs_by_page[pg] = []
-        imgs_by_page[pg].append(img)
-
-    # Считаем количество строк в raw-тексте каждой страницы для пропорций
-    raw_line_counts: dict[int, int] = {}
-    total_raw_lines = 0
-    for pg_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        md = ta.get("markdown", "").strip()
-        n = md.count("\n") + 1 if md else 0
-        raw_line_counts[pg_idx] = n
-        total_raw_lines += n
-
-    # Работаем с уже обработанным md_text
     lines = md_text.split("\n")
     total_lines = len(lines)
 
-    if total_lines == 0 or total_raw_lines == 0:
+    if total_lines == 0:
         return md_text
-
-    # Для каждой страницы вычисляем, с какой строки она начинается в md_text
-    # (пропорционально доле её raw-текста)
-    page_start_line: dict[int, int] = {}
-    cum_raw = 0
-    for pg_idx in sorted(raw_line_counts.keys()):
-        fraction_start = cum_raw / total_raw_lines if total_raw_lines > 0 else 0
-        page_start_line[pg_idx] = int(fraction_start * total_lines)
-        cum_raw += raw_line_counts[pg_idx]
 
     # Вставляем изображения
     result_lines = list(lines)
@@ -1082,18 +1094,44 @@ def _insert_images_into_md(
         y_frac = y_center / page_height if page_height > 0 else 0.5
         y_frac = max(0.05, min(0.95, y_frac))
 
-        page_lines_count = raw_line_counts.get(pg, 1)
-        line_offset = int(y_frac * page_lines_count)
+        if page_boundaries and pg < len(page_boundaries):
+            # Используем реальные границы страницы в обработанном тексте
+            start, end = page_boundaries[pg]
+            end = min(end, total_lines)
+            page_line_count = end - start
+            if page_line_count <= 0:
+                target_line = start
+            else:
+                target_line = start + int(y_frac * page_line_count)
+        else:
+            # Fallback: пропорциональное отображение
+            raw_line_counts: dict[int, int] = {}
+            total_raw_lines = 0
+            for pg_idx, page in enumerate(pages):
+                ta_local = page.get("result", {}).get("textAnnotation", {})
+                md = ta_local.get("markdown", "").strip()
+                n = md.count("\n") + 1 if md else 0
+                raw_line_counts[pg_idx] = n
+                total_raw_lines += n
 
-        # Пропорционально отображаем на md_text
-        start = page_start_line.get(pg, 0)
-        end = start + int(page_lines_count / total_raw_lines * total_lines) \
-            if total_raw_lines > 0 else total_lines
-        end = min(end, total_lines - 1)
+            if total_raw_lines == 0:
+                continue
 
-        target_line = start + int(y_frac * (end - start))
+            page_start_line: dict[int, int] = {}
+            cum_raw = 0
+            for pg_idx in sorted(raw_line_counts.keys()):
+                fraction_start = cum_raw / total_raw_lines if total_raw_lines > 0 else 0
+                page_start_line[pg_idx] = int(fraction_start * total_lines)
+                cum_raw += raw_line_counts[pg_idx]
+
+            start = page_start_line.get(pg, 0)
+            page_lines_count = raw_line_counts.get(pg, 1)
+            end = start + int(page_lines_count / total_raw_lines * total_lines) \
+                if total_raw_lines > 0 else total_lines
+            end = min(end, total_lines - 1)
+            target_line = start + int(y_frac * (end - start))
+
         target_line = max(0, min(total_lines - 1, target_line))
-
         img_md = f"![fig_{img['fig_num']}](image/{img['filename']})"
         insertions.append((target_line, img_md))
 
@@ -1126,9 +1164,13 @@ def _simplify_math_commands(text: str) -> str:
     text = re.sub(r"\\mathfrak\s*\{\s*([^}]+?)\s*\}", r"\1", text)
     text = re.sub(r"\\mathrm\s*\{\s*_([^}]+?)\s*\}", r"\\text{\1}", text)
     text = re.sub(r"\\mathrm\s*\{\s*([^}]+?)\s*\}", r"\\text{\1}", text)
-    # \tt — переключатель шрифта
+    # \\tt — переключатель шрифта
     text = re.sub(r"\\tt\s*", "", text)
     text = re.sub(r"\\tt\s*\{\s*([^}]+?)\s*\}", r"\1", text)
+    # \\sf — переключатель шрифта sans-serif, не нужен
+    text = re.sub(r"\\sf\s*", "", text)
+    # \\f — OCR-артефакт, невалидная LaTeX-команда
+    text = re.sub(r"\\f\s*", "", text)
     return text
 
 
@@ -2146,7 +2188,7 @@ def process_file(
         safe_write(json_path, json.dumps(pages, ensure_ascii=False, indent=2))
 
         # Этап 3: Парсинг JSON → Markdown
-        md_text, pictures = parse_yandex_json_to_md(pages=pages)
+        md_text, pictures, page_boundaries = parse_yandex_json_to_md(pages=pages)
 
         if not md_text.strip():
             log.warning("  Markdown пуст после парсинга JSON")
@@ -2161,7 +2203,7 @@ def process_file(
                 pdf_path, pictures, img_dir, pages=pages,
             )
             # Вставляем ссылки на изображения в текст по координатам
-            md_text = _insert_images_into_md(md_text, extracted, pages=pages)
+            md_text = _insert_images_into_md(md_text, extracted, pages=pages, page_boundaries=page_boundaries)
             log.info(f"  Извлечено изображений: {len(extracted)}")
         else:
             log.info("  Нет pictures для извлечения")
