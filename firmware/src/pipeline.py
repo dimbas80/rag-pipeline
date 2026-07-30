@@ -406,8 +406,83 @@ def _poll_yandex_operation(
     )
 
 
+# ── Вспомогательные: извлечение подписей таблиц ──────────────────────────
+
+
+def _normalize_spaced_text(text: str) -> str:
+    """Схлопнуть пробелы внутри слова 'Т а б л и ц а' → 'Таблица'.
+
+    Yandex OCR иногда ставит пробелы между буквами кириллицы.
+    """
+    # Специфичный паттерн: буквы с пробелами между ними
+    # "Т а б л и ц а" → "Таблица"
+    text = re.sub(
+        r"Т\s+а\s+б\s+л\s+и\s+ц\s+а",
+        "Таблица",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # "П р и м е ч а н и е" → "Примечание"
+    text = re.sub(
+        r"П\s+р\s+и\s+м\s+е\s+ч\s+а\s+н\s+и\s+[ея]",
+        "Примечание",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # "Р и с у н о к" → "Рисунок"
+    text = re.sub(
+        r"Р\s+и\s+с\s+у\s+н\s+о\s+к",
+        "Рисунок",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _extract_table_captions_from_text(md_text: str) -> list[str]:
+    """Извлечь подписи таблиц из markdown-текста.
+
+    Ищет строки, содержащие 'Т а б л и ц а' (с пробелами между буквами —
+    OCR-артефакт Yandex). Возвращает нормализованные подписи
+    в порядке появления на странице.
+
+    Returns:
+        list[str] — например ['Таблица 7.5 — Предельные отклонения', ...]
+    """
+    caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
+    captions = []
+    for line in md_text.split("\n"):
+        if caption_pattern.search(line):
+            # Нормализуем: схлопываем пробелы и убираем лишние
+            normalized = _normalize_spaced_text(line.strip())
+            normalized = re.sub(r"\s+", " ", normalized)
+            captions.append(normalized)
+    return captions
+
+
+def _extract_table_captions_from_blocks(ta: dict) -> list[str]:
+    """Извлечь подписи из блоков LAYOUT_TYPE_CAPTION.
+
+    Returns:
+        list[str] — подписи в порядке появления в блоках.
+    """
+    blocks = ta.get("blocks", [])
+    captions = []
+    for block in blocks:
+        if block.get("layoutType") == "LAYOUT_TYPE_CAPTION":
+            text_parts = []
+            for line_data in block.get("lines", []):
+                text = line_data.get("text", "").strip()
+                if text:
+                    text_parts.append(text)
+            caption = " ".join(text_parts).strip()
+            if caption:
+                captions.append(caption)
+    return captions
+
+
 # ═══════════════════════════════════════════════════════════════════════════
-# 3. JSON → Markdown Parser
+# 3. JSON → Markdown Parser (основные функции)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def parse_yandex_json_to_md(
@@ -416,12 +491,12 @@ def parse_yandex_json_to_md(
 ) -> tuple[str, list[dict], list[tuple[int, int]]]:
     """Разобрать Yandex OCR JSON в Markdown + список картинок.
 
-    Приоритет:
-      1. Поле markdown (из math-markdown модели) — основной текст
-      2. Поле tables — структурированные таблицы (вставляются в текст)
-         взамен битых таблиц из markdown-поля
-      3. Поле pictures — список bounding box'ов изображений
-      4. Поле blocks — fallback, если markdown пуст
+    НОВЫЙ АЛГОРИТМ (упрощённый):
+    Для каждой страницы:
+      1. Взять markdown-поле → удалить ВСЕ строки с | (таблицы) → «текстовый каркас»
+      2. Взять структурированные таблицы из textAnnotation.tables[]
+      3. Каждую таблицу вставить в КОНЕЦ страницы (после её текста)
+         с подписью-заголовком непосредственно перед таблицей
 
     Returns:
         (markdown_text, pictures_list, page_boundaries)
@@ -436,11 +511,8 @@ def parse_yandex_json_to_md(
     if not pages:
         return "", [], []
 
-    # Извлекаем структурированные таблицы из cells
-    structured_tables = _parse_structured_tables_per_page(pages)
-
-    # Собираем Markdown постранично, заменяя битые таблицы
     page_parts: list[str] = []
+    page_boundaries: list[tuple[int, int]] = []
 
     for page_idx, page in enumerate(pages):
         ta = page.get("result", {}).get("textAnnotation", {})
@@ -449,72 +521,74 @@ def parse_yandex_json_to_md(
         if not md.strip():
             continue
 
-        # Удаляем битые Markdown-таблицы из raw-текста страницы
-        page_text = _remove_md_table_sections(md.strip())
+        # 1. Извлекаем подписи из исходного markdown (до удаления таблиц)
+        text_captions = _extract_table_captions_from_text(md)
+        block_captions = _extract_table_captions_from_blocks(ta)
 
-        # Вставляем структурированные таблицы вместо удалённых
-        tables_on_page = structured_tables.get(page_idx, [])
+        # 2. Удаляем ВСЕ строки с | (сырые таблицы Yandex) и строки-подписи
+        caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
+        text_lines = []
+        for line in md.split("\n"):
+            stripped = line.strip()
+            # Пропускаем строки таблиц (начинаются с |)
+            if stripped.startswith("|"):
+                continue
+            # Пропускаем строки подписей (будем вставлять перед таблицами)
+            if caption_pattern.search(stripped):
+                continue
+            text_lines.append(line)
+        page_text = "\n".join(text_lines).strip()
 
-        if tables_on_page:
-            # Находим позиции всех удалённых таблиц в markdown
-            orig_sections = _find_md_table_sections(md)
-            if orig_sections:
-                lines = page_text.split("\n")
+        # 3. Обрабатываем структурированные таблицы
+        raw_tables = ta.get("tables", [])
+        if raw_tables:
+            page_text += "\n\n"
+            for i, table in enumerate(raw_tables):
+                cells = table.get("cells", [])
+                if not cells:
+                    continue
 
-                if len(orig_sections) == len(tables_on_page):
-                    # Вставляем каждую структурированную таблицу
-                    # на место соответствующей удалённой raw-таблицы
-                    # Идём снизу вверх, чтобы не сбивать индексы
-                    for sec, (md_table, note_text) in reversed(
-                        list(zip(orig_sections, tables_on_page))
-                    ):
-                        block = md_table
-                        if note_text:
-                            block += f"\n\n> {note_text}"
-                        insert_line = min(sec[0], len(lines))
-                        lines.insert(insert_line, "")
-                        lines.insert(insert_line, block)
-                else:
-                    # Количество не совпадает — fallback: все на место первой
-                    insert_line = orig_sections[0][0]
-                    insert_pos = min(insert_line, len(lines))
+                row_count = int(table.get("rowCount", 0))
+                col_count = int(table.get("columnCount", 0))
 
-                    table_blocks = []
-                    for md_table, note_text in tables_on_page:
-                        block = md_table
-                        if note_text:
-                            block += f"\n\n> {note_text}"
-                        table_blocks.append(block)
+                matrix = _build_cell_matrix(cells, row_count, col_count)
+                if not matrix:
+                    continue
 
-                    tables_section = "\n\n".join(table_blocks)
-                    lines.insert(insert_pos, "")
-                    lines.insert(insert_pos, tables_section)
+                # Объединяем двухстрочный заголовок
+                matrix = _merge_table_headers(matrix)
 
-                page_text = "\n".join(lines)
-            else:
-                # Таблиц в markdown не было, но структурированные есть
-                # Добавляем их в конец текста страницы
-                table_blocks = []
-                for md_table, note_text in tables_on_page:
-                    block = md_table
-                    if note_text:
-                        block += f"\n\n> {note_text}"
-                    table_blocks.append(block)
+                # Извлекаем примечание из последней строки
+                matrix, note_text = _detect_and_remove_note_row(matrix)
 
-                page_text = page_text.rstrip() + "\n\n" + "\n\n".join(table_blocks)
-        else:
-            # Нет структурированных таблиц на этой странице
-            # Просто очищаем битые таблицы из текста
-            pass
+                if len(matrix) < 2:
+                    log.debug(f"  Таблица стр.{page_idx + 1}: только заголовок — пропуск")
+                    continue
 
-        page_parts.append(page_text.strip())
+                md_table = _matrix_to_md_table(matrix)
+
+                # Подпись: текстовая или из блоков LAYOUT_TYPE_CAPTION
+                caption = ""
+                if i < len(text_captions):
+                    caption = text_captions[i]
+                elif i < len(block_captions):
+                    caption = block_captions[i]
+
+                # Вставляем подпись непосредственно перед таблицей
+                if caption:
+                    page_text += f"\n\n*{caption}*"
+                page_text += "\n\n" + md_table
+
+                # Примечание после таблицы
+                if note_text:
+                    page_text += f"\n\n> {note_text}"
+
+        page_parts.append(page_text)
 
     # Собираем окончательный текст
     if page_parts:
         md_text = "\n\n".join(page_parts)
         # Вычисляем реальные границы страниц в финальном тексте
-        # \n\n добавляет одну пустую строку между частями
-        page_boundaries = []
         pos = 0
         for idx, part in enumerate(page_parts):
             start = pos
@@ -550,21 +624,31 @@ def _extract_markdown_field(pages: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _build_cell_matrix(cells: list[dict]) -> list[list[str]]:
+def _build_cell_matrix(
+    cells: list[dict],
+    row_count: int = 0,
+    col_count: int = 0,
+) -> list[list[str]]:
     """Построить матрицу ячеек из списка cells Yandex OCR.
 
     Учитывает rowSpan/columnSpan. Пустые spanned-ячейки заполняются
     текстом из первой ячейки объединения.
+    Если row_count/col_count переданы — использует их как размеры матрицы
+    (гарантирует, что пустые ячейки на границах не теряются).
     """
     if not cells:
         return []
 
-    max_row = max(
-        int(c.get("rowIndex", 0)) + int(c.get("rowSpan", 1)) for c in cells
-    )
-    max_col = max(
-        int(c.get("columnIndex", 0)) + int(c.get("columnSpan", 1)) for c in cells
-    )
+    if row_count > 0 and col_count > 0:
+        max_row = row_count
+        max_col = col_count
+    else:
+        max_row = max(
+            int(c.get("rowIndex", 0)) + int(c.get("rowSpan", 1)) for c in cells
+        )
+        max_col = max(
+            int(c.get("columnIndex", 0)) + int(c.get("columnSpan", 1)) for c in cells
+        )
     if max_row == 0 or max_col == 0:
         return []
 
@@ -729,7 +813,7 @@ def _parse_structured_tables_per_page(
             if not cells:
                 continue
 
-            matrix = _build_cell_matrix(cells)
+            matrix = _build_cell_matrix(cells, raw_table.get("rowCount", 0), raw_table.get("columnCount", 0))
             if not matrix:
                 continue
 
