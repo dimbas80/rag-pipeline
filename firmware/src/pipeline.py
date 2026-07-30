@@ -457,7 +457,7 @@ def parse_yandex_json_to_md(
       4. Элементы рендерятся по типу:
          - block → _block_to_md() (форматирование по layoutType)
          - table → _table_to_md() + подпись от _find_table_caption_for()
-         - picture → "<!-- image placeholder -->"
+         - picture -> '@@IMAGE_N@@' placeholder (заменяется _insert_images_into_md)
 
     Returns:
         (markdown_text, pictures_list, page_boundaries)
@@ -475,6 +475,7 @@ def parse_yandex_json_to_md(
     page_parts: list[str] = []
     page_boundaries: list[tuple[int, int]] = []
     pictures: list[dict] = []
+    pic_counter = 0  # счётчик для @@IMAGE_N@@ плейсхолдеров (по Y-порядку)
 
     for page_idx, page in enumerate(pages):
         ta = page.get("result", {}).get("textAnnotation", {})
@@ -562,7 +563,8 @@ def parse_yandex_json_to_md(
                     if note_text:
                         page_lines.append(f"> {note_text}")
             elif etype == "picture":
-                page_lines.append("<!-- image placeholder -->")
+                page_lines.append(f"@@IMAGE_{pic_counter}@@")
+                pic_counter += 1
 
         page_text = "\n\n".join(page_lines).strip()
         if page_text:
@@ -581,6 +583,9 @@ def parse_yandex_json_to_md(
     else:
         md_text = ""
         page_boundaries = []
+
+    # Склеиваем разорванные между страницами таблицы (Окончание/Продолжение)
+    md_text = _stitch_continuation_tables(md_text)
 
     return md_text, pictures, page_boundaries
 
@@ -645,6 +650,9 @@ def _block_to_md(block: dict) -> str:
         return f"- {raw_text}"
 
     # LAYOUT_TYPE_TEXT, LAYOUT_TYPE_UNSPECIFIED, и всё остальное
+    # Если текст — LaTeX-формула (начинается и заканчивается на $), обернуть в $$
+    if raw_text.startswith("$") and raw_text.endswith("$"):
+        return f"$$\n{raw_text[1:-1]}\n$$"
     return raw_text
 
 
@@ -939,6 +947,133 @@ def _matrix_to_md_table(matrix: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _stitch_continuation_tables(md_text: str) -> str:
+    """Склеить таблицы, разорванные между страницами (Окончание/Продолжение).
+
+    Ищет пары последовательных Markdown-таблиц, где в тексте между ними
+    встречается «Окончание таблицы N» или «Продолжение таблицы N».
+    Строки данных второй таблицы добавляются к первой, а подпись-продолжение
+    и дублирующийся заголовок удаляются.
+
+    Args:
+        md_text: Markdown-текст с возможными разорванными таблицами.
+
+    Returns:
+        Текст со склеенными таблицами.
+    """
+    lines = md_text.split("\n")
+    if len(lines) < 6:
+        return md_text
+
+    # Находим все таблицы (строки с | ... |)
+    table_starts: list[int] = []
+    in_table = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            if not in_table:
+                table_starts.append(i)
+                in_table = True
+        else:
+            in_table = False
+
+    if len(table_starts) < 2:
+        return md_text
+
+    def _get_table_end(start: int) -> int:
+        """Вернуть индекс строки ПОСЛЕ последней строки таблицы (end exclusive)."""
+        i = start
+        while i < len(lines) and lines[i].strip().startswith("|"):
+            i += 1
+        return i
+
+    def _extract_table_num(text: str) -> str | None:
+        """Извлечь номер таблицы из текста вида «Окончание таблицы 7.6»."""
+        # Сначала ищем «Окончание таблицы N» или «Продолжение таблицы N»
+        m = re.search(
+            r"(?:Окончани[ея]|Продолжени[ее]|Продолж\.?)\s+"
+            r"(?:таблиц[аы]|table|табл\.?)\s+"
+            r"(\d+(?:\.\d+)*)",
+            text, re.IGNORECASE,
+        )
+        if m:
+            return m.group(1)
+        # Альтернатива: просто «Таблица N» (например, «*Таблица 7.6 — Пример*»)
+        m2 = re.search(
+            r"(?:Таблиц[аы]|table|табл\.?)\s+"
+            r"(\d+(?:\.\d+)*)",
+            text, re.IGNORECASE,
+        )
+        if m2:
+            return m2.group(1)
+        return None
+
+    # Собираем таблицы с их номерами
+    tables_info: list[dict] = []
+    for start in table_starts:
+        end = _get_table_end(start)
+        prev_table_end = tables_info[-1]["end"] if tables_info else 0
+        before_lines = lines[prev_table_end:start]
+        before_text = " ".join(l.strip() for l in before_lines if l.strip())
+
+        table_num = _extract_table_num(before_text)
+        has_continuation = any(
+            kw in before_text.lower()
+            for kw in ["окончани", "продолжени", "продолж."]
+        )
+
+        tables_info.append({
+            "start": start,
+            "end": end,
+            "lines": lines[start:end],
+            "table_num": table_num,
+            "has_continuation": has_continuation,
+            "before_text": before_text,
+        })
+
+    # Склеиваем
+    result: list[str] = []
+    i = 0
+    while i < len(tables_info):
+        t = tables_info[i]
+
+        if t["has_continuation"] and t["table_num"] and i > 0:
+            prev = tables_info[i - 1]
+            if prev["table_num"] == t["table_num"]:
+                # Нашли пару — склеиваем: данные из t добавляем к result
+                t_lines = t["lines"]
+                sep_idx = -1
+                for li, tl in enumerate(t_lines):
+                    if ":--" in tl or "---" in tl:
+                        sep_idx = li
+                        break
+                if sep_idx >= 0 and sep_idx + 1 < len(t_lines):
+                    data_lines = t_lines[sep_idx + 1:]
+                    # Пропускаем первую строку данных, если она дублирует
+                    # последнюю строку предыдущей таблицы
+                    if prev["lines"] and data_lines:
+                        last_prev = prev["lines"][-1].strip()
+                        first_data = data_lines[0].strip()
+                        if last_prev == first_data:
+                            data_lines = data_lines[1:]
+                    result.extend(data_lines)
+                i += 1
+                continue
+
+        # Не продолжение — добавляем как есть
+        prev_end = tables_info[i - 1]["end"] if i > 0 else 0
+        result.extend(lines[prev_end:t["start"]])
+        result.extend(t["lines"])
+        i += 1
+
+    # Добавляем остаток после последней таблицы
+    if tables_info:
+        last_end = tables_info[-1]["end"]
+        result.extend(lines[last_end:])
+
+    return "\n".join(result)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Извлечение изображений из PDF
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1093,26 +1228,22 @@ def _insert_images_into_md(
     pages: list[dict] = None,
     page_boundaries: list[tuple[int, int]] | None = None,
 ) -> str:
-    """Вставить ссылки на извлечённые изображения в Markdown по Y-координатам.
+    """Вставить ссылки на извлечённые изображения в Markdown, заменяя @@IMAGE_N@@ плейсхолдеры.
 
-    Сортирует изображения по страницам и Y-координате bounding box'а,
-    затем вставляет ссылки ![fig_N](image/fig_N.ext) на позиции,
-    пропорциональные Y-положению изображения на странице.
+    Плейсхолдеры @@IMAGE_0@@, @@IMAGE_1@@, ... создаются в parse_yandex_json_to_md()
+    в Y-отсортированном порядке. Извлечённые изображения (extracted) сортируются
+    по (page, Y) и заменяют соответствующие плейсхолдеры.
 
-    ВАЖНО: использует page_boundaries для точного определения границ страниц
-    в уже обработанном md_text. Если page_boundaries не передан — использует
-    пропорциональное отображение (менее точное).
+    Если изображение не удалось извлечь — плейсхолдер остаётся как есть.
 
     Args:
-        md_text: Уже обработанный Markdown-текст (с заменёнными таблицами).
+        md_text: Markdown-текст с плейсхолдерами @@IMAGE_N@@.
         extracted: Список от extract_images_from_pdf().
-        pages: Список страниц от send_to_yandex_ocr() — нужен для
-               Y-координат и размеров страниц.
-        page_boundaries: [(start_line, end_line), ...] — реальные границы
-                         страниц в md_text (end exclusive).
+        pages: Не используется (оставлено для совместимости).
+        page_boundaries: Не используется (оставлено для совместимости).
 
     Returns:
-        Markdown с вставленными ссылками на изображения.
+        Markdown с заменёнными ссылками на изображения.
     """
     if not extracted:
         return md_text
@@ -1126,89 +1257,17 @@ def _insert_images_into_md(
             return sum(ys) / len(ys)
         return 0
 
-    # Сортируем по странице и Y
+    # Сортируем по странице и Y — тот же порядок, что и плейсхолдеры
     sorted_imgs = sorted(extracted, key=lambda x: (x["page"], _get_y_center(x)))
 
-    if not pages:
-        # Fallback: в конец файла (legacy)
-        parts = [md_text.strip(), "", "---", ""]
-        for img in sorted_imgs:
-            parts.append(f"![fig_{img['fig_num']}](image/{img['filename']})")
-        parts.append("")
-        return "\n".join(parts)
+    # Заменяем @@IMAGE_N@@ на ![fig_N](image/fig_N.ext)
+    for idx, img in enumerate(sorted_imgs):
+        placeholder = f"@@IMAGE_{idx}@@"
+        replacement = f"![fig_{img['fig_num']}](image/{img['filename']})"
+        if placeholder in md_text:
+            md_text = md_text.replace(placeholder, replacement, 1)
 
-    lines = md_text.split("\n")
-    total_lines = len(lines)
-
-    if total_lines == 0:
-        return md_text
-
-    # Вставляем изображения
-    result_lines = list(lines)
-    insertions = []
-
-    for img in sorted_imgs:
-        pg = img["page"]
-        y_center = _get_y_center(img)
-
-        ta = pages[pg].get("result", {}).get("textAnnotation", {})
-        page_height = float(ta.get("height", 3095))
-
-        y_frac = y_center / page_height if page_height > 0 else 0.5
-        y_frac = max(0.05, min(0.95, y_frac))
-
-        if page_boundaries and pg < len(page_boundaries):
-            # Используем реальные границы страницы в обработанном тексте
-            start, end = page_boundaries[pg]
-            end = min(end, total_lines)
-            page_line_count = end - start
-            if page_line_count <= 0:
-                target_line = start
-            else:
-                target_line = start + int(y_frac * page_line_count)
-        else:
-            # Fallback: пропорциональное отображение на основе blocks
-            raw_line_counts: dict[int, int] = {}
-            total_raw_lines = 0
-            for pg_idx, page in enumerate(pages):
-                ta_local = page.get("result", {}).get("textAnnotation", {})
-                blocks = ta_local.get("blocks", [])
-                n = 0
-                for block in blocks:
-                    for line_data in block.get("lines", []):
-                        if line_data.get("text", "").strip():
-                            n += 1
-                raw_line_counts[pg_idx] = n
-                total_raw_lines += n
-
-            if total_raw_lines == 0:
-                continue
-
-            page_start_line: dict[int, int] = {}
-            cum_raw = 0
-            for pg_idx in sorted(raw_line_counts.keys()):
-                fraction_start = cum_raw / total_raw_lines if total_raw_lines > 0 else 0
-                page_start_line[pg_idx] = int(fraction_start * total_lines)
-                cum_raw += raw_line_counts[pg_idx]
-
-            start = page_start_line.get(pg, 0)
-            page_lines_count = raw_line_counts.get(pg, 1)
-            end = start + int(page_lines_count / total_raw_lines * total_lines) \
-                if total_raw_lines > 0 else total_lines
-            end = min(end, total_lines - 1)
-            target_line = start + int(y_frac * (end - start))
-
-        target_line = max(0, min(total_lines - 1, target_line))
-        img_md = f"![fig_{img['fig_num']}](image/{img['filename']})"
-        insertions.append((target_line, img_md))
-
-    # Вставляем снизу вверх
-    insertions.sort(key=lambda x: -x[0])
-    for target_line, img_md in insertions:
-        result_lines.insert(target_line, "")
-        result_lines.insert(target_line, img_md)
-
-    return "\n".join(result_lines)
+    return md_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
