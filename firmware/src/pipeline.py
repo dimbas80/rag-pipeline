@@ -419,6 +419,7 @@ def parse_yandex_json_to_md(
     Приоритет:
       1. Поле markdown (из math-markdown модели) — основной текст
       2. Поле tables — структурированные таблицы (вставляются в текст)
+         взамен битых таблиц из markdown-поля
       3. Поле pictures — список bounding box'ов изображений
       4. Поле blocks — fallback, если markdown пуст
 
@@ -437,20 +438,76 @@ def parse_yandex_json_to_md(
     if not pages:
         return "", []
 
-    # Шаг 1: извлекаем markdown текст
-    md_text = _extract_markdown_field(pages)
+    # Извлекаем структурированные таблицы из cells
+    structured_tables = _parse_structured_tables_per_page(pages)
 
-    # Шаг 2: если markdown пуст — fallback на blocks
-    if not md_text.strip():
-        log.warning("  Поле markdown пусто — fallback на blocks")
-        md_text = _parse_blocks_to_text(pages)
+    # Собираем Markdown постранично, заменяя битые таблицы
+    page_parts: list[str] = []
 
-    # Шаг 3: таблицы из structured data
-    tables_md = _parse_tables_from_json(pages, existing_md=md_text)
-    if tables_md:
-        md_text = md_text + "\n\n" + tables_md
+    for page_idx, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        md = ta.get("markdown", "")
 
-    # Шаг 4: картинки
+        if not md.strip():
+            continue
+
+        # Удаляем битые Markdown-таблицы из raw-текста страницы
+        page_text = _remove_md_table_sections(md.strip())
+
+        # Вставляем структурированные таблицы вместо удалённых
+        tables_on_page = structured_tables.get(page_idx, [])
+
+        if tables_on_page:
+            # Находим позицию первой таблицы в markdown (по секциям)
+            # Если таблицы были и их удалили — вставляем на их место
+            orig_sections = _find_md_table_sections(md)
+            if orig_sections:
+                # Вставляем структурированные таблицы на место первой удалённой
+                insert_line = orig_sections[0][0]
+                lines = page_text.split("\n")
+                insert_pos = min(insert_line, len(lines))
+
+                # Собираем все таблицы с примечаниями
+                table_blocks = []
+                for md_table, note_text in tables_on_page:
+                    block = md_table
+                    if note_text:
+                        block += f"\n\n> {note_text}"
+                    table_blocks.append(block)
+
+                tables_section = "\n\n".join(table_blocks)
+                lines.insert(insert_pos, "")
+                lines.insert(insert_pos, tables_section)
+                page_text = "\n".join(lines)
+            else:
+                # Таблиц в markdown не было, но структурированные есть
+                # Добавляем их в конец текста страницы
+                table_blocks = []
+                for md_table, note_text in tables_on_page:
+                    block = md_table
+                    if note_text:
+                        block += f"\n\n> {note_text}"
+                    table_blocks.append(block)
+
+                page_text = page_text.rstrip() + "\n\n" + "\n\n".join(table_blocks)
+        else:
+            # Нет структурированных таблиц на этой странице
+            # Просто очищаем битые таблицы из текста
+            pass
+
+        page_parts.append(page_text.strip())
+
+    # Собираем окончательный текст
+    if page_parts:
+        md_text = "\n\n".join(page_parts)
+    else:
+        # Fallback: если все страницы пусты — blocks
+        md_text = _extract_markdown_field(pages)
+        if not md_text.strip():
+            log.warning("  Поле markdown пусто — fallback на blocks")
+            md_text = _parse_blocks_to_text(pages)
+
+    # Шаг: картинки
     pictures = _parse_pictures_from_json(pages)
 
     return md_text, pictures
@@ -467,73 +524,124 @@ def _extract_markdown_field(pages: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _parse_tables_from_json(pages: list[dict], existing_md: str = "") -> str:
-    """Извлечь структурированные таблицы из поля 'tables'.
+def _build_cell_matrix(cells: list[dict]) -> list[list[str]]:
+    """Построить матрицу ячеек из списка cells Yandex OCR.
 
-    Yandex возвращает cells с rowIndex, columnIndex, text, columnSpan, rowSpan.
-    Конвертирует в Markdown-таблицы.
-
-    Если передан existing_md, проверяет дубликаты: если содержимое таблицы
-    (первые 2 строки) уже присутствует в existing_md — пропускает.
+    Учитывает rowSpan/columnSpan. Пустые spanned-ячейки заполняются
+    текстом из первой ячейки объединения.
     """
-    all_tables = []
+    if not cells:
+        return []
 
-    for page_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        tables = ta.get("tables", [])
-        for table in tables:
-            cells = table.get("cells", [])
-            if not cells:
-                continue
+    max_row = max(
+        int(c.get("rowIndex", 0)) + int(c.get("rowSpan", 1)) for c in cells
+    )
+    max_col = max(
+        int(c.get("columnIndex", 0)) + int(c.get("columnSpan", 1)) for c in cells
+    )
+    if max_row == 0 or max_col == 0:
+        return []
 
-            # Определяем размеры таблицы
-            max_row = 0
-            max_col = 0
-            for cell in cells:
-                r = int(cell.get("rowIndex", 0))
-                c = int(cell.get("columnIndex", 0))
-                rs = int(cell.get("rowSpan", 1))
-                cs = int(cell.get("columnSpan", 1))
-                max_row = max(max_row, r + rs)
-                max_col = max(max_col, c + cs)
-
-            if max_row == 0 or max_col == 0:
-                continue
-
-            # Строим матрицу
-            matrix = [[""] * max_col for _ in range(max_row)]
-            for cell in cells:
-                r = int(cell.get("rowIndex", 0))
-                c = int(cell.get("columnIndex", 0))
-                rs = int(cell.get("rowSpan", 1))
-                cs = int(cell.get("columnSpan", 1))
-                text = cell.get("text", "").replace("\n", " ").strip()
-                for dr in range(rs):
-                    for dc in range(cs):
-                        if r + dr < max_row and c + dc < max_col:
-                            # Заполняем только если ячейка ещё пуста (первый источник)
-                            if not matrix[r + dr][c + dc]:
-                                matrix[r + dr][c + dc] = text
-
-            md_table = matrix_to_markdown(matrix)
-            if md_table:
-                # Дедупликация: проверяем, нет ли уже этой таблицы
-                # в существующем markdown-тексте (из поля markdown)
-                if existing_md:
-                    # Нормализуем: берём первые 2 строки таблицы (заголовок + разделитель)
-                    md_lines = md_table.strip().split("\n")
-                    key = "\n".join(md_lines[:2]).strip()
-                    if key and key in existing_md:
-                        log.debug(
-                            f"  Таблица (стр. {page_idx + 1}) уже есть в markdown — пропуск"
-                        )
-                        continue
-                all_tables.append(md_table)
-
-    return "\n\n".join(all_tables)
+    matrix = [[""] * max_col for _ in range(max_row)]
+    for cell in cells:
+        r = int(cell.get("rowIndex", 0))
+        c = int(cell.get("columnIndex", 0))
+        rs = int(cell.get("rowSpan", 1))
+        cs = int(cell.get("columnSpan", 1))
+        text = cell.get("text", "").replace("\n", " ").strip()
+        for dr in range(rs):
+            for dc in range(cs):
+                if r + dr < max_row and c + dc < max_col:
+                    if not matrix[r + dr][c + dc]:
+                        matrix[r + dr][c + dc] = text
+    return matrix
 
 
-def matrix_to_markdown(matrix: list[list[str]]) -> str:
+def _merge_table_headers(matrix: list[list[str]]) -> list[list[str]]:
+    """Склеить двухстрочный заголовок в одну строку.
+
+    Если первые две строки матрицы образуют заголовок с rowSpan-шапкой
+    (первая строка — общий заголовок через rowSpan, вторая — колонки),
+    объединяет их в одну header-строку.
+
+    Пример:
+      Row 0: ['Общий заголовок' | 'Kc при числе...' | 'Kc при числе...']
+      Row 1: ['Общий заголовок' | '2' | '3']
+      → Row 0: ['Общий заголовок' | 'Kc при числе... 2' | 'Kc при числе... 3']
+    """
+    if len(matrix) < 2:
+        return matrix
+
+    row0 = list(matrix[0])
+    row1 = list(matrix[1])
+    max_cols = max(len(row0), len(row1))
+    while len(row0) < max_cols:
+        row0.append("")
+    while len(row1) < max_cols:
+        row1.append("")
+
+    # Ищем колонку, где строки различаются — это граница объединения
+    split_col = None
+    for col in range(max_cols):
+        if row0[col] != row1[col]:
+            split_col = col
+            break
+    if split_col is None or split_col == 0:
+        return matrix
+
+    # Первая колонка — объединённая (rowSpan), её берём как есть
+    # Остальные — склеиваем
+    merged = list(row0)
+    for col in range(split_col, max_cols):
+        t0 = row0[col].strip()
+        t1 = row1[col].strip()
+        if t0 and t1:
+            merged[col] = t0 + " " + t1
+        elif t1:
+            merged[col] = t1
+    return [merged] + matrix[2:]
+
+
+def _detect_and_remove_note_row(
+    matrix: list[list[str]],
+) -> tuple[list[list[str]], str]:
+    """Обнаружить и удалить строку 'Примечание' из матрицы таблицы.
+
+    Проверяет последнюю строку: если первая ячейка начинается с 'Примечание'
+    или 'Примечания', извлекает её и возвращает как note_text.
+
+    Returns:
+        (matrix_without_note, note_text)
+    """
+    if len(matrix) < 2:
+        return matrix, ""
+
+    last_row = matrix[-1]
+    if not last_row:
+        return matrix, ""
+
+    first_cell = last_row[0].strip() if last_row else ""
+    note_pattern = re.compile(
+        r"^(?:П\s*р\s*и\s*м\s*е\s*ч\s*а\s*н\s*и\s*[ея]|Примечани[ея])",
+        re.IGNORECASE,
+    )
+
+    if note_pattern.match(first_cell):
+        # Берём текст из первой ячейки (colSpan может дублировать её по всем колонкам)
+        note_text = first_cell
+        # Если в других ячейках есть доп. текст (не дубликат первой) — добавляем
+        extra = [
+            c.strip() for c in last_row[1:]
+            if c.strip() and c.strip() != first_cell
+        ]
+        if extra:
+            note_text += " " + " ".join(extra)
+        return matrix[:-1], note_text
+
+    return matrix, ""
+
+
+def _matrix_to_md_table(matrix: list[list[str]]) -> str:
     """Преобразовать матрицу ячеек в Markdown-таблицу."""
     if not matrix or not matrix[0]:
         return ""
@@ -557,6 +665,100 @@ def matrix_to_markdown(matrix: list[list[str]]) -> str:
         lines.append("| " + " | ".join(vals) + " |")
 
     return "\n".join(lines)
+
+
+def _parse_structured_tables_per_page(
+    pages: list[dict],
+) -> dict[int, list[tuple[str, str]]]:
+    """Разобрать структурированные таблицы из textAnnotation.tables.
+
+    Для каждой страницы возвращает список кортежей (md_table, note_text).
+    Таблицы строятся из cells (rowIndex, columnIndex, rowSpan, columnSpan),
+    заголовки объединяются, строки 'Примечание' извлекаются.
+
+    Returns:
+        {page_idx: [(md_table_string, note_text), ...]}
+    """
+    result: dict[int, list[tuple[str, str]]] = {}
+
+    for page_idx, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        raw_tables = ta.get("tables", [])
+        if not raw_tables:
+            continue
+
+        page_tables: list[tuple[str, str]] = []
+        for raw_table in raw_tables:
+            cells = raw_table.get("cells", [])
+            if not cells:
+                continue
+
+            matrix = _build_cell_matrix(cells)
+            if not matrix:
+                continue
+
+            # Объединяем двухстрочный заголовок
+            matrix = _merge_table_headers(matrix)
+
+            # Извлекаем примечание из последней строки
+            matrix, note_text = _detect_and_remove_note_row(matrix)
+
+            if len(matrix) < 2:
+                log.debug(f"  Таблица стр.{page_idx + 1}: только заголовок — пропуск")
+                continue
+
+            md_table = _matrix_to_md_table(matrix)
+            page_tables.append((md_table, note_text))
+
+        if page_tables:
+            result[page_idx] = page_tables
+
+    return result
+
+
+def _find_md_table_sections(text: str) -> list[tuple[int, int]]:
+    """Найти секции Markdown-таблиц (|...|) в тексте.
+
+    Returns:
+        [(start_line, end_line), ...] — индексы строк.
+    """
+    lines = text.split("\n")
+    sections = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip().startswith("|"):
+            start = i
+            while i < len(lines) and ("|" in lines[i] or not lines[i].strip()):
+                # Пустые строки внутри таблицы — часть таблицы
+                if not lines[i].strip():
+                    i += 1
+                    continue
+                if "|" in lines[i]:
+                    i += 1
+                else:
+                    break
+            end = i
+            # Минимум 3 строки: заголовок, разделитель, данные
+            valid_lines = [l for l in lines[start:end] if l.strip().startswith("|")]
+            if len(valid_lines) >= 3:
+                sections.append((start, end))
+        else:
+            i += 1
+    return sections
+
+
+def _remove_md_table_sections(text: str) -> str:
+    """Удалить все Markdown-таблицы (|...|) из текста."""
+    sections = _find_md_table_sections(text)
+    if not sections:
+        return text
+
+    lines = text.split("\n")
+    # Удаляем снизу вверх, чтобы не сбивать индексы
+    result = list(lines)
+    for start, end in reversed(sections):
+        del result[start:end]
+    return "\n".join(result)
 
 
 def _parse_pictures_from_json(pages: list[dict]) -> list[dict]:
@@ -797,10 +999,11 @@ def _insert_images_into_md(
     затем вставляет ссылки ![fig_N](image/fig_N.ext) на позиции,
     пропорциональные Y-положению изображения на странице.
 
-    Если pages не передан — legacy-режим: все ссылки в конец текста.
+    ВАЖНО: работает с уже обработанным md_text (таблицы заменены),
+    использует pages только для получения page_height (масштабирования Y).
 
     Args:
-        md_text: Исходный Markdown-текст.
+        md_text: Уже обработанный Markdown-текст (с заменёнными таблицами).
         extracted: Список от extract_images_from_pdf().
         pages: Список страниц от send_to_yandex_ocr() — нужен для
                Y-координат и размеров страниц.
@@ -831,14 +1034,6 @@ def _insert_images_into_md(
         parts.append("")
         return "\n".join(parts)
 
-    # Собираем markdown по страницам с сохранением page_idx
-    page_texts: dict[int, str] = {}
-    for pg_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        md = ta.get("markdown", "")
-        if md:
-            page_texts[pg_idx] = md.strip()
-
     # Группируем изображения по страницам
     imgs_by_page: dict[int, list[dict]] = {}
     for img in sorted_imgs:
@@ -847,42 +1042,68 @@ def _insert_images_into_md(
             imgs_by_page[pg] = []
         imgs_by_page[pg].append(img)
 
-    # Собираем финальный текст постранично
-    result_parts = []
-    for pg_idx in sorted(page_texts.keys()):
-        page_md = page_texts[pg_idx]
-        lines = page_md.split("\n")
-        imgs = imgs_by_page.get(pg_idx, [])
+    # Считаем количество строк в raw-тексте каждой страницы для пропорций
+    raw_line_counts: dict[int, int] = {}
+    total_raw_lines = 0
+    for pg_idx, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        md = ta.get("markdown", "").strip()
+        n = md.count("\n") + 1 if md else 0
+        raw_line_counts[pg_idx] = n
+        total_raw_lines += n
 
-        if not imgs:
-            result_parts.append(page_md)
-            continue
+    # Работаем с уже обработанным md_text
+    lines = md_text.split("\n")
+    total_lines = len(lines)
 
-        # Высота страницы для пропорции Y
-        ta = pages[pg_idx].get("result", {}).get("textAnnotation", {})
+    if total_lines == 0 or total_raw_lines == 0:
+        return md_text
+
+    # Для каждой страницы вычисляем, с какой строки она начинается в md_text
+    # (пропорционально доле её raw-текста)
+    page_start_line: dict[int, int] = {}
+    cum_raw = 0
+    for pg_idx in sorted(raw_line_counts.keys()):
+        fraction_start = cum_raw / total_raw_lines if total_raw_lines > 0 else 0
+        page_start_line[pg_idx] = int(fraction_start * total_lines)
+        cum_raw += raw_line_counts[pg_idx]
+
+    # Вставляем изображения
+    result_lines = list(lines)
+    insertions = []
+
+    for img in sorted_imgs:
+        pg = img["page"]
+        y_center = _get_y_center(img)
+
+        ta = pages[pg].get("result", {}).get("textAnnotation", {})
         page_height = float(ta.get("height", 3095))
 
-        # Точки вставки: (line_index, image_markdown)
-        insertions = []
-        for img in imgs:
-            y_center = _get_y_center(img)
-            y_frac = y_center / page_height if page_height > 0 else 0.5
-            y_frac = max(0.05, min(0.95, y_frac))
-            target_line = int(y_frac * len(lines))
-            target_line = max(0, min(len(lines) - 1, target_line))
-            img_md = f"![fig_{img['fig_num']}](image/{img['filename']})"
-            insertions.append((target_line, img_md))
+        y_frac = y_center / page_height if page_height > 0 else 0.5
+        y_frac = max(0.05, min(0.95, y_frac))
 
-        # Вставляем снизу вверх, чтобы не смещать индексы
-        insertions.sort(key=lambda x: -x[0])
-        new_lines = list(lines)
-        for target_line, img_md in insertions:
-            new_lines.insert(target_line, "")
-            new_lines.insert(target_line, img_md)
+        page_lines_count = raw_line_counts.get(pg, 1)
+        line_offset = int(y_frac * page_lines_count)
 
-        result_parts.append("\n".join(new_lines))
+        # Пропорционально отображаем на md_text
+        start = page_start_line.get(pg, 0)
+        end = start + int(page_lines_count / total_raw_lines * total_lines) \
+            if total_raw_lines > 0 else total_lines
+        end = min(end, total_lines - 1)
 
-    return "\n\n".join(result_parts)
+        target_line = start + int(y_frac * (end - start))
+        target_line = max(0, min(total_lines - 1, target_line))
+
+        img_md = f"![fig_{img['fig_num']}](image/{img['filename']})"
+        insertions.append((target_line, img_md))
+
+    # Вставляем снизу вверх
+    insertions.sort(key=lambda x: -x[0])
+    for target_line, img_md in insertions:
+        result_lines.insert(target_line, "")
+        result_lines.insert(target_line, img_md)
+
+    return "\n".join(result_lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -997,7 +1218,8 @@ def cleanup_latex(md_text: str) -> str:
     """Найти и очистить все LaTeX-формулы в тексте."""
     def _rep_display(m):
         return f"$$\n{_clean_formula(m.group(1))}\n$$"
-    md_text = re.sub(r"\$\$\n(.*?)\n\$\$", _rep_display, md_text, flags=re.DOTALL)
+    # Yandex ставит $$...$$ на одной строке. Используем DOTALL для многострочных.
+    md_text = re.sub(r"\$\$(.+?)\$\$", _rep_display, md_text, flags=re.DOTALL)
 
     def _rep_inline(m):
         return f"${_clean_formula(m.group(1))}$"
