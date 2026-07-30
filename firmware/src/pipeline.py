@@ -1455,6 +1455,10 @@ def _call_vision_api(
     base_url = config.get("base_url", "https://api.provod.ai/v1")
     fallback = config.get("fallback", {})
 
+    if not api_key:
+        log.warning("  Vision: API-ключ не задан")
+        return None
+
     def _do_vision(mdl: str, url: str, key: str) -> str | None:
         payload = {
             "model": mdl,
@@ -1611,7 +1615,7 @@ def _fix_latex_ocr_artifacts(text: str) -> str:
     """Чистка OCR-артефактов в LaTeX."""
     text = re.sub(r"\\,\s*", "", text)
     text = re.sub(r"\\ldots", "...", text)
-    text = re.sub(r"(\S)(\\\^)", r"\1 \2", text)
+    text = re.sub(r"(\S)(\\\^)\{", r"\1 \2 {", text)
     text = re.sub(r"(\d)\\(')", r"\1 \2", text)
     return text
 
