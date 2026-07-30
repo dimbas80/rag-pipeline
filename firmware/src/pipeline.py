@@ -439,48 +439,6 @@ def _normalize_spaced_text(text: str) -> str:
     return text
 
 
-def _extract_table_captions_from_text(md_text: str) -> list[str]:
-    """Извлечь подписи таблиц из markdown-текста.
-
-    Ищет строки, содержащие 'Т а б л и ц а' (с пробелами между буквами —
-    OCR-артефакт Yandex). Возвращает нормализованные подписи
-    в порядке появления на странице.
-
-    Returns:
-        list[str] — например ['Таблица 7.5 — Предельные отклонения', ...]
-    """
-    caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
-    captions = []
-    for line in md_text.split("\n"):
-        if caption_pattern.search(line):
-            # Нормализуем: схлопываем пробелы и убираем лишние
-            normalized = _normalize_spaced_text(line.strip())
-            normalized = re.sub(r"\s+", " ", normalized)
-            captions.append(normalized)
-    return captions
-
-
-def _extract_table_captions_from_blocks(ta: dict) -> list[str]:
-    """Извлечь подписи из блоков LAYOUT_TYPE_CAPTION.
-
-    Returns:
-        list[str] — подписи в порядке появления в блоках.
-    """
-    blocks = ta.get("blocks", [])
-    captions = []
-    for block in blocks:
-        if block.get("layoutType") == "LAYOUT_TYPE_CAPTION":
-            text_parts = []
-            for line_data in block.get("lines", []):
-                text = line_data.get("text", "").strip()
-                if text:
-                    text_parts.append(text)
-            caption = " ".join(text_parts).strip()
-            if caption:
-                captions.append(caption)
-    return captions
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. JSON → Markdown Parser (основные функции)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -491,12 +449,15 @@ def parse_yandex_json_to_md(
 ) -> tuple[str, list[dict], list[tuple[int, int]]]:
     """Разобрать Yandex OCR JSON в Markdown + список картинок.
 
-    НОВЫЙ АЛГОРИТМ (упрощённый):
+    АЛГОРИТМ (только JSON, без markdown-поля):
     Для каждой страницы:
-      1. Взять markdown-поле → удалить ВСЕ строки с | (таблицы) → «текстовый каркас»
-      2. Взять структурированные таблицы из textAnnotation.tables[]
-      3. Каждую таблицу вставить в КОНЕЦ страницы (после её текста)
-         с подписью-заголовком непосредственно перед таблицей
+      1. Собрать ВСЁ из textAnnotation.blocks[], tables[], pictures[]
+      2. Каждый элемент получает Y-координату (min y bounding box'а)
+      3. Отсортировать по Y → корректный порядок на странице
+      4. Элементы рендерятся по типу:
+         - block → _block_to_md() (форматирование по layoutType)
+         - table → _table_to_md() + подпись от _find_table_caption_for()
+         - picture → "<!-- image placeholder -->"
 
     Returns:
         (markdown_text, pictures_list, page_boundaries)
@@ -513,77 +474,99 @@ def parse_yandex_json_to_md(
 
     page_parts: list[str] = []
     page_boundaries: list[tuple[int, int]] = []
+    pictures: list[dict] = []
 
     for page_idx, page in enumerate(pages):
         ta = page.get("result", {}).get("textAnnotation", {})
-        md = ta.get("markdown", "")
-
-        if not md.strip():
-            continue
-
-        # 1. Извлекаем подписи из исходного markdown (до удаления таблиц)
-        text_captions = _extract_table_captions_from_text(md)
-        block_captions = _extract_table_captions_from_blocks(ta)
-
-        # 2. Удаляем ВСЕ строки с | (сырые таблицы Yandex) и строки-подписи
-        caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
-        text_lines = []
-        for line in md.split("\n"):
-            stripped = line.strip()
-            # Пропускаем строки таблиц (начинаются с |)
-            if stripped.startswith("|"):
-                continue
-            # Пропускаем строки подписей (будем вставлять перед таблицами)
-            if caption_pattern.search(stripped):
-                continue
-            text_lines.append(line)
-        page_text = "\n".join(text_lines).strip()
-
-        # 3. Обрабатываем структурированные таблицы
+        blocks = ta.get("blocks", [])
         raw_tables = ta.get("tables", [])
-        if raw_tables:
-            page_text += "\n\n"
-            for i, table in enumerate(raw_tables):
-                cells = table.get("cells", [])
-                if not cells:
+        page_pictures_list = ta.get("pictures", [])
+
+        # 1. Собираем все элементы страницы с Y-координатой
+        elements: list[tuple[float, str, dict]] = []  # [(y, type, data), ...]
+
+        for block in blocks:
+            vertices = block.get("boundingBox", {}).get("vertices", [])
+            if vertices:
+                y = min(float(v.get("y", 0)) for v in vertices)
+            else:
+                y = 0.0
+            elements.append((y, "block", block))
+
+        for table in raw_tables:
+            vertices = table.get("boundingBox", {}).get("vertices", [])
+            if vertices:
+                y = min(float(v.get("y", 0)) for v in vertices)
+            else:
+                y = 0.0
+            elements.append((y, "table", table))
+
+        for pic in page_pictures_list:
+            vertices = pic.get("boundingBox", {}).get("vertices", [])
+            if vertices:
+                y = min(float(v.get("y", 0)) for v in vertices)
+            else:
+                y = 0.0
+            elements.append((y, "picture", pic))
+            pictures.append({"page": page_idx, "bbox": pic.get("boundingBox", {})})
+
+        # 2. Сортируем по Y
+        elements.sort(key=lambda x: x[0])
+
+        # Определяем, какие блоки входят в bounding box таблиц
+        # (это отдельные ячейки таблицы как text-блоки — их не рендерим,
+        #  т.к. таблица будет рендериться из structured tables[])
+        table_y_ranges: list[tuple[float, float]] = []
+        for table in raw_tables:
+            tv = table.get("boundingBox", {}).get("vertices", [])
+            if tv:
+                ys = [float(v.get("y", 0)) for v in tv]
+                table_y_ranges.append((min(ys), max(ys)))
+
+        def _block_in_table(block: dict) -> bool:
+            """Проверить, находится ли блок внутри bounding box какой-либо таблицы."""
+            bv = block.get("boundingBox", {}).get("vertices", [])
+            if not bv or not table_y_ranges:
+                return False
+            bys = [float(v.get("y", 0)) for v in bv]
+            b_y_min, b_y_max = min(bys), max(bys)
+            for t_min, t_max in table_y_ranges:
+                # Блок полностью внутри таблицы по Y
+                if b_y_min >= t_min and b_y_max <= t_max:
+                    return True
+                # Блок частично внутри (пересечение > 50%)
+                overlap = min(b_y_max, t_max) - max(b_y_min, t_min)
+                b_height = b_y_max - b_y_min
+                if b_height > 0 and overlap / b_height > 0.5:
+                    return True
+            return False
+
+        # 3. Рендерим страницу в порядке Y
+        page_lines: list[str] = []
+
+        for y, etype, data in elements:
+            if etype == "block":
+                # Пропускаем блоки, которые являются частью таблицы
+                if _block_in_table(data):
                     continue
+                text = _block_to_md(data)
+                if text:
+                    page_lines.append(text)
+            elif etype == "table":
+                md_table, note_text = _table_to_md(data)
+                if md_table:
+                    caption = _find_table_caption_for(blocks, data, raw_tables)
+                    if caption:
+                        page_lines.append(f"*{caption}*")
+                    page_lines.append(md_table)
+                    if note_text:
+                        page_lines.append(f"> {note_text}")
+            elif etype == "picture":
+                page_lines.append("<!-- image placeholder -->")
 
-                row_count = int(table.get("rowCount", 0))
-                col_count = int(table.get("columnCount", 0))
-
-                matrix = _build_cell_matrix(cells, row_count, col_count)
-                if not matrix:
-                    continue
-
-                # Объединяем двухстрочный заголовок
-                matrix = _merge_table_headers(matrix)
-
-                # Извлекаем примечание из последней строки
-                matrix, note_text = _detect_and_remove_note_row(matrix)
-
-                if len(matrix) < 2:
-                    log.debug(f"  Таблица стр.{page_idx + 1}: только заголовок — пропуск")
-                    continue
-
-                md_table = _matrix_to_md_table(matrix)
-
-                # Подпись: текстовая или из блоков LAYOUT_TYPE_CAPTION
-                caption = ""
-                if i < len(text_captions):
-                    caption = text_captions[i]
-                elif i < len(block_captions):
-                    caption = block_captions[i]
-
-                # Вставляем подпись непосредственно перед таблицей
-                if caption:
-                    page_text += f"\n\n*{caption}*"
-                page_text += "\n\n" + md_table
-
-                # Примечание после таблицы
-                if note_text:
-                    page_text += f"\n\n> {note_text}"
-
-        page_parts.append(page_text)
+        page_text = "\n\n".join(page_lines).strip()
+        if page_text:
+            page_parts.append(page_text)
 
     # Собираем окончательный текст
     if page_parts:
@@ -599,29 +582,198 @@ def parse_yandex_json_to_md(
         md_text = ""
         page_boundaries = []
 
-    if not md_text.strip():
-        # Fallback: если все страницы пусты — blocks
-        md_text = _extract_markdown_field(pages)
-        if not md_text.strip():
-            log.warning("  Поле markdown пусто — fallback на blocks")
-            md_text = _parse_blocks_to_text(pages)
-            page_boundaries = []  # неизвестны при fallback
-
-    # Шаг: картинки
-    pictures = _parse_pictures_from_json(pages)
-
     return md_text, pictures, page_boundaries
 
 
-def _extract_markdown_field(pages: list[dict]) -> str:
-    """Извлечь поле 'markdown' из textAnnotation всех страниц."""
-    parts = []
-    for page in pages:
-        ta = page.get("result", {}).get("textAnnotation", {})
-        md = ta.get("markdown", "")
-        if md:
-            parts.append(md.strip())
-    return "\n\n".join(parts)
+def _block_to_md(block: dict) -> str:
+    """Форматировать блок текста по его layoutType.
+
+    - LAYOUT_TYPE_SECTION_HEADER с текстом «Рисунок»/«Рис.» → *курсив*
+    - LAYOUT_TYPE_SECTION_HEADER (остальное) → **жирный**
+    - LAYOUT_TYPE_CAPTION → не выводится (используется как подпись таблицы)
+    - LAYOUT_TYPE_LIST → - элемент списка
+    - LAYOUT_TYPE_TEXT / LAYOUT_TYPE_UNSPECIFIED → обычный текст
+    - Блоки с текстом «Т а б л и ц а» → не выводятся (подпись, будет у таблицы)
+    - Блоки с текстом «П р и м е ч а н и е» → не выводятся (будет > blockquote у таблицы)
+
+    Returns:
+        Строка Markdown или пустая строка (если блок нужно пропустить).
+    """
+    lines = block.get("lines", [])
+    text_parts: list[str] = []
+    for line_data in lines:
+        text = line_data.get("text", "").strip()
+        if text:
+            text_parts.append(text)
+    text = " ".join(text_parts).strip()
+
+    if not text:
+        return ""
+
+    raw_text = text
+
+    # Нормализуем для проверки содержания
+    normalized = _normalize_spaced_text(text)
+
+    # Блоки с "Т а б л и ц а" — это подпись, будет вставлена с таблицей
+    if re.search(r"Таблиц[аы]", normalized, re.IGNORECASE):
+        return ""
+
+    # Блоки с "П р и м е ч а н и е" — это примечание, будет в > blockquote у таблицы
+    if re.search(r"Примечани[ея]", normalized, re.IGNORECASE):
+        return ""
+
+    layout_type = block.get("layoutType", "")
+
+    # LAYOUT_TYPE_CAPTION — подпись таблицы/рисунка.
+    # Рендерим как обычный текст. Если эта подпись будет использована
+    # как caption для таблицы _find_table_caption_for, она появится
+    # дважды — но на практике блок "Т а б л и ц а" (LAYOUT_TYPE_TEXT)
+    # перехватывается выше, а CAPTION-блоки без "Таблица" — это
+    # заголовки разделов между таблицами, их нужно выводить.
+    if layout_type == "LAYOUT_TYPE_CAPTION":
+        return raw_text
+
+    if layout_type == "LAYOUT_TYPE_SECTION_HEADER":
+        # Проверяем, содержит ли текст "Рисунок" или "Рис."
+        if re.search(r"Р\s*и\s*с\s*(?:у\s*н\s*о\s*к|\.\s*)", raw_text, re.IGNORECASE):
+            return f"*{raw_text}*"
+        else:
+            return f"**{raw_text}**"
+
+    if layout_type == "LAYOUT_TYPE_LIST":
+        return f"- {raw_text}"
+
+    # LAYOUT_TYPE_TEXT, LAYOUT_TYPE_UNSPECIFIED, и всё остальное
+    return raw_text
+
+
+def _find_table_caption_for(
+    blocks: list[dict],
+    table: dict,
+    all_tables: list[dict],
+) -> str:
+    """Найти подпись для таблицы среди блоков.
+
+    Ищет ближайший по Y сверху блок, который является:
+    - LAYOUT_TYPE_CAPTION
+    - или содержит текст «Т а б л и ц а» (с пробелами между буквами — OCR-артефакт)
+
+    Исключает блоки, которые уже являются подписью для другой, более близкой
+    по Y таблицы.
+
+    Args:
+        blocks: Все блоки страницы.
+        table: Текущая таблица.
+        all_tables: Все таблицы страницы (для избежания дублирования подписей).
+
+    Returns:
+        Нормализованный текст подписи, или пустая строка.
+    """
+    # Y-позиция текущей таблицы (min y)
+    table_vertices = table.get("boundingBox", {}).get("vertices", [])
+    if not table_vertices:
+        return ""
+    table_y = min(float(v.get("y", 0)) for v in table_vertices)
+
+    # Y-позиции других таблиц (для определения, какая таблица ближе к caption)
+    other_table_ys: list[float] = []
+    for other in all_tables:
+        if other is table:
+            continue
+        ov = other.get("boundingBox", {}).get("vertices", [])
+        if ov:
+            other_table_ys.append(min(float(v.get("y", 0)) for v in ov))
+
+    # Сортируем блоки по Y (возрастание — сверху вниз)
+    blocks_with_y: list[tuple[float, dict]] = []
+    for block in blocks:
+        bv = block.get("boundingBox", {}).get("vertices", [])
+        if bv:
+            by = min(float(v.get("y", 0)) for v in bv)
+        else:
+            by = 0.0
+        blocks_with_y.append((by, block))
+    blocks_with_y.sort(key=lambda x: x[0])
+
+    # Ищем блоки, которые могут быть подписью для этой таблицы.
+    # Они должны быть выше таблицы (y < table_y).
+    # Выбираем САМЫЙ БЛИЖНИЙ сверху.
+    best_caption: str = ""
+    best_y_diff: float = float("inf")
+
+    caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
+
+    for by, block in blocks_with_y:
+        if by >= table_y:
+            continue  # Блок ниже таблицы — не подходит
+
+        # Проверяем, не ближе ли другой таблице этот блок
+        # (Если другая таблица находится между этим блоком и текущей таблицей,
+        #  то блок относится к той, другой таблице)
+        is_closer_to_other = False
+        for ot_y in other_table_ys:
+            if by < ot_y < table_y:
+                is_closer_to_other = True
+                break
+        if is_closer_to_other:
+            continue
+
+        layout_type = block.get("layoutType", "")
+        block_text = ""
+        for line_data in block.get("lines", []):
+            t = line_data.get("text", "").strip()
+            if t:
+                block_text += " " + t
+        block_text = block_text.strip()
+
+        is_caption_block = layout_type == "LAYOUT_TYPE_CAPTION"
+        has_table_word = bool(caption_pattern.search(block_text))
+
+        if is_caption_block or has_table_word:
+            y_diff = table_y - by
+            if y_diff < best_y_diff:
+                best_y_diff = y_diff
+                if has_table_word:
+                    best_caption = _normalize_spaced_text(block_text)
+                    best_caption = re.sub(r"\s+", " ", best_caption)
+                else:
+                    best_caption = block_text
+
+    return best_caption
+
+
+def _table_to_md(table: dict) -> tuple[str, str]:
+    """Преобразовать структурированную таблицу в Markdown + примечание.
+
+    Args:
+        table: Словарь таблицы из textAnnotation.tables[].
+
+    Returns:
+        (md_table_string, note_text)
+    """
+    cells = table.get("cells", [])
+    if not cells:
+        return "", ""
+
+    row_count = int(table.get("rowCount", 0))
+    col_count = int(table.get("columnCount", 0))
+
+    matrix = _build_cell_matrix(cells, row_count, col_count)
+    if not matrix:
+        return "", ""
+
+    # Объединяем двухстрочный заголовок
+    matrix = _merge_table_headers(matrix)
+
+    # Извлекаем примечание из последней строки
+    matrix, note_text = _detect_and_remove_note_row(matrix)
+
+    if len(matrix) < 2:
+        return "", ""
+
+    md_table = _matrix_to_md_table(matrix)
+    return md_table, note_text
 
 
 def _build_cell_matrix(
@@ -787,179 +939,6 @@ def _matrix_to_md_table(matrix: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _parse_structured_tables_per_page(
-    pages: list[dict],
-) -> dict[int, list[tuple[str, str]]]:
-    """Разобрать структурированные таблицы из textAnnotation.tables.
-
-    Для каждой страницы возвращает список кортежей (md_table, note_text).
-    Таблицы строятся из cells (rowIndex, columnIndex, rowSpan, columnSpan),
-    заголовки объединяются, строки 'Примечание' извлекаются.
-
-    Returns:
-        {page_idx: [(md_table_string, note_text), ...]}
-    """
-    result: dict[int, list[tuple[str, str]]] = {}
-
-    for page_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        raw_tables = ta.get("tables", [])
-        if not raw_tables:
-            continue
-
-        page_tables: list[tuple[str, str]] = []
-        for raw_table in raw_tables:
-            cells = raw_table.get("cells", [])
-            if not cells:
-                continue
-
-            matrix = _build_cell_matrix(cells, raw_table.get("rowCount", 0), raw_table.get("columnCount", 0))
-            if not matrix:
-                continue
-
-            # Объединяем двухстрочный заголовок
-            matrix = _merge_table_headers(matrix)
-
-            # Извлекаем примечание из последней строки
-            matrix, note_text = _detect_and_remove_note_row(matrix)
-
-            if len(matrix) < 2:
-                log.debug(f"  Таблица стр.{page_idx + 1}: только заголовок — пропуск")
-                continue
-
-            md_table = _matrix_to_md_table(matrix)
-            page_tables.append((md_table, note_text))
-
-        if page_tables:
-            result[page_idx] = page_tables
-
-    return result
-
-
-def _find_md_table_sections(text: str) -> list[tuple[int, int]]:
-    """Найти секции Markdown-таблиц (|...|) в тексте.
-
-    Returns:
-        [(start_line, end_line), ...] — индексы строк.
-    """
-    lines = text.split("\n")
-    sections = []
-    i = 0
-    while i < len(lines):
-        if lines[i].strip().startswith("|"):
-            start = i
-            while i < len(lines) and ("|" in lines[i] or not lines[i].strip()):
-                # Пустые строки внутри таблицы — часть таблицы
-                if not lines[i].strip():
-                    i += 1
-                    continue
-                if "|" in lines[i]:
-                    i += 1
-                else:
-                    break
-            end = i
-            # Минимум 3 строки: заголовок, разделитель, данные
-            valid_lines = [l for l in lines[start:end] if l.strip().startswith("|")]
-            if len(valid_lines) >= 3:
-                sections.append((start, end))
-        else:
-            i += 1
-    return sections
-
-
-def _remove_md_table_sections(text: str) -> str:
-    """Удалить все Markdown-таблицы (|...|) из текста."""
-    sections = _find_md_table_sections(text)
-    if not sections:
-        return text
-
-    lines = text.split("\n")
-    # Удаляем снизу вверх, чтобы не сбивать индексы
-    result = list(lines)
-    for start, end in reversed(sections):
-        del result[start:end]
-    return "\n".join(result)
-
-
-def _parse_pictures_from_json(pages: list[dict]) -> list[dict]:
-    """Извлечь bounding box'ы изображений из поля 'pictures'.
-
-    Возвращает список картинок с page, bbox, filename (temp).
-    """
-    pictures = []
-    for page_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        pics = ta.get("pictures", [])
-        for pic in pics:
-            bbox = pic.get("boundingBox", {})
-            if bbox and "vertices" in bbox:
-                pictures.append({
-                    "page": page_idx,
-                    "bbox": bbox,
-                    "score": pic.get("score", 0),
-                })
-    return pictures
-
-
-def _parse_blocks_to_text(pages: list[dict]) -> str:
-    """Fallback: собрать текст из блоков (layoutType: TEXT, LIST, UNSPECIFIED).
-
-    Используется только если поле markdown пусто.
-    """
-    all_lines = []
-    for page_idx, page in enumerate(pages):
-        ta = page.get("result", {}).get("textAnnotation", {})
-        blocks = ta.get("blocks", [])
-        if not blocks:
-            continue
-
-        # Сортируем блоки по Y, затем по X
-        sorted_blocks = []
-        for block in blocks:
-            vertices = block.get("boundingBox", {}).get("vertices", [])
-            y_min = min(int(v.get("y", 0)) for v in vertices) if vertices else 0
-            x_min = min(int(v.get("x", 0)) for v in vertices) if vertices else 0
-            sorted_blocks.append((y_min, x_min, block))
-        sorted_blocks.sort(key=lambda x: (x[0], x[1]))
-
-        page_lines = []
-        prev_y = None
-        for y_min, x_min, block in sorted_blocks:
-            layout_type = block.get("layoutType", "")
-
-            for line_data in block.get("lines", []):
-                text = line_data.get("text", "").strip()
-                if not text:
-                    continue
-
-                lines_bbox = line_data.get("boundingBox", {}).get("vertices", [])
-                y_center = 0
-                if lines_bbox:
-                    ys = [int(v.get("y", 0)) for v in lines_bbox]
-                    y_center = sum(ys) / len(ys)
-
-                # Определяем параграф по Y-разрыву
-                if prev_y is not None and (y_center - prev_y) > 20:
-                    page_lines.append("")
-
-                if "LIST" in layout_type:
-                    page_lines.append(f"- {text}")
-                elif "TEXT" in layout_type or "UNSPECIFIED" in layout_type:
-                    page_lines.append(text)
-                else:
-                    page_lines.append(text)
-
-                if lines_bbox:
-                    ys = [int(v.get("y", 0)) for v in lines_bbox]
-                    prev_y = sum(ys) / len(ys)
-
-        if page_lines:
-            all_lines.extend(page_lines)
-            all_lines.append("")
-
-    return "\n".join(all_lines).strip()
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Извлечение изображений из PDF
 # ═══════════════════════════════════════════════════════════════════════════
@@ -979,7 +958,7 @@ def extract_images_from_pdf(
 
     Args:
         pdf_path: Путь к PDF.
-        pictures: Список картинок от _parse_pictures_from_json().
+        pictures: Список картинок от parse_yandex_json_to_md().
         output_img_dir: Папка для сохранения изображений.
         pages: Список страниц от send_to_yandex_ocr() — нужен для
                получения ta["width"]/ta["height"] (масштабирование
@@ -1188,13 +1167,17 @@ def _insert_images_into_md(
             else:
                 target_line = start + int(y_frac * page_line_count)
         else:
-            # Fallback: пропорциональное отображение
+            # Fallback: пропорциональное отображение на основе blocks
             raw_line_counts: dict[int, int] = {}
             total_raw_lines = 0
             for pg_idx, page in enumerate(pages):
                 ta_local = page.get("result", {}).get("textAnnotation", {})
-                md = ta_local.get("markdown", "").strip()
-                n = md.count("\n") + 1 if md else 0
+                blocks = ta_local.get("blocks", [])
+                n = 0
+                for block in blocks:
+                    for line_data in block.get("lines", []):
+                        if line_data.get("text", "").strip():
+                            n += 1
                 raw_line_counts[pg_idx] = n
                 total_raw_lines += n
 
