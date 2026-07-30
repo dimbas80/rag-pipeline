@@ -7,7 +7,7 @@ pipeline.py — Пайплайн конвертации PDF/DOCX в Markdown ч�
 Постобработка:
   — скриптовая (всегда): HTML-таблицы → MD, LaTeX-чистка, изображения → fig_N,
     OCR-артефакты, примечания, подписи
-  — AI (флаг --ai): gemini-3.5-flash → claude-sonnet-5 (через Provod)
+  — AI (флаг --ai): deepseek-v4-flash → gemini-3.5-flash (через DeepSeek / Provod)
 
 Использование:
   python3 pipeline.py -i file.pdf
@@ -113,11 +113,17 @@ def load_config(config_path: str | Path) -> dict:
     if not config_path.exists():
         log.warning(f"Конфиг не найден: {config_path}, использую умолчания")
         return {
-            "postprocess": {
-                "primary": {"provider": "provod", "base_url": "https://api.provod.ai/v1",
-                            "model": "google/gemini-3.5-flash"},
-                "fallback": {"provider": "provod", "base_url": "https://api.provod.ai/v1",
-                             "model": "anthropic/claude-sonnet-5"},
+            "ai_postprocess": {
+                "provider": "deepseek",
+                "model": "deepseek-v4-flash",
+                "api_key_env": "DEEPSEEK_API_KEY",
+                "base_url": "https://api.deepseek.com/v1",
+                "fallback": {
+                    "provider": "provod",
+                    "model": "google/gemini-3.5-flash",
+                    "api_key_env": "PROVOD_API_KEY",
+                    "base_url": "https://api.provod.ai/v1",
+                },
             }
         }
     with open(config_path, encoding="utf-8") as f:
@@ -2160,79 +2166,95 @@ def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
 
 
 def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
-    """Вызвать AI API через Provod для постобработки."""
-    primary = config.get("primary", {})
-    fallback = config.get("fallback", {})
+    """AI-постобработка через config-указанный провайдер.
 
-    api_key = os.environ.get("PROVOD_API_KEY", "")
+    Поддерживает DeepSeek и Provod (OpenAI-совместимый API).
+    При отсутствии или ошибках primary переходит на fallback.
+    """
+    ai_cfg = config.get("ai_postprocess", config)
+
+    # Primary provider
+    provider = ai_cfg.get("provider", "deepseek")
+    model = ai_cfg.get("model", "deepseek-v4-flash")
+    api_key_env = ai_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
+    base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1")
+    prompt = ai_cfg.get("prompt", AI_CLEANUP_DEFAULT_PROMPT)
+
+    api_key = os.environ.get(api_key_env, "")
     if not api_key:
-        log.error("PROVOD_API_KEY не задан")
-        return None
+        log.error(f"{api_key_env} не задан, пробую fallback")
+        fb = ai_cfg.get("fallback", {})
+        if fb:
+            provider = fb.get("provider", provider)
+            model = fb.get("model", model)
+            api_key_env = fb.get("api_key_env", api_key_env)
+            base_url = fb.get("base_url", base_url)
+            api_key = os.environ.get(api_key_env, "")
+            if not api_key:
+                log.error(f"Fallback {api_key_env} не задан")
+                return None
+            log.info(f"Fallback: {provider} / {model}")
+        else:
+            return None
 
-    base_url = primary.get("base_url", "https://api.provod.ai/v1")
-    model = primary.get("model", "google/gemini-3.5-flash")
-    prompt = config.get("prompt", AI_CLEANUP_DEFAULT_PROMPT)
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": text},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 64000,
-    }
-
-    for attempt in range(3):
-        try:
-            with httpx.Client(timeout=600) as client:
-                resp = client.post(
-                    f"{base_url}/chat/completions",
-                    json=payload,
-                    headers=headers,
-                )
-
-            if resp.status_code == 503:
-                log.warning(f"  {model}: 503, попытка {attempt + 1}/3")
-                time.sleep(5)
-                continue
-
-            resp.raise_for_status()
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"].strip()
-            content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
-            content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
-            return content
-
-        except Exception as e:
-            log.warning(f"  {model}: {e}, попытка {attempt + 1}/3")
-            time.sleep(5)
-
-    if fallback:
-        fallback_model = fallback.get("model", "anthropic/claude-sonnet-5")
-        log.info(f"Пробую fallback: {fallback_model}")
-        payload["model"] = fallback_model
+    def _do_request(url: str, mdl: str, key: str, prv: str) -> str | None:
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": mdl,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 64000,
+        }
         for attempt in range(3):
             try:
                 with httpx.Client(timeout=600) as client:
                     resp = client.post(
-                        f"{base_url}/chat/completions",
+                        f"{url}/chat/completions",
                         json=payload,
                         headers=headers,
                     )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    content = data["choices"][0]["message"]["content"].strip()
-                    content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
-                    content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
-                    return content
+                if resp.status_code == 503:
+                    log.warning(f"  {prv}/{mdl}: 503, попытка {attempt + 1}/3")
+                    time.sleep(5)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
+                content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
+                return content
             except Exception as e:
-                log.warning(f"  fallback {fallback_model}: {e}")
+                log.warning(f"  {prv}/{mdl}: {e}, попытка {attempt + 1}/3")
+                time.sleep(5)
+        return None
+
+    # Primary attempt
+    log.info(f"AI: {provider} / {model}")
+    result = _do_request(base_url, model, api_key, provider)
+    if result is not None:
+        return result
+
+    # Fallback attempt
+    fb = ai_cfg.get("fallback", {})
+    if fb:
+        fb_provider = fb.get("provider", "provod")
+        fb_model = fb.get("model", "google/gemini-3.5-flash")
+        fb_key_env = fb.get("api_key_env", "PROVOD_API_KEY")
+        fb_base_url = fb.get("base_url", "https://api.provod.ai/v1")
+        fb_key = os.environ.get(fb_key_env, "")
+        if fb_key:
+            log.info(f"Пробую fallback: {fb_provider} / {fb_model}")
+            result = _do_request(fb_base_url, fb_model, fb_key, fb_provider)
+            if result is not None:
+                return result
+        else:
+            log.warning(f"Fallback {fb_key_env} не задан")
 
     log.error("AI: все модели недоступны")
     return None
@@ -2408,7 +2430,7 @@ def process_file(
 
         # Этап 6: AI-постобработка (если --ai)
         if use_ai:
-            ai_cfg = config.get("postprocess", config)
+            ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
             md_text = ai_postprocess(md_text, ai_cfg, file_stem)
 
         # Сохраняем итоговый .md
