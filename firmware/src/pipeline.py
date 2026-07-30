@@ -789,15 +789,21 @@ def _crop_and_save_image(
 def _insert_images_into_md(
     md_text: str,
     extracted: list[dict],
+    pages: list[dict] = None,
 ) -> str:
-    """Вставить ссылки на извлечённые изображения в Markdown.
+    """Вставить ссылки на извлечённые изображения в Markdown по Y-координатам.
 
-    Сортирует изображения по страницам и порядковому номеру,
-    затем добавляет ссылки ![fig_N](image/fig_N.ext) в конец текста.
+    Сортирует изображения по страницам и Y-координате bounding box'а,
+    затем вставляет ссылки ![fig_N](image/fig_N.ext) на позиции,
+    пропорциональные Y-положению изображения на странице.
+
+    Если pages не передан — legacy-режим: все ссылки в конец текста.
 
     Args:
         md_text: Исходный Markdown-текст.
         extracted: Список от extract_images_from_pdf().
+        pages: Список страниц от send_to_yandex_ocr() — нужен для
+               Y-координат и размеров страниц.
 
     Returns:
         Markdown с вставленными ссылками на изображения.
@@ -805,18 +811,78 @@ def _insert_images_into_md(
     if not extracted:
         return md_text
 
-    # Сортируем по странице и номеру рисунка
-    sorted_imgs = sorted(extracted, key=lambda x: (x["page"], x["fig_num"]))
+    # Вспомогательная: Y-центр bounding box'а
+    def _get_y_center(img):
+        bbox = img.get("bbox", {})
+        vertices = bbox.get("vertices", [])
+        if vertices:
+            ys = [int(v.get("y", 0)) for v in vertices]
+            return sum(ys) / len(ys)
+        return 0
 
-    # Добавляем разделитель и ссылки
-    parts = [md_text.strip(), ""]
-    parts.append("---")
-    parts.append("")
+    # Сортируем по странице и Y
+    sorted_imgs = sorted(extracted, key=lambda x: (x["page"], _get_y_center(x)))
+
+    if not pages:
+        # Fallback: в конец файла (legacy)
+        parts = [md_text.strip(), "", "---", ""]
+        for img in sorted_imgs:
+            parts.append(f"![fig_{img['fig_num']}](image/{img['filename']})")
+        parts.append("")
+        return "\n".join(parts)
+
+    # Собираем markdown по страницам с сохранением page_idx
+    page_texts: dict[int, str] = {}
+    for pg_idx, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        md = ta.get("markdown", "")
+        if md:
+            page_texts[pg_idx] = md.strip()
+
+    # Группируем изображения по страницам
+    imgs_by_page: dict[int, list[dict]] = {}
     for img in sorted_imgs:
-        parts.append(f"![fig_{img['fig_num']}](image/{img['filename']})")
-    parts.append("")
+        pg = img["page"]
+        if pg not in imgs_by_page:
+            imgs_by_page[pg] = []
+        imgs_by_page[pg].append(img)
 
-    return "\n".join(parts)
+    # Собираем финальный текст постранично
+    result_parts = []
+    for pg_idx in sorted(page_texts.keys()):
+        page_md = page_texts[pg_idx]
+        lines = page_md.split("\n")
+        imgs = imgs_by_page.get(pg_idx, [])
+
+        if not imgs:
+            result_parts.append(page_md)
+            continue
+
+        # Высота страницы для пропорции Y
+        ta = pages[pg_idx].get("result", {}).get("textAnnotation", {})
+        page_height = float(ta.get("height", 3095))
+
+        # Точки вставки: (line_index, image_markdown)
+        insertions = []
+        for img in imgs:
+            y_center = _get_y_center(img)
+            y_frac = y_center / page_height if page_height > 0 else 0.5
+            y_frac = max(0.05, min(0.95, y_frac))
+            target_line = int(y_frac * len(lines))
+            target_line = max(0, min(len(lines) - 1, target_line))
+            img_md = f"![fig_{img['fig_num']}](image/{img['filename']})"
+            insertions.append((target_line, img_md))
+
+        # Вставляем снизу вверх, чтобы не смещать индексы
+        insertions.sort(key=lambda x: -x[0])
+        new_lines = list(lines)
+        for target_line, img_md in insertions:
+            new_lines.insert(target_line, "")
+            new_lines.insert(target_line, img_md)
+
+        result_parts.append("\n".join(new_lines))
+
+    return "\n\n".join(result_parts)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1303,19 +1369,48 @@ def fix_image_captions(md_text: str) -> str:
 
 
 def fix_table_fig_labels(md_text: str) -> str:
-    """Форматирование 'Таблица N' и 'Рис. N'."""
+    """Форматировать подписи 'Таблица N', 'Рисунок/Рис. N'.
+
+    - Убирает префикс # если был заголовком
+    - Форматирует как *курсив*
+    - Добавляет пустую строку перед подписью для визуального отделения
+    """
     lines = md_text.split("\n")
     result = []
+
+    # Паттерны: "Рисунок N", "Рис. N", "Таблица N" (с возможными пробелами между буквами OCR)
+    fig_pattern = re.compile(
+        r"^(?:#+\s*)?(Р\s*и\s*с\s*у\s*н\s*о\s*к|Р\s*и\s*с\s*\.?)\s*\d+",
+        re.IGNORECASE,
+    )
+    table_pattern = re.compile(
+        r"^(?:#+\s*)?(Т\s*а\s*б\s*л\s*и\s*ц\s*а|Таблиц[аы])\s*\d+",
+        re.IGNORECASE,
+    )
+
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith("#"):
-            if re.search(r"Таблица\s+\d+", stripped, re.IGNORECASE):
-                result.append(stripped.lstrip("#").strip())
-                continue
-            if re.search(r"Рис\.?\s+\d+", stripped, re.IGNORECASE):
-                result.append(stripped.lstrip("#").strip())
-                continue
+
+        if not stripped:
+            result.append(line)
+            continue
+
+        is_fig = fig_pattern.match(stripped)
+        is_table = table_pattern.match(stripped)
+
+        if is_fig or is_table:
+            # Убираем # префикс если был заголовком
+            caption = stripped.lstrip("#").strip()
+            # Форматируем как курсив
+            caption = f"*{caption}*"
+            # Добавляем пустую строку перед, если её нет
+            if result and result[-1].strip():
+                result.append("")
+            result.append(caption)
+            continue
+
         result.append(line)
+
     return "\n".join(result)
 
 
@@ -1324,7 +1419,12 @@ def fix_table_fig_labels(md_text: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fix_notes(md_text: str) -> str:
-    """Примечания под таблицами -> цитаты."""
+    """Примечания под таблицами -> цитаты.
+
+    Обрабатывает:
+    - Строки "Примечание" или "П р и м е ч а н и е" как отдельные строки
+    - Последние строки Markdown-таблиц, начинающиеся с "Примечание"
+    """
     lines = md_text.split("\n")
     result = []
     i = 0
@@ -1354,7 +1454,74 @@ def fix_notes(md_text: str) -> str:
         result.append(line)
         i += 1
 
+    # Шаг 2: обрабатываем Markdown-таблицы — извлекаем "Примечание" из последней строки
+    result = _extract_notes_from_md_tables(result)
+
     return "\n".join(result)
+
+
+def _extract_notes_from_md_tables(lines: list[str]) -> list[str]:
+    """Извлечь 'Примечание' из последней строки Markdown-таблиц.
+
+    Если последняя строка таблицы содержит текст, начинающийся с 'Примечание'
+    или 'Примечания', вырезает её из таблицы и добавляет как > blockquote
+    после таблицы.
+    """
+    result = []
+    i = 0
+
+    # Паттерн для детекции "Примечание" в ячейке таблицы
+    note_in_cell = re.compile(
+        r"^(?:П\s*р\s*и\s*м\s*е\s*ч\s*а\s*н\s*и\s*[ея]|Примечани[ея])",
+        re.IGNORECASE,
+    )
+
+    while i < len(lines):
+        # Ищем начало таблицы: строка с | и следом строка с :--- или ---
+        stripped = lines[i].strip()
+        if not stripped.startswith("|"):
+            result.append(lines[i])
+            i += 1
+            continue
+
+        # Собираем все строки таблицы
+        table_start = i
+        while i < len(lines) and lines[i].strip().startswith("|"):
+            i += 1
+        table_end = i
+
+        table_lines = lines[table_start:table_end]
+
+        # Минимум 3 строки для таблицы: заголовок, разделитель, данные
+        if len(table_lines) < 3:
+            result.extend(table_lines)
+            continue
+
+        # Проверяем последнюю строку таблицы на наличие "Примечание"
+        last_row = table_lines[-1].strip()
+        # Разбираем ячейки
+        cells = [c.strip() for c in last_row.split("|")[1:-1]]  # пропускаем пустые до/после |
+        first_cell = cells[0] if cells else ""
+
+        if note_in_cell.match(first_cell):
+            # Извлекаем примечание из таблицы
+            table_body = table_lines[:-1]  # таблица без последней строки
+            result.extend(table_body)
+
+            # Собираем текст примечания из первой ячейки
+            note_text = first_cell
+            # Добавляем текст из остальных ячеек (если он не пустой и не дублируется)
+            extra_texts = [c for c in cells[1:] if c.strip() and c.strip() != first_cell.strip()]
+            if extra_texts:
+                note_text += " " + " ".join(extra_texts)
+
+            result.append("")
+            result.append(f"> {note_text}")
+            result.append("")
+        else:
+            result.extend(table_lines)
+
+    return result
 
 
 def fix_ocr_artifacts(md_text: str) -> str:
@@ -1772,7 +1939,7 @@ def process_file(
                 pdf_path, pictures, img_dir, pages=pages,
             )
             # Вставляем ссылки на изображения в текст по координатам
-            md_text = _insert_images_into_md(md_text, extracted)
+            md_text = _insert_images_into_md(md_text, extracted, pages=pages)
             log.info(f"  Извлечено изображений: {len(extracted)}")
         else:
             log.info("  Нет pictures для извлечения")
