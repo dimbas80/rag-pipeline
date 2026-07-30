@@ -1349,6 +1349,235 @@ def _insert_images_into_md(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 4b. Vision-распознавание таблиц (--ai-table)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def extract_table_images(
+    pdf_path: str | Path,
+    pages: list[dict],
+    img_dir: str | Path,
+) -> list[dict]:
+    """Вырезать все таблицы из PDF по boundingBox из textAnnotation.tables[].
+
+    Использует PyMuPDF (fitz) для вырезки каждой таблицы как PNG (dpi=200).
+    Координаты преобразуются из Yandex-пикселей в PyMuPDF points
+    с помощью ta["width"]/ta["height"] (тот же механизм, что в
+    extract_images_from_pdf()).
+
+    Args:
+        pdf_path: Путь к PDF-файлу.
+        pages: Список страниц от send_to_yandex_ocr().
+        img_dir: Папка для сохранения PNG таблиц.
+
+    Returns:
+        [{"page": int, "table_idx": int, "path": "table_N.png"}, ...]
+    """
+    import fitz
+
+    pdf_path = Path(pdf_path).resolve()
+    img_dir = Path(img_dir)
+    ensure_dir(img_dir)
+
+    # Быстрая проверка: есть ли вообще таблицы на страницах?
+    has_any_table = any(
+        page_data.get("result", {}).get("textAnnotation", {}).get("tables", [])
+        for page_data in pages
+    )
+    if not has_any_table:
+        log.info("  Нет таблиц в JSON — пропускаю вырезку")
+        return []
+
+    doc = fitz.open(str(pdf_path))
+    table_images: list[dict] = []
+    table_counter = 0  # сквозной счётчик по всем страницам
+
+    for pi, page_data in enumerate(pages):
+        ta = page_data.get("result", {}).get("textAnnotation", {})
+        tables = ta.get("tables", [])
+
+        if not tables:
+            continue
+
+        page = doc[pi]
+        ya_w = float(ta.get("width", 1))
+        ya_h = float(ta.get("height", 1))
+        sx = page.rect.width / ya_w if ya_w > 0 else 1.0
+        sy = page.rect.height / ya_h if ya_h > 0 else 1.0
+
+        for ti, table in enumerate(tables):
+            bbox = table.get("boundingBox", {}).get("vertices", [])
+            if len(bbox) < 4:
+                log.warning(f"  Таблица стр.{pi+1}#{ti+1}: нет boundingBox")
+                continue
+
+            xs = [float(v.get("x", 0)) for v in bbox]
+            ys = [float(v.get("y", 0)) for v in bbox]
+            x0, y0 = min(xs) * sx - 2, min(ys) * sy - 2
+            x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
+
+            rect = fitz.Rect(x0, y0, x1, y1)
+            pix = page.get_pixmap(clip=rect, dpi=200)
+
+            table_counter += 1
+            fname = f"table_{table_counter}.png"
+            pix.save(str(img_dir / fname))
+
+            table_images.append({
+                "page": pi,
+                "table_idx": table_counter,
+                "path": fname,
+            })
+            log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
+
+    doc.close()
+    return table_images
+
+
+def _call_vision_api(
+    image_b64: str,
+    prompt: str,
+    config: dict,
+    api_key: str,
+) -> str | None:
+    """Отправить изображение в vision-модель (OpenAI-совместимый API).
+
+    Args:
+        image_b64: base64-encoded PNG.
+        prompt: Текстовый промпт.
+        config: Секция table_vision из config_ai.yaml.
+        api_key: API-ключ.
+
+    Returns:
+        Распознанный текст (Markdown) или None при ошибке.
+    """
+    model = config.get("model", "google/gemini-2.5-flash-lite")
+    base_url = config.get("base_url", "https://api.provod.ai/v1")
+    fallback = config.get("fallback", {})
+
+    def _do_vision(mdl: str, url: str, key: str) -> str | None:
+        payload = {
+            "model": mdl,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                ],
+            }],
+            "max_tokens": 8000,
+            "temperature": 0.0,
+        }
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=120) as client:
+                    resp = client.post(
+                        f"{url}/chat/completions",
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                if resp.status_code == 503:
+                    log.warning(f"  {mdl}: 503, попытка {attempt + 1}/3")
+                    time.sleep(5)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                # Убираем возможные markdown-обёртки
+                content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
+                content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
+                return content
+            except Exception as e:
+                log.warning(f"  {mdl}: {e}, попытка {attempt + 1}/3")
+                time.sleep(5)
+        return None
+
+    # Primary
+    log.info(f"  Vision: {model}")
+    result = _do_vision(model, base_url, api_key)
+    if result is not None:
+        return result
+
+    # Fallback
+    if fallback:
+        fb_model = fallback.get("model", "google/gemini-2.5-flash")
+        fb_url = fallback.get("base_url", "https://api.provod.ai/v1")
+        fb_key_env = fallback.get("api_key_env", "PROVOD_API_KEY")
+        fb_key = os.environ.get(fb_key_env, "")
+        if fb_key:
+            log.info(f"  Fallback vision: {fb_model}")
+            result = _do_vision(fb_model, fb_url, fb_key)
+            if result is not None:
+                return result
+        else:
+            log.warning(f"  Fallback {fb_key_env} не задан")
+
+    log.error("  Vision: все модели недоступны")
+    return None
+
+
+def recognize_tables_vision(
+    table_images: list[dict],
+    img_dir: str | Path,
+    config: dict,
+    tmp_dir: str | Path,
+    api_key: str,
+) -> int:
+    """Распознать вырезанные таблицы через vision-модель.
+
+    Для каждой вырезанной PNG отправляет её в vision-модель
+    (Gemini через Provod API) с промптом из config.
+    Результат сохраняется как tmp/<file>/table_N.md.
+
+    Args:
+        table_images: Список от extract_table_images().
+        img_dir: Папка с PNG таблиц.
+        config: Полный конфиг (должен содержать table_vision секцию).
+        tmp_dir: Папка tmp/<имя_файла> для сохранения .md результатов.
+        api_key: API-ключ из PROVOD_API_KEY.
+
+    Returns:
+        Количество успешно распознанных таблиц.
+    """
+    vision_cfg = config.get("table_vision", {})
+    if not vision_cfg:
+        log.warning("  Нет секции table_vision в конфиге — пропускаю")
+        return 0
+
+    prompt = vision_cfg.get("prompt",
+        "Переведи данную таблицу в markdown формат.\n"
+        "Текст объединённых ячеек продублируй в каждой строке или столбце.\n"
+        "Если в первом столбце есть цифровой ряд по порядку — это номер строки, выведи в отдельную колонку."
+    )
+
+    success = 0
+    for ti in table_images:
+        fname = ti["path"]
+        img_path = Path(img_dir) / fname
+        if not img_path.exists():
+            log.warning(f"  Файл не найден: {img_path}")
+            continue
+
+        log.info(f"  Распознавание таблицы {ti['table_idx']}: {fname}")
+        with open(img_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        result = _call_vision_api(b64, prompt, vision_cfg, api_key)
+        if result:
+            out_path = Path(tmp_dir) / f"table_{ti['table_idx']}.md"
+            safe_write(out_path, result)
+            log.info(f"    Результат: {out_path} ({len(result)} символов)")
+            success += 1
+        else:
+            log.warning(f"    Таблица {ti['table_idx']}: не распознана")
+
+    return success
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 5. Постобработка: LaTeX
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2329,12 +2558,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Пайплайн конвертации PDF/DOCX в Markdown через Yandex Vision OCR",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""\
+        epilog="""\\
 Примеры:
   %(prog)s -i file.pdf
   %(prog)s -i dir/ --ai
   %(prog)s -i file.pdf --ai --config my_config.yaml
   %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
+  %(prog)s -i file.pdf --ai-table          # + vision-распознавание таблиц
+  %(prog)s -i file.pdf --ai-table --ai     # + vision + AI-постобработка (gap-filling)
         """,
     )
 
@@ -2349,6 +2580,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Включить AI-постобработку. Для .md — единственный режим (без OCR)",
     )
     parser.add_argument(
+        "--ai-table",
+        action="store_true",
+        help="AI-распознавание таблиц через vision-модель (вырезка из PDF + Gemini)",
+    )
+    parser.add_argument(
         "--config",
         default="./config_ai.yaml",
         help="Путь к config_ai.yaml (по умолч. ./config_ai.yaml)",
@@ -2360,6 +2596,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def process_file(
     input_path: str,
     use_ai: bool,
+    use_ai_table: bool,
     config: dict,
     api_key: str,
     folder_id: str,
@@ -2367,6 +2604,9 @@ def process_file(
     tmp_base: str,
 ) -> bool:
     """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
+
+    Args:
+        use_ai_table: Включить vision-распознавание таблиц (--ai-table).
 
     Returns:
         True при успехе, False при ошибке.
@@ -2449,6 +2689,25 @@ def process_file(
         else:
             log.info("  Нет pictures для извлечения")
 
+        # Этап 4b: Vision-распознавание таблиц (если --ai-table)
+        if use_ai_table and pages:
+            log.info("Vision-распознавание таблиц:")
+            table_images = extract_table_images(pdf_path, pages, img_dir)
+            log.info(f"  Вырезано таблиц: {len(table_images)}")
+
+            if table_images:
+                vision_api_key = os.environ.get(
+                    config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"),
+                    "",
+                )
+                if vision_api_key:
+                    recognized = recognize_tables_vision(
+                        table_images, img_dir, config, file_tmp_dir, vision_api_key,
+                    )
+                    log.info(f"  Распознано таблиц: {recognized}/{len(table_images)}")
+                else:
+                    log.warning("  PROVOD_API_KEY не задан — vision-распознавание пропущено")
+
         # Этап 5: Скриптовая постобработка
         md_text = run_script_postprocess(md_text, img_dir)
 
@@ -2456,6 +2715,31 @@ def process_file(
         if use_ai:
             ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
             md_text = ai_postprocess(md_text, ai_cfg, file_stem)
+
+        # Этап 6b: Gap-filling — проверить таблицы vision-результатом (если --ai + --ai-table)
+        if use_ai and use_ai_table:
+            table_files = sorted(Path(file_tmp_dir).glob("table_*.md"))
+            if table_files:
+                log.info("Gap-filling: сверка таблиц с vision-результатом")
+                table_texts = "\n\n".join(
+                    f.read_text(encoding="utf-8") for f in table_files
+                )
+                # Передаём полный текст: markdown + таблицы из vision
+                gap_input = (
+                    f"Проверь все таблицы в Markdown-файле ниже с файлами таблиц, "
+                    f"полученными из vision-распознавания. "
+                    f"Дополни пропущенные или нераспознанные данные в таблицах. "
+                    f"Не выдумывай данные.\n\n"
+                    f"=== Markdown-файл ===\n{md_text}\n\n"
+                    f"=== Файлы таблиц (vision-распознавание) ===\n{table_texts}\n"
+                )
+                ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
+                gap_result = _call_ai_api(gap_input, ai_cfg)
+                if gap_result:
+                    md_text = gap_result
+                    log.info(f"  Gap-filling: применён ({len(gap_result)} символов)")
+                else:
+                    log.warning("  Gap-filling: модель не ответила")
 
         # Сохраняем итоговый .md
         md_path = out_dir / f"{file_stem}.md"
@@ -2493,6 +2777,7 @@ def main() -> None:
 
     log.info(f"Вход: {args.input}")
     log.info(f"AI: {args.ai}")
+    log.info(f"AI-Table: {args.ai_table}")
     log.info(f"Выход: {output_base}")
     log.info(f"Лог: {log_path}")
 
@@ -2517,8 +2802,8 @@ def main() -> None:
             log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
             sys.exit(1)
 
-    # Загружаем конфиг AI (если нужен)
-    config = load_config(args.config) if args.ai else {}
+    # Загружаем конфиг AI (если нужен — для --ai или --ai-table)
+    config = load_config(args.config) if (args.ai or args.ai_table) else {}
 
     # Обрабатываем каждый файл
     success = 0
@@ -2527,6 +2812,7 @@ def main() -> None:
         ok = process_file(
             str(file_path),
             args.ai,
+            args.ai_table,
             config,
             api_key,
             folder_id,
