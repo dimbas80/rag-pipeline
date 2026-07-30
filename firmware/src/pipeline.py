@@ -476,12 +476,31 @@ def parse_yandex_json_to_md(
     page_boundaries: list[tuple[int, int]] = []
     pictures: list[dict] = []
     pic_counter = 0  # счётчик для @@IMAGE_N@@ плейсхолдеров (по Y-порядку)
+    page_has_continuation: list[bool] = []  # page-level: есть "Окончание/Продолжение таблицы" блок
 
     for page_idx, page in enumerate(pages):
         ta = page.get("result", {}).get("textAnnotation", {})
         blocks = ta.get("blocks", [])
         raw_tables = ta.get("tables", [])
         page_pictures_list = ta.get("pictures", [])
+
+        # Определяем, есть ли на странице блоки "Окончание/Продолжение таблицы N"
+        # (эти блоки подавляются _block_to_md(), т.к. содержат слово "Таблица",
+        # поэтому их нужно детектить из сырого JSON до рендеринга)
+        _has_cont = False
+        for block in blocks:
+            _lines = block.get("lines", [])
+            _text = " ".join(
+                _l.get("text", "") for _l in _lines
+            ).strip()
+            if re.search(
+                r"(?:Окончани[ея]|Продолжени[ее]|Продолж\.?)\s+"
+                r"(?:таблиц[аы]|табл\.?)",
+                _text, re.IGNORECASE,
+            ):
+                _has_cont = True
+                break
+        page_has_continuation.append(_has_cont)
 
         # 1. Собираем все элементы страницы с Y-координатой
         elements: list[tuple[float, str, dict]] = []  # [(y, type, data), ...]
@@ -585,7 +604,13 @@ def parse_yandex_json_to_md(
         page_boundaries = []
 
     # Склеиваем разорванные между страницами таблицы (Окончание/Продолжение)
-    md_text = _stitch_continuation_tables(md_text)
+    # Передаём page-level контекст, т.к. "Окончание таблицы N" блоки
+    # подавляются _block_to_md() и не попадают в md_text
+    md_text = _stitch_continuation_tables(
+        md_text,
+        page_boundaries=page_boundaries,
+        page_has_continuation=page_has_continuation,
+    )
 
     return md_text, pictures, page_boundaries
 
@@ -947,16 +972,31 @@ def _matrix_to_md_table(matrix: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _stitch_continuation_tables(md_text: str) -> str:
+def _stitch_continuation_tables(
+    md_text: str,
+    page_boundaries: list[tuple[int, int]] | None = None,
+    page_has_continuation: list[bool] | None = None,
+) -> str:
     """Склеить таблицы, разорванные между страницами (Окончание/Продолжение).
 
     Ищет пары последовательных Markdown-таблиц, где в тексте между ними
     встречается «Окончание таблицы N» или «Продолжение таблицы N».
-    Строки данных второй таблицы добавляются к первой, а подпись-продолжение
-    и дублирующийся заголовок удаляются.
+
+    Если page-контекст передан, дополнительно проверяет:
+      — Находится ли текущая таблица на следующей странице относительно предыдущей
+      — Есть ли на этой странице блок "Окончание/Продолжение таблицы" (из JSON)
+      — Совпадают ли номера таблиц в caption
+
+    Это нужно, потому что «Окончание таблицы N» — LAYOUT_TYPE_SECTION_HEADER,
+    который подавляется _block_to_md() из-за слова «Таблица» и не попадает
+    в финальный md_text.
 
     Args:
         md_text: Markdown-текст с возможными разорванными таблицами.
+        page_boundaries: [(start_line, end_line), ...] для каждой страницы.
+        page_has_continuation: [bool, ...] — есть ли на странице блок с
+            "Окончание/Продолжение таблицы". Должен быть той же длины, что
+            page_boundaries.
 
     Returns:
         Текст со склеенными таблицами.
@@ -1031,34 +1071,63 @@ def _stitch_continuation_tables(md_text: str) -> str:
             "before_text": before_text,
         })
 
+    # Вспомогательная: к какой странице относится строка line_num
+    def _page_of_line(line_num: int) -> int | None:
+        if page_boundaries is None:
+            return None
+        for page_idx, (p_start, p_end) in enumerate(page_boundaries):
+            if p_start <= line_num < p_end:
+                return page_idx
+        return None
+
     # Склеиваем
     result: list[str] = []
     i = 0
     while i < len(tables_info):
         t = tables_info[i]
 
-        if t["has_continuation"] and t["table_num"] and i > 0:
+        # Проверка: это продолжение таблицы с предыдущей страницы?
+        is_continuation = False
+        if i > 0:
             prev = tables_info[i - 1]
-            if prev["table_num"] == t["table_num"]:
-                # Нашли пару — склеиваем: данные из t добавляем к result
-                t_lines = t["lines"]
-                sep_idx = -1
-                for li, tl in enumerate(t_lines):
-                    if ":--" in tl or "---" in tl:
-                        sep_idx = li
-                        break
-                if sep_idx >= 0 and sep_idx + 1 < len(t_lines):
-                    data_lines = t_lines[sep_idx + 1:]
-                    # Пропускаем первую строку данных, если она дублирует
-                    # последнюю строку предыдущей таблицы
-                    if prev["lines"] and data_lines:
-                        last_prev = prev["lines"][-1].strip()
-                        first_data = data_lines[0].strip()
-                        if last_prev == first_data:
-                            data_lines = data_lines[1:]
-                    result.extend(data_lines)
-                i += 1
-                continue
+            # Способ 1: явный маркер "Окончание/Продолжение" в тексте + совпадение номеров
+            if (t["has_continuation"] and t["table_num"]
+                    and prev["table_num"] == t["table_num"]):
+                is_continuation = True
+            # Способ 2: page-level контекст — таблица на другой странице,
+            #          на той странице есть блок "Окончание/Продолжение",
+            #          и предыдущая таблица имеет номер (продолжение без caption)
+            elif (page_boundaries and page_has_continuation
+                  and prev["table_num"] is not None):
+                t_page = _page_of_line(t["start"])
+                prev_page = _page_of_line(prev["start"])
+                if (t_page is not None and prev_page is not None
+                        and t_page != prev_page
+                        and t_page < len(page_has_continuation)
+                        and page_has_continuation[t_page]):
+                    is_continuation = True
+
+        if is_continuation and i > 0:
+            prev = tables_info[i - 1]
+            # Нашли пару — склеиваем: данные из t добавляем к result
+            t_lines = t["lines"]
+            sep_idx = -1
+            for li, tl in enumerate(t_lines):
+                if ":--" in tl or "---" in tl:
+                    sep_idx = li
+                    break
+            if sep_idx >= 0 and sep_idx + 1 < len(t_lines):
+                data_lines = t_lines[sep_idx + 1:]
+                # Пропускаем первую строку данных, если она дублирует
+                # последнюю строку предыдущей таблицы
+                if prev["lines"] and data_lines:
+                    last_prev = prev["lines"][-1].strip()
+                    first_data = data_lines[0].strip()
+                    if last_prev == first_data:
+                        data_lines = data_lines[1:]
+                result.extend(data_lines)
+            i += 1
+            continue
 
         # Не продолжение — добавляем как есть
         prev_end = tables_info[i - 1]["end"] if i > 0 else 0
