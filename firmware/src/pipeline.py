@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pipeline.py — Пайплайн конвертации PDF/DOCX в Markdown через Yandex Vision OCR.
+pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown через Yandex Vision OCR.
 
 Модель: math-markdown (даёт markdown + tables + pictures + blocks).
 
@@ -9,9 +9,12 @@ pipeline.py — Пайплайн конвертации PDF/DOCX в Markdown ч�
     OCR-артефакты, примечания, подписи
   — AI (флаг --ai): deepseek-v4-flash → gemini-3.5-flash (через DeepSeek / Provod)
 
+Режим .md + --ai: только AI-постобработка готового .md файла, без OCR.
+
 Использование:
   python3 pipeline.py -i file.pdf
   python3 pipeline.py -i file.pdf --ai --config config_ai.yaml
+  python3 pipeline.py -i file.md --ai                 # только AI
   python3 pipeline.py -i dir/
 """
 
@@ -52,7 +55,7 @@ YANDEX_POLL_TIMEOUT = 600  # 10 минут
 YANDEX_POLL_INTERVAL = 2
 
 # Поддерживаемые расширения
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc"}
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".md"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2331,18 +2334,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   %(prog)s -i file.pdf
   %(prog)s -i dir/ --ai
   %(prog)s -i file.pdf --ai --config my_config.yaml
+  %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
         """,
     )
 
     parser.add_argument(
         "-i", "--input",
         required=True,
-        help="Входной файл или папка с файлами (PDF/DOCX/DOC)",
+        help="Входной файл или папка (PDF/DOCX/DOC/MD). Для .md обязателен флаг --ai",
     )
     parser.add_argument(
         "--ai",
         action="store_true",
-        help="Включить AI-постобработку (gemini-3.5-flash / claude-sonnet-5)",
+        help="Включить AI-постобработку. Для .md — единственный режим (без OCR)",
     )
     parser.add_argument(
         "--config",
@@ -2380,10 +2384,30 @@ def process_file(
     ensure_dir(img_dir)
     ensure_dir(file_tmp_dir)
 
+    # Режим: .md + --ai → только AI-постобработка, без OCR и скриптов
+    ext = Path(input_path).suffix.lower()
+    if ext == ".md":
+        if use_ai:
+            log.info(f"AI-постобработка MD: {file_stem}.md")
+            md_text = Path(input_path).read_text(encoding="utf-8")
+            ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
+            result = ai_postprocess(md_text, ai_cfg, file_stem)
+            if result:
+                out_path = Path(input_path).parent / f"{file_stem}_ai.md"
+                safe_write(out_path, result)
+                log.info(f"Результат: {out_path} ({len(result)} символов)")
+                log.info(f"{'=' * 60}")
+                return True
+            else:
+                log.error("AI-постобработка не дала результата")
+                return False
+        else:
+            log.error(".md файл требует флаг --ai")
+            return False
+
     # Этап 1: DOCX → PDF (если нужно)
     pdf_path = input_path
     was_docx = False
-    ext = Path(input_path).suffix.lower()
     if ext in (".docx", ".doc"):
         try:
             pdf_path = str(convert_docx_to_pdf(input_path, file_tmp_dir))
@@ -2453,19 +2477,6 @@ def main() -> None:
     """Точка входа. Парсинг аргументов, итерация по файлам, process_file()."""
     args = parse_args()
 
-    # Загружаем .env
-    env_path = Path(__file__).parent / ".env"
-    load_env(env_path)
-    api_key = os.environ.get("YANDEX_API_KEY", "")
-    folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
-
-    if not api_key or not folder_id:
-        log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
-        sys.exit(1)
-
-    # Загружаем конфиг AI (если нужен)
-    config = load_config(args.config) if args.ai else {}
-
     # Определяем выходные папки относительно входного файла/папки
     input_path = Path(args.input).resolve()
     if input_path.is_file():
@@ -2492,6 +2503,22 @@ def main() -> None:
         sys.exit(1)
 
     log.info(f"Найдено файлов: {len(files)}")
+
+    # Загружаем .env
+    env_path = Path(__file__).parent / ".env"
+    load_env(env_path)
+    api_key = os.environ.get("YANDEX_API_KEY", "")
+    folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
+
+    # Yandex API ключи нужны только если есть не-.md файлы
+    need_yandex = any(f.suffix.lower() != ".md" for f in files)
+    if need_yandex:
+        if not api_key or not folder_id:
+            log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
+            sys.exit(1)
+
+    # Загружаем конфиг AI (если нужен)
+    config = load_config(args.config) if args.ai else {}
 
     # Обрабатываем каждый файл
     success = 0
