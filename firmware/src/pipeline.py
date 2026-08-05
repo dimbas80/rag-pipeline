@@ -4560,6 +4560,14 @@ def main() -> None:
     output_base = str(base_dir / "Markdown")
     tmp_base = str(base_dir / "tmp")
 
+    # Если входной .md лежит внутри Markdown/ → лог пишем в tmp/ рядом с Markdown/,
+    # а не внутри Markdown/<file>/tmp/. Это тот же tmp/, куда пишется лог пайплайна.
+    if "Markdown" in input_path.parts:
+        # Найти сегмент Markdown/ в пути и взять его родителя
+        mdx = list(input_path.parts).index("Markdown")
+        source_dir = Path(*input_path.parts[:mdx])
+        tmp_base = str(source_dir / "tmp")
+
     # Настраиваем логгирование
     log_path = Path(tmp_base) / "Create_Markdown_VisionOCR.log"
     setup_logging(log_path)
