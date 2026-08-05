@@ -7,7 +7,8 @@ pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown 
 Постобработка:
   — скриптовая (всегда): HTML-таблицы → MD, LaTeX-чистка, изображения → fig_N,
     OCR-артефакты, примечания, подписи
-  — AI (флаг --ai): deepseek-v4-flash → gemini-3.5-flash (через DeepSeek / Provod)
+  — AI (флаг --ai): vision-распознавание таблиц → единый AI-проход
+    (коррекция таблиц + постобработка) через deepseek / provod
 
 Режим .md + --ai: только AI-постобработка готового .md файла, без OCR.
 
@@ -15,6 +16,7 @@ pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown 
   python3 pipeline.py -i file.pdf
   python3 pipeline.py -i file.pdf --ai --config config_ai.yaml
   python3 pipeline.py -i file.md --ai                 # только AI
+  python3 pipeline.py -i file.pdf --rag               # + RAG JSONL (секция 12)
   python3 pipeline.py -i dir/
 """
 
@@ -26,8 +28,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import httpx
 import yaml
@@ -48,7 +52,7 @@ YANDEX_POLL_URL = "https://ai.api.cloud.yandex.net/ocr/v1/getRecognition"
 PROVOD_BASE_URL = "https://api.provod.ai/v1"
 
 # Лимиты
-AI_MAX_CHARS = 24000
+AI_MAX_CHARS = 80000
 YANDEX_MAX_PAGES = 200
 YANDEX_MAX_SIZE_MB = 10
 YANDEX_POLL_TIMEOUT = 600  # 10 минут
@@ -90,6 +94,10 @@ def setup_logging(log_path: str | Path) -> logging.Logger:
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
     root.addHandler(fh)
+
+    # Подавляем DEBUG от httpcore/httpx (сильно тормозит на больших ответах)
+    for noisy in ("httpcore", "httpx", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     return logging.getLogger("create-md-ya")
 
@@ -156,10 +164,33 @@ def find_input_files(input_path: str) -> list[Path]:
 
 
 def safe_write(path: str | Path, content: str) -> None:
-    """Безопасно записать файл (создать папки)."""
+    """Атомарно записать файл (temp-file + os.replace).
+
+    Пишет во временный файл в той же директории (создавая её при
+    необходимости), затем os.replace() — перезапись атомарна: читатели
+    видят либо старое, либо новое содержимое, никогда частичную запись.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        # Убираем временный файл при ошибке, не прячем исходную ошибку
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1153,6 +1184,130 @@ def _stitch_continuation_tables(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3b. Heading Extractor (ADR-8)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_HEADING_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)*)\.\s")
+_HEADING_Y_TOLERANCE = 15.0
+_HEADING_MAX_LEN = 100
+_HEADING_MAX_WORDS = 10
+_HEADING_REL_X_MAX = 0.50
+
+
+def _extract_headings_from_json(pages: list[dict] | None = None) -> list[dict]:
+    """Извлечь заголовки разделов из Yandex OCR JSON.
+
+    5 правил (ADR-8):
+      1. Текст начинается с номера раздела: ^\\d+\\.(\\d+\\.)*\\s
+      2. Длина: len(text) < 100 символов И слов < 10
+      3. Левый край: x_left / page_width < 0.50
+      4. Один блок на строке: на той же странице и Y (±15px) нет других блоков
+      5. Уровень по глубине номера: "3"→1, "3.2"→2, "3.2.1"→3, "3.2.1.1"→4
+
+    Returns:
+        [{"page": N, "y": Y, "level": L, "number": "3.2.1",
+          "text": "Молниеприемники", "full_text": "3.2.1. Молниеприемники"}, ...]
+    """
+    if not pages:
+        return []
+
+    headings: list[dict] = []
+
+    for page_idx, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        blocks = ta.get("blocks", [])
+        if not blocks:
+            continue
+
+        page_width = float(ta.get("width") or 0) or 1.0
+
+        # Per-page Y-индекс всех блоков (правило 4: один блок на строке)
+        y_tops: list[float] = []
+        for block in blocks:
+            vertices = block.get("boundingBox", {}).get("vertices", [])
+            if vertices:
+                y_tops.append(min(float(v.get("y", 0)) for v in vertices))
+
+        for block in blocks:
+            vertices = block.get("boundingBox", {}).get("vertices", [])
+            if not vertices:
+                continue
+
+            # Текст блока — как в _block_to_md(): join строк с пробелом
+            text_parts: list[str] = []
+            for line_data in block.get("lines", []):
+                t = line_data.get("text", "").strip()
+                if t:
+                    text_parts.append(t)
+            text = " ".join(text_parts).strip()
+            if not text:
+                continue
+
+            # Правило 1: текст начинается с номера раздела
+            m = _HEADING_NUMBER_RE.match(text)
+            if not m:
+                continue
+
+            # Правило 2: длина и число слов
+            if len(text) >= _HEADING_MAX_LEN or len(text.split()) >= _HEADING_MAX_WORDS:
+                continue
+
+            # Правило 3: левый край страницы (не таблица/центр)
+            x_left = min(float(v.get("x", 0)) for v in vertices)
+            if page_width and x_left / page_width >= _HEADING_REL_X_MAX:
+                continue
+
+            # Правило 4: один блок на строке (±15px) — отсекает ячейки таблиц
+            y_top = min(float(v.get("y", 0)) for v in vertices)
+            blocks_at_y = sum(
+                1 for y in y_tops if abs(y - y_top) <= _HEADING_Y_TOLERANCE
+            )
+            if blocks_at_y != 1:
+                continue
+
+            # Правило 5: уровень по глубине номера
+            number = m.group(1)
+            level = number.count(".") + 1
+
+            headings.append(
+                {
+                    "page": page_idx,
+                    "y": y_top,
+                    "level": level,
+                    "number": number,
+                    "text": text[m.end():].strip(),
+                    "full_text": text,
+                }
+            )
+
+    return headings
+
+
+def _apply_headings_to_md(md_text: str, headings: list[dict] | None = None) -> str:
+    """Заменить **жирные** заголовки разделов на Markdown-заголовки.
+
+    Для каждого heading ищет в md_text строку **full_text** и заменяет
+    на '#' * (level + 1) + ' ' + full_text через re.sub(count=1) —
+    дубликаты (например, в оглавлении) остаются жирным текстом.
+
+    Если headings пуст — вернуть md_text без изменений.
+    """
+    if not headings or not md_text:
+        return md_text
+
+    for heading in headings:
+        full_text = heading.get("full_text", "")
+        level = heading.get("level", 1)
+        if not full_text:
+            continue
+        pattern = r"\*\*" + re.escape(full_text) + r"\*\*"
+        replacement = "#" * (level + 1) + " " + full_text
+        md_text = re.sub(pattern, replacement, md_text, count=1)
+
+    return md_text
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 4. Извлечение изображений из PDF
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1349,7 +1504,7 @@ def _insert_images_into_md(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 4b. Vision-распознавание таблиц (--ai-table)
+# 4b. Vision-распознавание таблиц (в составе --ai)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -1371,7 +1526,9 @@ def extract_table_images(
         img_dir: Папка для сохранения PNG таблиц.
 
     Returns:
-        [{"page": int, "table_idx": int, "path": "table_N.png"}, ...]
+        [{"page": int, "table_idx": int, "path": "table_N.png", "id": "t_pN_M"}, ...]
+        id — сквозная метка таблицы: t_p{page+1}_{table_index_on_page}
+        (page+1 — 1-based страница, index — 0-based индекс на странице).
     """
     import fitz
 
@@ -1413,7 +1570,8 @@ def extract_table_images(
 
             xs = [float(v.get("x", 0)) for v in bbox]
             ys = [float(v.get("y", 0)) for v in bbox]
-            x0, y0 = min(xs) * sx - 2, min(ys) * sy - 2
+            x0 = min(xs) * sx - 2
+            y0 = max(0, min(ys) * sy - 32)  # +30px вверх для заголовка
             x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
 
             rect = fitz.Rect(x0, y0, x1, y1)
@@ -1427,6 +1585,7 @@ def extract_table_images(
                 "page": pi,
                 "table_idx": table_counter,
                 "path": fname,
+                "id": f"t_p{pi + 1}_{ti}",
             })
             log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
 
@@ -1534,7 +1693,8 @@ def recognize_tables_vision(
 
     Для каждой вырезанной PNG отправляет её в vision-модель
     (Gemini через Provod API) с промптом из config.
-    Результат сохраняется как tmp/<file>/table_N.md.
+    Результат сохраняется как tmp/<file>/table_N.md;
+    первой строкой файла идёт ID-маркер <!-- t_pN_M --> (из table_images[].id).
 
     Args:
         table_images: Список от extract_table_images().
@@ -1551,11 +1711,10 @@ def recognize_tables_vision(
         log.warning("  Нет секции table_vision в конфиге — пропускаю")
         return 0
 
-    prompt = vision_cfg.get("prompt",
-        "Переведи данную таблицу в markdown формат.\n"
-        "Текст объединённых ячеек продублируй в каждой строке или столбце.\n"
-        "Если в первом столбце есть цифровой ряд по порядку — это номер строки, выведи в отдельную колонку."
-    )
+    prompt = vision_cfg.get("prompt")
+    if not prompt:
+        log.error("не задан промт: укажите prompt в секции table_vision конфига")
+        sys.exit(1)
 
     success = 0
     for ti in table_images:
@@ -1572,7 +1731,7 @@ def recognize_tables_vision(
         result = _call_vision_api(b64, prompt, vision_cfg, api_key)
         if result:
             out_path = Path(tmp_dir) / f"table_{ti['table_idx']}.md"
-            safe_write(out_path, result)
+            safe_write(out_path, f"<!-- {ti['id']} -->\n{result}")
             log.info(f"    Результат: {out_path} ({len(result)} символов)")
             success += 1
         else:
@@ -1606,8 +1765,9 @@ def _simplify_math_commands(text: str) -> str:
     text = re.sub(r"\\tt\s*\{\s*([^}]+?)\s*\}", r"\1", text)
     # \\sf — переключатель шрифта sans-serif, не нужен
     text = re.sub(r"\\sf\s*", "", text)
-    # \\f — OCR-артефакт, невалидная LaTeX-команда
-    text = re.sub(r"\\f\s*", "", text)
+    # \\f — OCR-артефакт, невалидная LaTeX-команда; НЕ трогать \\frac, \\flat и др.
+    # (?![a-zA-Z]) — удалять только если за \\f не идёт буква (иначе съедаем команду)
+    text = re.sub(r"\\f(?![a-zA-Z])\s*", "", text)
     return text
 
 
@@ -2016,6 +2176,10 @@ def merge_tables(md_text: str) -> str:
 def rename_images(md_text: str, img_dir: str | Path) -> tuple[str, int]:
     """Переименовать хеш-изображения в fig_N, поправить ссылки."""
     img_dir = Path(img_dir)
+    # Защита: пустой img_dir = Path('.') — переименовал бы текущую папку
+    if not str(img_dir).strip() or img_dir == Path("."):
+        log.warning("  rename_images: img_dir пуст — переименование пропущено")
+        return md_text, 0
     if not img_dir.exists():
         return md_text, 0
 
@@ -2247,22 +2411,171 @@ def fix_ocr_artifacts(md_text: str) -> str:
     return md_text
 
 
+def fix_latex_caret_spaces(md_text: str) -> str:
+    """Добавить пробелы вокруг ^ внутри LaTeX-формул ($...$ и $$...$$).
+
+    Правило (как в AI-промпте config_ai.yaml, но без --ai):
+      - внутри формул перед ^ ставится пробел, если его нет;
+      - внутри формул после ^ ставится пробел, если его нет;
+      - ^ вне формул не трогается;
+      - экранированный \\^ (например 90\\^{\\circ}) не трогается;
+      - уже существующие пробелы не дублируются.
+    """
+    # $$...$$ (многострочные) обрабатываем первыми, чтобы $...$ не «съел» их границы.
+    _formula_re = re.compile(r"\$\$((?s:.+?))\$\$|\$(.+?)\$")
+
+    def _fix_carets(content: str) -> str:
+        # пробел перед ^ (если перед ним не пробел и это не \\^)
+        content = re.sub(r"(\S)(?<!\\)\^", r"\1 ^", content)
+        # пробел после ^ (если после него не пробел и это не \\^)
+        content = re.sub(r"(?<!\\)\^(\S)", r"^ \1", content)
+        return content
+
+    def _rep(m):
+        if m.group(1) is not None:
+            return f"$${_fix_carets(m.group(1))}$$"
+        return f"${_fix_carets(m.group(2))}$"
+
+    return _formula_re.sub(_rep, md_text)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 9. Полная скриптовая постобработка
 # ═══════════════════════════════════════════════════════════════════════════
 
-def run_script_postprocess(md_text: str, img_dir: str | Path) -> str:
+def _inject_table_ids(
+    md_text: str,
+    page_boundaries: list[tuple[int, int]] | None = None,
+    table_images: list[dict] | None = None,
+) -> str:
+    """Вставить ID-маркеры <!-- t_pN_M --> перед Markdown-таблицами.
+
+    Сквозная маркировка для AI-сопоставления OCR-таблиц с vision-эталонами
+    (тот же формат id, что в extract_table_images(): t_p{page+1}_{index}).
+
+    Логика:
+      - md_text разбивается на строки; для каждой строки определяется номер
+        страницы через page_boundaries ([(start, end), ...], 0-based строки,
+        end exclusive).
+      - Таблица = группа строк |...|, перед которой (пропуская пустые строки)
+        идёт строка-название (не |...|-строка). Несколько |...|-строк подряд —
+        ОДНА таблица.
+      - Индекс таблицы на странице (idx) сбрасывается на новой странице.
+      - Маркер <!-- t_p{page+1}_{idx} --> вставляется отдельной строкой
+        ПЕРЕД строкой-названием.
+
+    Порядок таблиц в md_text совпадает с порядком в Yandex JSON (один
+    источник — parse_yandex_json_to_md), поэтому индексы совпадают с id
+    из extract_table_images().
+
+    Args:
+        md_text: Markdown-текст (после шагов 1–2 постобработки).
+        page_boundaries: Границы страниц в md_text.
+        table_images: Список от extract_table_images() — используется как
+            признак «включить маркировку» (проверяется в
+            run_script_postprocess()).
+
+    Returns:
+        md_text с вставленными ID-маркерами.
+    """
+    if not page_boundaries:
+        return md_text
+
+    lines = md_text.split("\n")
+
+    def _is_row(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith("|") and "|" in stripped[1:]
+
+    def _page_of_line(line_num: int) -> int:
+        for page_idx, (p_start, p_end) in enumerate(page_boundaries):
+            if p_start <= line_num < p_end:
+                return page_idx
+        # Строки за пределами последней границы относим к последней странице
+        return len(page_boundaries) - 1
+
+    # Проход 1: найти таблицы — пары (индекс строки-названия, индекс первой |-строки)
+    table_starts: list[tuple[int, int]] = []
+    prev_nonblank = -1
+    prev_nonblank_is_row = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        is_row = _is_row(line)
+        if is_row and not prev_nonblank_is_row:
+            table_starts.append((prev_nonblank, i))
+        prev_nonblank = i
+        prev_nonblank_is_row = is_row
+
+    if not table_starts:
+        return md_text
+
+    # Собираем маркеры: по одному на строку-название, индекс — на страницу
+    markers: dict[int, str] = {}
+    page_table_idx: dict[int, int] = {}
+    for name_idx, first_row_idx in table_starts:
+        page = _page_of_line(first_row_idx)
+        idx = page_table_idx.get(page, 0)
+        markers[name_idx] = f"<!-- t_p{page + 1}_{idx} -->"
+        page_table_idx[page] = idx + 1
+
+    # Проход 2: собрать результат, вставляя маркер перед строкой-названием
+    result: list[str] = []
+    # Таблица в самом начале документа без строки-названия — маркер в начало
+    prefix = markers.pop(-1, None)
+    if prefix is not None:
+        result.append(prefix)
+    for i, line in enumerate(lines):
+        marker = markers.get(i)
+        if marker is not None:
+            result.append(marker)
+        result.append(line)
+
+    return "\n".join(result)
+
+
+def _table_id_sort_key(tid: str) -> tuple[int, int]:
+    """Ключ сортировки ID-маркеров таблиц в порядке t_p1_0, t_p1_1, t_p2_0, ...
+
+    Парсит ID вида t_p{page}_{index} и возвращает (page, index).
+    Неизвестный формат сортируется первым ((0, 0)).
+    """
+    m = re.match(r"t_p(\d+)_(\d+)", tid)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+    return (0, 0)
+
+
+def run_script_postprocess(
+    md_text: str,
+    img_dir: str | Path,
+    page_boundaries: list[tuple[int, int]] | None = None,
+    table_images: list[dict] | None = None,
+) -> str:
     """Выполнить всю скриптовую постобработку.
 
     Порядок (без wrap_equations — в Yandex формулы уже в $$):
       1. HTML-таблицы → MD
       2. Объединение смежных таблиц
+      2b. Вставка ID-маркеров <!-- t_pN_M --> перед таблицами
+          (если переданы page_boundaries и table_images)
       3. LaTeX-чистка
       4. Переименование изображений
       5. Подписи → курсив
       6. Примечания → цитаты
       7. Подписи "Таблица N", "Рис. N"
       8. OCR-артефакты
+      9. Пробелы вокруг ^ в LaTeX-формулах
+
+    Args:
+        md_text: Markdown-текст.
+        img_dir: Папка с изображениями.
+        page_boundaries: [(start_line, end_line), ...] — границы страниц
+            в md_text (0-based строки, end exclusive), из parse_yandex_json_to_md().
+        table_images: Список от extract_table_images() — включает id каждой
+            вырезанной таблицы. Маркеры вставляются только при наличии обоих
+            параметров (иначе пайплайн ведёт себя как раньше).
     """
     log.info("Скриптовая постобработка:")
 
@@ -2271,6 +2584,10 @@ def run_script_postprocess(md_text: str, img_dir: str | Path) -> str:
 
     md_text = merge_tables(md_text)
     log.info("  2. Таблицы: объединение")
+
+    if page_boundaries and table_images:
+        md_text = _inject_table_ids(md_text, page_boundaries, table_images)
+        log.info("  2b. Таблицы: ID-маркеры вставлены")
 
     md_text = cleanup_latex(md_text)
     log.info("  3. LaTeX: очищен")
@@ -2290,6 +2607,9 @@ def run_script_postprocess(md_text: str, img_dir: str | Path) -> str:
     md_text = fix_ocr_artifacts(md_text)
     log.info("  8. OCR-артефакты: исправлены")
 
+    md_text = fix_latex_caret_spaces(md_text)
+    log.info("  9. LaTeX: пробелы вокруг ^")
+
     return md_text
 
 
@@ -2297,30 +2617,19 @@ def run_script_postprocess(md_text: str, img_dir: str | Path) -> str:
 # 10. AI-постобработка
 # ═══════════════════════════════════════════════════════════════════════════
 
-AI_CLEANUP_DEFAULT_PROMPT = """Ты — редактор технических текстов. Исправь Markdown, полученный из OCR-парсера PDF.
-
-ЧТО МОЖНО ДЕЛАТЬ (только это):
-1. LaTeX: убрать \\mathtt{...}, \\mathsf{...}, \\mathfrak{...}, \\pmb{...}, \\boldsymbol{...}, \\mathbf{...}
-2. LaTeX: \\mathrm{...} -> \\text{...}
-3. OCR-артефакты: удалить мусор
-4. Пробелы внутри чисел: 0 , 4 2 9 -> 0,429
-5. Лишние фигурные скобки в LaTeX: {X} -> X
-6. LaTeX-команды в обычном тексте: убрать
-7. csv-блоки: оставить как есть
-8. В ячейках таблиц LaTeX -> обернуть в $...$
-9. Подписи под рисунками -> курсив: *текст*
-10. Примечания -> цитаты: > Примечание ...
-11. Объединить таблицы (Продолжение, Окончание, одинаковый заголовок)
-12. Удалить разрывы слов, добавить пробелы
-
-ЧТО НЕЛЬЗЯ:
-- НЕ изменяй структуру Markdown-таблицы
-- НЕ удаляй изображения: ![Рисунок N](image/fig_N.jpg)
-- НЕ меняй нумерацию разделов, формул, таблиц
-- НЕ добавляй разделители"""
+# Границы разделов для section-aware chunking (ADR-007):
+#   **N. Title**, **N.N. Title**, ### N.N. Title, #### N.N.N. Title,
+#   а также заголовки без числового префикса: ### Title, **TITLE**
+# Любая markdown-заголовок (#...##### + пробел + непустой символ) ИЛИ
+# строка целиком из **жирного текста** (ровно одна пара звёздочек).
+# Примечание: $ стоит внутри группы, привязывая к концу строки только
+# bold-ветку — ветка заголовка матчит префикс строки (сам заголовок).
+SECTION_BOUNDARY_RE = re.compile(
+    r"^(?:#{1,5}\s+\S|\*\*[^*]+\*\*$)"
+)
 
 
-def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
+def _split_oversized_section(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
     """Разбить текст на части для AI, сохраняя целостность таблиц и кодовых блоков."""
     lines = text.split("\n")
     chunks = []
@@ -2401,6 +2710,59 @@ def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
     return [c for c in chunks if c]
 
 
+def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
+    """Разбить текст на части для AI по границам разделов.
+
+    Двухфазный алгоритм (ADR-007):
+      1. Партиционирование: ищем границы разделов (SECTION_BOUNDARY_RE).
+         Секция = строки от заголовка (включительно) до следующего заголовка.
+         Текст до первого заголовка — преамбула, отдельная секция.
+      2. Сборка чанков из целых секций, пока помещаются в max_chars;
+         секции > max_chars разбиваются через _split_oversized_section().
+         Если границ разделов не найдено — fallback на старую логику.
+    """
+    lines = text.split("\n")
+
+    # Фаза 1: найти границы разделов
+    boundary_idx = [i for i, line in enumerate(lines) if SECTION_BOUNDARY_RE.match(line)]
+    if not boundary_idx:
+        # Заголовков разделов нет — старая логика
+        return _split_oversized_section(text, max_chars)
+
+    sections: list[str] = []
+    # Преамбула: текст до первого заголовка
+    if boundary_idx[0] > 0:
+        sections.append("\n".join(lines[:boundary_idx[0]]))
+    for i, idx in enumerate(boundary_idx):
+        end = boundary_idx[i + 1] if i + 1 < len(boundary_idx) else len(lines)
+        sections.append("\n".join(lines[idx:end]))
+
+    # Фаза 2: сборка чанков из целых секций
+    chunks: list[str] = []
+    current = ""
+    for section in sections:
+        if not current:
+            # Первая секция / после сброса: если сама секция-гигант — разбить
+            if len(section) > max_chars:
+                chunks.extend(_split_oversized_section(section, max_chars))
+            else:
+                current = section
+        elif len(current) + len(section) + 2 <= max_chars:
+            current += "\n\n" + section
+        elif len(section) > max_chars:
+            # Секция-гигант: разбить по параграфам
+            chunks.append(current.strip())
+            current = ""
+            chunks.extend(_split_oversized_section(section, max_chars))
+        else:
+            chunks.append(current.strip())
+            current = section
+    if current:
+        chunks.append(current.strip())
+
+    return [c for c in chunks if c]
+
+
 def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
     """AI-постобработка через config-указанный провайдер.
 
@@ -2414,7 +2776,10 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
     model = ai_cfg.get("model", "deepseek-v4-flash")
     api_key_env = ai_cfg.get("api_key_env", "DEEPSEEK_API_KEY")
     base_url = ai_cfg.get("base_url", "https://api.deepseek.com/v1")
-    prompt = ai_cfg.get("prompt", AI_CLEANUP_DEFAULT_PROMPT)
+    prompt = ai_cfg.get("prompt")
+    if not prompt:
+        log.error("не задан промт: укажите prompt в секции ai_postprocess конфига")
+        sys.exit(1)
 
     api_key = os.environ.get(api_key_env, "")
     if not api_key:
@@ -2532,7 +2897,13 @@ def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
     for i, r in enumerate(results):
         if r is None:
             log.info(f"  Часть {i + 1}/{len(chunks)} ({len(chunks[i]) if i < len(chunks) else '?'} символов)")
-            result = _call_ai_api(chunks[i], config, f"{file_label} [ч.{i + 1}]")
+            chunk = chunks[i]
+            if i > 0:
+                # Добавляем последние 3 строки предыдущего чанка как контекст
+                prev_lines = chunks[i - 1].strip().split("\n")
+                context = "\n".join(prev_lines[-3:]) if len(prev_lines) >= 3 else chunks[i - 1].strip()
+                chunk = f"[Контекст из предыдущего чанка]\n{context}\n[Конец контекста]\n\n{chunk}"
+            result = _call_ai_api(chunk, config, f"{file_label} [ч.{i + 1}]")
             results[i] = result if result else chunks[i]
             try:
                 ckpt_path.write_text(
@@ -2554,6 +2925,1270 @@ def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 12. RAG JSONL Converter (ADR-9)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_MD_HEADING_RE = re.compile(r"^(#{2,5})\s+(.+)$")
+_RAG_DEFAULT_MAX_CHARS = 1500  # v1 (deprecated, ADR-9)
+_RAG_DEFAULT_MAX_TOKENS = 7000  # v2 (ADR-010)
+
+# Префиксы канонических кросс-ссылок: определяются по ключевым словам
+# regexp-паттерна (паттерны в rag_config.yaml захватывают только номер).
+_REF_LABEL_HINTS: list[tuple[str, str]] = [
+    ("табл", "табл."),
+    ("пункт", "п."),
+    ("разд", "разд."),
+    ("гл", "гл."),
+]
+
+
+def load_rag_config(config_path: str | Path) -> dict:
+    """Загрузить rag_config.yaml.
+
+    Returns:
+        Полный словарь конфига с секциями defaults, references, documents.
+
+    Raises:
+        FileNotFoundError: файл не найден.
+        yaml.YAMLError: ошибка парсинга YAML.
+    """
+    config_path = Path(config_path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"rag_config не найден: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    # Валидация (ADR-010b): warnings при ошибках, конфиг продолжает работать
+    for err in validate_rag_config(config):
+        log.warning(f"  rag_config: {err}")
+
+    return config
+
+
+def validate_rag_config(config: dict) -> list[str]:
+    """Проверить rag_config на корректность. Возвращает список ошибок.
+
+    Правила (ADR-010b):
+      - defaults.max_chunk_tokens — int 100..100000
+      - documents.<slug>.status — "active" | "inactive" (отсутствие → warning
+        и использование default_status)
+      - status=active требует null для status_reason / replaced_by_document_id
+        / replaced_by_doc_key
+    """
+    errors: list[str] = []
+
+    defaults = config.get("defaults", {})
+    mt = defaults.get("max_chunk_tokens", 0)
+    if not isinstance(mt, int) or mt < 100 or mt > 100000:
+        errors.append(f"defaults.max_chunk_tokens должен быть int 100..100000, получено {mt}")
+
+    default_status = defaults.get("default_status", "active")
+    for slug, doc in config.get("documents", {}).items():
+        status = doc.get("status")
+        if status is None:
+            errors.append(
+                f"documents.{slug}: status не указан "
+                f"(будет '{default_status}')"
+            )
+        elif status not in ("active", "inactive"):
+            errors.append(
+                f"documents.{slug}: status='{status}' — допустимы только active/inactive"
+            )
+
+        if status == "active":
+            if doc.get("status_reason") is not None:
+                errors.append(f"documents.{slug}: status=active, но status_reason не null")
+            if doc.get("replaced_by_document_id") is not None:
+                errors.append(
+                    f"documents.{slug}: status=active, но replaced_by_document_id не null"
+                )
+            if doc.get("replaced_by_doc_key") is not None:
+                errors.append(
+                    f"documents.{slug}: status=active, но replaced_by_doc_key не null"
+                )
+
+    return errors
+
+
+def _extract_heading_number(heading_text: str | None) -> str | None:
+    """Извлечь номер раздела из текста заголовка.
+
+    Примеры:
+        '3.2.1. Молниеприемники' → '3.2.1'
+        '1.1. Общие положения' → '1.1'
+        'Введение' → None
+
+    Regex: ^(\\d+(?:\\.\\d+)*)\\.\\s
+    """
+    if not heading_text:
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)*)\.\s", heading_text)
+    return m.group(1) if m else None
+
+
+def _build_ancestors(
+    headings: list[dict],
+    idx: int,
+) -> dict[str, str | None]:
+    """Построить chapter/section/clause для данного heading по индексу.
+
+    Ищет ближайшие предшествующие heading нужного уровня:
+      - chapter: свой номер для ##, иначе ближайший предыдущий ##
+      - section: свой номер для ###, иначе ближайший предыдущий ###
+      - clause:  свой номер для ####/#####, иначе ближайший предыдущий ####/#####
+
+    Returns:
+        {'chapter': '3', 'section': '3.2', 'clause': '3.2.1'}.
+        Поля, для которых предок не найден, равны None.
+    """
+    current = headings[idx]
+    level = current.get("level", 0)
+
+    chapter = section = clause = None
+
+    if level == 2:
+        chapter = current.get("number")
+    else:
+        for j in range(idx - 1, -1, -1):
+            if headings[j].get("level") == 2:
+                chapter = headings[j].get("number")
+                break
+
+    if level == 3:
+        section = current.get("number")
+    else:
+        for j in range(idx - 1, -1, -1):
+            if headings[j].get("level") == 3:
+                section = headings[j].get("number")
+                break
+
+    if level >= 4:
+        clause = current.get("number")
+        if clause is None:
+            # Ненумерованный подпункт — наследуем от предыдущего ####/#####
+            for j in range(idx - 1, -1, -1):
+                if (headings[j].get("level") or 0) >= 4:
+                    clause = headings[j].get("number")
+                    break
+
+    return {"chapter": chapter, "section": section, "clause": clause}
+
+
+def _build_heading_texts(
+    headings: list[dict],
+    idx: int,
+) -> dict[str, str | None]:
+    """Построить heading_texts (названия) для данного heading по индексу.
+
+    Аналог _build_ancestors(), но возвращает ТЕКСТЫ заголовков, а не номера:
+      - chapter: текст ближайшего ##
+      - section: текст ближайшего ###
+      - clause:  текст текущего ####/##### (или ближайшего предыдущего)
+
+    Returns:
+        {'chapter': '3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ', ...}.
+        Поля, для которых предок не найден, равны None.
+    """
+    current = headings[idx]
+    level = current.get("level", 0)
+
+    chapter_text = section_text = clause_text = None
+
+    if level == 2:
+        chapter_text = current.get("heading_text")
+    else:
+        for j in range(idx - 1, -1, -1):
+            if headings[j].get("level") == 2:
+                chapter_text = headings[j].get("heading_text")
+                break
+
+    if level == 3:
+        section_text = current.get("heading_text")
+    else:
+        for j in range(idx - 1, -1, -1):
+            if headings[j].get("level") == 3:
+                section_text = headings[j].get("heading_text")
+                break
+
+    if level >= 4:
+        clause_text = current.get("heading_text")
+        if clause_text is None:
+            for j in range(idx - 1, -1, -1):
+                if (headings[j].get("level") or 0) >= 4:
+                    clause_text = headings[j].get("heading_text")
+                    break
+
+    return {"chapter": chapter_text, "section": section_text, "clause": clause_text}
+
+
+def _build_section_path(ancestors: dict[str, str | None]) -> str | None:
+    """Построить section_path вида '3 → 3.2 → 3.2.1'.
+
+    Соединяет непустые chapter/section/clause через ' → '.
+    Если все уровни пусты — None.
+    """
+    parts = [
+        p for p in (ancestors.get("chapter"), ancestors.get("section"), ancestors.get("clause"))
+        if p
+    ]
+    return " → ".join(parts) if parts else None
+
+
+def parse_md_structure(md_text: str) -> list[dict]:
+    """Разобрать Markdown на иерархию clause.
+
+    Алгоритм:
+      1. Разбить текст на строки (splitlines)
+      2. Найти все строки-заголовки: ^(#{2,5})\\s+(.+)$
+      3. Для каждого заголовка: level, heading_text, number, line_num
+      4. next_line_num = строка следующего заголовка (или len(lines))
+
+    Returns:
+        [{'level': 2, 'number': '3', 'heading_text': '3. ...',
+          'line_num': 42, 'next_line_num': 78}, ...]
+    """
+    lines = md_text.splitlines()
+    headings: list[dict] = []
+    for i, line in enumerate(lines):
+        m = _MD_HEADING_RE.match(line)
+        if not m:
+            continue
+        heading_text = m.group(2).strip()
+        headings.append(
+            {
+                "level": len(m.group(1)),
+                "number": _extract_heading_number(heading_text),
+                "heading_text": heading_text,
+                "line_num": i,
+                "next_line_num": len(lines),
+            }
+        )
+    for i in range(len(headings) - 1):
+        headings[i]["next_line_num"] = headings[i + 1]["line_num"]
+    return headings
+
+
+def extract_clause_text(
+    md_text: str,
+    heading_line: int,
+    next_heading_line: int,
+) -> str:
+    """Извлечь текст clause между двумя заголовками.
+
+    Таблицы и изображения сохраняются как есть (Markdown).
+    Не модифицирует текст.
+
+    Returns: текст clause (может быть пустой строкой).
+    """
+    lines = md_text.splitlines()
+    content = lines[heading_line + 1 : next_heading_line]
+    return "\n".join(content).strip()
+
+
+def _reference_label(pattern: str) -> str:
+    """Канонический префикс ссылки по содержимому regexp-паттерна.
+
+    Паттерны захватывают только номер ('3.2.1'); префикс
+    ('п.', 'табл.', 'разд.', 'гл.') выводится из ключевых слов.
+    """
+    for hint, label in _REF_LABEL_HINTS:
+        if hint in pattern:
+            return label
+    return ""
+
+
+def extract_references(text: str, patterns: list[str] | None) -> list[str]:
+    """Извлечь кросс-ссылки из текста clause.
+
+    Алгоритм:
+      1. Для каждого regexp-паттерна из patterns: re.findall(pattern, text)
+      2. Каждое совпадение приводится к канонической форме
+         (напр. 'см. п. 3.2.1' → 'п. 3.2.1')
+      3. Дедупликация (set → sorted list)
+
+    Returns: list[str] уникальных ссылок в порядке возрастания.
+    """
+    refs: set[str] = set()
+    for pattern in patterns or []:
+        label = _reference_label(pattern)
+        try:
+            matches = re.findall(pattern, text)
+        except re.error:
+            log.warning(f"  Некорректный regexp для references: {pattern}")
+            continue
+        for m in matches:
+            if isinstance(m, tuple):
+                m = m[0]
+            refs.add(f"{label} {m}".strip())
+    return sorted(refs)
+
+
+def _get_page_for_heading(
+    number: str | None,
+    json_headings: list[dict] | None,
+) -> int | None:
+    """Найти номер страницы для clause по номеру раздела.
+
+    Использует результат _extract_headings_from_json() (ADR-8):
+      json_headings = [{'page': N, 'number': '3.2.1', ...}, ...]
+
+    Первое вхождение каждого номера (оглавление → корректная страница).
+
+    Returns: page (0-based), или None.
+    """
+    if not json_headings or not number:
+        return None
+    for h in json_headings:
+        if h.get("number") == number:
+            return h.get("page")
+    return None
+
+
+def _split_oversized_clause(text: str, max_chars: int) -> list[str]:
+    """Разбить текст clause на подчанки по границам параграфов.
+
+    Алгоритм:
+      1. Если len(text) <= max_chars → [text]
+      2. Разбить на атомарные блоки: таблицы (строки с '|') и
+         кодовые блоки (```...```) не разрываются
+      3. Объединить блоки в группы ≤ max_chars
+      4. Одиночный блок (параграф/таблица/код) > max_chars публикуется
+         как есть (log.warning)
+
+    Returns: список подчанков (всегда минимум 1 элемент).
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    lines = text.splitlines()
+    blocks: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].lstrip()
+        if stripped.startswith("```"):
+            # Кодовый блок до закрывающего fence
+            j = i + 1
+            while j < n and not lines[j].lstrip().startswith("```"):
+                j += 1
+            if j < n:
+                j += 1  # включить закрывающий fence
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+        elif stripped.startswith("|"):
+            # Таблица: смежные строки с '|' — атомарный блок
+            j = i
+            while j < n and lines[j].lstrip().startswith("|"):
+                j += 1
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+        elif stripped == "":
+            i += 1  # разделитель параграфов
+        else:
+            # Параграф: до пустой строки / таблицы / кодового блока
+            j = i
+            while j < n:
+                l2 = lines[j].strip()
+                if l2 == "" or l2.startswith("```") or l2.startswith("|"):
+                    break
+                j += 1
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for block in blocks:
+        block_len = len(block)
+        if block_len > max_chars:
+            if current:
+                chunks.append("\n\n".join(current))
+                current, current_len = [], 0
+            log.warning(
+                f"  Clause-блок размером {block_len} > max_chars={max_chars} "
+                "(таблица/код/абзац) — публикуется как есть"
+            )
+            chunks.append(block)
+            continue
+        if current and current_len + 2 + block_len > max_chars:
+            chunks.append("\n\n".join(current))
+            current, current_len = [], 0
+        if current:
+            current_len += 2  # разделитель "\n\n"
+        current.append(block)
+        current_len += block_len
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return chunks if chunks else [text]
+
+
+def _split_oversized_clause_tokens(
+    text: str,
+    max_tokens: int,
+    tokenize: Callable[[str], int],
+    overhead: int = 200,
+) -> list[str]:
+    """Разбить текст clause на подчанки ≤ max_tokens - overhead токенов.
+
+    Аналог _split_oversized_clause(), но лимит считается в токенах
+    через переданный tokenize() (Qwen3 tokenizer или degraded эвристика).
+
+    Алгоритм (ADR-010 §3.3):
+      1. Если tokenize(text) <= effective_limit → [text]
+      2. Разбить на атомарные блоки (таблицы, код, параграфы)
+      3. Объединить блоки в группы ≤ effective_limit токенов
+      4. Одиночный блок > effective_limit публикуется как есть (log.warning)
+
+    Returns: список подчанков (всегда минимум 1 элемент).
+    """
+    effective_limit = max_tokens - overhead
+    if effective_limit <= 0:
+        effective_limit = max_tokens
+    if tokenize(text) <= effective_limit:
+        return [text]
+
+    blocks = _tokenize_blocks(text, tokenize)
+
+    chunks: list[str] = []
+    current_blocks: list[str] = []
+    current_tokens = 0
+
+    for block, block_tokens in blocks:
+        if block_tokens > effective_limit:
+            # Гигантский блок (таблица/код) — публикуем как есть
+            if current_blocks:
+                chunks.append("\n\n".join(current_blocks))
+                current_blocks, current_tokens = [], 0
+            log.warning(
+                f"  Блок {block_tokens} токенов > лимита {effective_limit} — как есть"
+            )
+            chunks.append(block)
+            continue
+
+        sep_tokens = tokenize("\n\n") if current_blocks else 0
+        if current_tokens + sep_tokens + block_tokens > effective_limit:
+            chunks.append("\n\n".join(current_blocks))
+            current_blocks, current_tokens = [], 0
+
+        current_blocks.append(block)
+        current_tokens += block_tokens + (sep_tokens if len(current_blocks) > 1 else 0)
+
+    if current_blocks:
+        chunks.append("\n\n".join(current_blocks))
+
+    return chunks if chunks else [text]
+
+
+def _tokenize_blocks(
+    text: str,
+    tokenize: Callable[[str], int],
+) -> list[tuple[str, int]]:
+    """Разбить текст на атомарные блоки и посчитать токены каждого.
+
+    Таблицы (строки с '|') и кодовые блоки (```...```) не разрываются.
+    Разделители '\\n\\n' между блоками не включаются в блоки (их токены
+    добавляются при объединении в _split_oversized_clause_tokens).
+
+    Returns: [(block_text, token_count), ...]
+    """
+    lines = text.splitlines()
+    blocks: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        stripped = lines[i].lstrip()
+        if stripped.startswith("```"):
+            j = i + 1
+            while j < n and not lines[j].lstrip().startswith("```"):
+                j += 1
+            if j < n:
+                j += 1  # включить закрывающий fence
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+        elif stripped.startswith("|"):
+            j = i
+            while j < n and lines[j].lstrip().startswith("|"):
+                j += 1
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+        elif stripped == "":
+            i += 1  # разделитель параграфов
+        else:
+            j = i
+            while j < n:
+                l2 = lines[j].strip()
+                if l2 == "" or l2.startswith("```") or l2.startswith("|"):
+                    break
+                j += 1
+            blocks.append("\n".join(lines[i:j]))
+            i = j
+
+    return [(block, tokenize(block)) for block in blocks if block]
+
+
+def _find_doc_key(input_path: str | Path, rag_config: dict | None) -> str | None:
+    """Сопоставить входной файл с doc_key из rag_config.documents.
+
+    Сравнивает source_file документа с именем входного файла
+    без учёта регистра и разделителей (-/_), чтобы пережить
+    различия 'СО153-34_21_122' vs 'СО153-34-21-122'.
+
+    Returns:
+        slug (doc_key) или None, если документ не найден.
+    """
+    documents = (rag_config or {}).get("documents", {})
+    if not documents:
+        return None
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^0-9a-zа-яё]", "", s.lower())
+
+    input_name = norm(Path(input_path).name)
+    input_stem = norm(Path(input_path).stem)
+    for slug, meta in documents.items():
+        source_file = (meta or {}).get("source_file", "")
+        if not source_file:
+            continue
+        if input_name == norm(source_file) or input_stem == norm(Path(source_file).stem):
+            return slug
+    return None
+
+
+def build_rag_jsonl_v1(
+    md_text: str,
+    json_headings: list[dict] | None,
+    rag_config: dict,
+    doc_key: str,
+) -> str:
+    """Построить JSONL-строку для RAG-индексации (v1, ADR-9, deprecated).
+
+    Сохранён для обратной совместимости. Новый контракт — build_rag_jsonl_v2()
+    (ADR-010): status, chunk_id, section_path, heading_texts, chunk_tokens,
+    chunking_method, без source.page.
+
+    Алгоритм:
+      1. doc_meta = rag_config['documents'][doc_key] (ValueError если нет)
+      2. defaults = rag_config['defaults']
+      3. patterns = rag_config['references']['patterns'] (если extract_references)
+      4. ignore_sections = doc_meta.get('ignore_sections', [])
+      5. clauses = parse_md_structure(md_text)
+      6. Для каждого clause:
+         a. ignore_sections → пропустить секцию и её подразделы
+         b. text = extract_clause_text(); пустой → пропустить
+         c. chapter/section/clause = _build_ancestors()
+         d. source.page = _get_page_for_heading()
+         e. references = extract_references()
+         f. oversized → _split_oversized_clause() с суффиксом «(ч. N)»
+      7. Вернуть JSONL ("\\n".join) + "\\n"
+
+    Returns:
+        JSONL-строка, каждая строка — валидный JSON-объект.
+    """
+    documents = rag_config.get("documents", {})
+    doc_meta = documents.get(doc_key)
+    if doc_meta is None:
+        raise ValueError(f"doc_key '{doc_key}' не найден в rag_config")
+
+    defaults = rag_config.get("defaults", {})
+    max_chars = int(defaults.get("max_chunk_chars", _RAG_DEFAULT_MAX_CHARS))
+    extract_refs = defaults.get("extract_references", True)
+    patterns: list[str] = []
+    if extract_refs:
+        patterns = rag_config.get("references", {}).get("patterns", []) or []
+
+    ignore_sections = doc_meta.get("ignore_sections", []) or []
+    clauses = parse_md_structure(md_text)
+
+    # Отфильтровать игнорируемые секции (и их подразделы): они не попадают
+    # ни в выход, ни в цепочку предков для _build_ancestors()
+    active_clauses: list[dict] = []
+    skip_until_level: int | None = None
+    for clause in clauses:
+        level = clause["level"]
+        heading_text = clause["heading_text"]
+        # Продолжаем пропуск игнорируемой секции (её подразделы)
+        if skip_until_level is not None:
+            if level > skip_until_level:
+                continue
+            skip_until_level = None
+        # Начало игнорируемой секции
+        if any(s and s.lower() in heading_text.lower() for s in ignore_sections):
+            skip_until_level = level
+            continue
+        active_clauses.append(clause)
+
+    source_file = doc_meta.get("source_file")
+    json_lines: list[str] = []
+
+    for i, clause in enumerate(active_clauses):
+        text = extract_clause_text(md_text, clause["line_num"], clause["next_line_num"])
+        if not text:
+            continue
+
+        ancestors = _build_ancestors(active_clauses, i)
+        page = _get_page_for_heading(clause.get("number"), json_headings)
+        refs = extract_references(text, patterns) if patterns else []
+
+        base = {
+            "document_id": doc_meta.get("document_id"),
+            "document_id_alt": doc_meta.get("document_id_alt"),
+            "title": doc_meta.get("title"),
+            "edition": doc_meta.get("edition"),
+            "date_enacted": doc_meta.get("date_enacted"),
+            "date_amended": doc_meta.get("date_amended"),
+            "amended_by": doc_meta.get("amended_by"),
+            "chapter": ancestors["chapter"],
+            "section": ancestors["section"],
+            "clause": ancestors["clause"],
+            "text": text,
+            "source": {"file": source_file, "page": page},
+            "references": refs,
+        }
+
+        parts = _split_oversized_clause(text, max_chars)
+        if len(parts) <= 1:
+            json_lines.append(json.dumps(base, ensure_ascii=False))
+        else:
+            for n, part in enumerate(parts, 1):
+                rec = dict(base)
+                rec["text"] = part
+                if ancestors["clause"]:
+                    rec["clause"] = f"{ancestors['clause']} (ч. {n})"
+                json_lines.append(json.dumps(rec, ensure_ascii=False))
+
+    return "\n".join(json_lines) + ("\n" if json_lines else "")
+
+
+# v1 сохраняется под псевдонимом для обратной совместимости (ADR-010 §7.5)
+build_rag_jsonl = build_rag_jsonl_v1
+
+
+def build_rag_jsonl_v2(
+    md_text: str,
+    json_headings: list[dict] | None,
+    rag_config: dict,
+    doc_key: str,
+    tokenize: Callable[[str], int],
+    chunking_method: str = "qwen3",
+) -> str:
+    """Построить JSONL-строку для RAG-индексации (v2, ADR-010).
+
+    Отличия от v1 (ADR-9):
+      - Лимит чанка — в токенах (max_chunk_tokens, по умолчанию 7000)
+      - source.page удалён из публичной схемы; остаётся _source_page
+      - Поля status / status_reason / replaced_by_document_id
+      - Стабильный chunk_id без страниц: {doc_slug}/{clause_number}[/part_{N}]
+      - section_path, heading_texts, chunk_tokens, chunking_method
+      - assets: пустой список (заполняется _link_assets_to_chunks)
+
+    Алгоритм:
+      1. doc_meta = rag_config['documents'][doc_key] (ValueError если нет)
+      2. defaults = rag_config['defaults']
+      3. status: doc_meta.status или defaults.default_status (warning если нет)
+      4. ignore_sections = doc_meta.get('ignore_sections', [])
+      5. clauses = parse_md_structure(md_text)
+      6. Для каждого clause:
+         a. ignore_sections → пропустить секцию и её подразделы
+         b. text = extract_clause_text(); пустой → пропустить
+         c. chapter/section/clause = _build_ancestors()
+         d. heading_texts = _build_heading_texts()
+         e. section_path = _build_section_path()
+         f. chunk_id = {doc_slug}/{clause_number} (или /_h{idx} без номера)
+         g. _source_page = _get_page_for_heading()
+         h. references = extract_references()
+         i. chunk_tokens = tokenize(text)
+         j. oversized → _split_oversized_clause_tokens() с /part_{N} и «(ч. N)»
+      7. Вернуть JSONL ("\\n".join) + "\\n"
+
+    Returns:
+        JSONL-строка, каждая строка — валидный JSON-объект.
+    """
+    documents = rag_config.get("documents", {})
+    doc_meta = documents.get(doc_key)
+    if doc_meta is None:
+        raise ValueError(f"doc_key '{doc_key}' не найден в rag_config")
+
+    defaults = rag_config.get("defaults", {})
+    max_tokens = int(defaults.get("max_chunk_tokens", _RAG_DEFAULT_MAX_TOKENS))
+    extract_refs = defaults.get("extract_references", True)
+    patterns: list[str] = []
+    if extract_refs:
+        patterns = rag_config.get("references", {}).get("patterns", []) or []
+
+    # Статус документа (ADR-010b): явный или default_status; warning если нет
+    status = doc_meta.get("status")
+    if status is None:
+        status = defaults.get("default_status", "active")
+        log.warning(
+            f"  {doc_key}: status не указан — использую default_status='{status}'"
+        )
+    status_reason = doc_meta.get("status_reason")
+    replaced_by_document_id = doc_meta.get("replaced_by_document_id")
+    replaced_by_doc_key = doc_meta.get("replaced_by_doc_key")
+
+    ignore_sections = doc_meta.get("ignore_sections", []) or []
+    clauses = parse_md_structure(md_text)
+
+    # Отфильтровать игнорируемые секции (и их подразделы): они не попадают
+    # ни в выход, ни в цепочку предков для _build_ancestors()
+    active_clauses: list[dict] = []
+    skip_until_level: int | None = None
+    for clause in clauses:
+        level = clause["level"]
+        heading_text = clause["heading_text"]
+        # Продолжаем пропуск игнорируемой секции (её подразделы)
+        if skip_until_level is not None:
+            if level > skip_until_level:
+                continue
+            skip_until_level = None
+        # Начало игнорируемой секции
+        if any(s and s.lower() in heading_text.lower() for s in ignore_sections):
+            skip_until_level = level
+            continue
+        active_clauses.append(clause)
+
+    source_file = doc_meta.get("source_file")
+    json_lines: list[str] = []
+
+    for i, clause in enumerate(active_clauses):
+        text = extract_clause_text(md_text, clause["line_num"], clause["next_line_num"])
+        if not text:
+            continue
+
+        ancestors = _build_ancestors(active_clauses, i)
+        heading_texts = _build_heading_texts(active_clauses, i)
+        section_path = _build_section_path(ancestors)
+        page = _get_page_for_heading(clause.get("number"), json_headings)
+        refs = extract_references(text, patterns) if patterns else []
+
+        base_chunk_id = _make_chunk_id(doc_key, active_clauses, i)
+        chunk_tokens = tokenize(text)
+
+        base = {
+            "document_id": doc_meta.get("document_id"),
+            "document_id_alt": doc_meta.get("document_id_alt"),
+            "title": doc_meta.get("title"),
+            "edition": doc_meta.get("edition"),
+            "date_enacted": doc_meta.get("date_enacted"),
+            "date_amended": doc_meta.get("date_amended"),
+            "amended_by": doc_meta.get("amended_by"),
+            "status": status,
+            "status_reason": status_reason,
+            "replaced_by_document_id": replaced_by_document_id,
+            "replaced_by_doc_key": replaced_by_doc_key,
+            "chunk_id": base_chunk_id,
+            "chapter": ancestors["chapter"],
+            "section": ancestors["section"],
+            "clause": ancestors["clause"],
+            "section_path": section_path,
+            "heading_texts": heading_texts,
+            "text": text,
+            "source": {"file": source_file},
+            "_source_page": page,
+            "assets": [],
+            "references": refs,
+            "chunk_tokens": chunk_tokens,
+            "chunking_method": chunking_method,
+        }
+
+        if chunk_tokens <= max_tokens:
+            json_lines.append(json.dumps(base, ensure_ascii=False))
+        else:
+            parts = _split_oversized_clause_tokens(text, max_tokens, tokenize)
+            for n, part in enumerate(parts, 1):
+                rec = dict(base)
+                rec["text"] = part
+                rec["chunk_id"] = f"{base_chunk_id}/part_{n}"
+                rec["chunk_tokens"] = tokenize(part)
+                if ancestors["clause"]:
+                    rec["clause"] = f"{ancestors['clause']} (ч. {n})"
+                json_lines.append(json.dumps(rec, ensure_ascii=False))
+
+    return "\n".join(json_lines) + ("\n" if json_lines else "")
+
+
+def _make_chunk_id(
+    doc_key: str,
+    active_clauses: list[dict],
+    idx: int,
+) -> str:
+    """Построить стабильный chunk_id: {doc_slug}/{clause_number}[/part_{N}].
+
+    doc_slug — ключ документа в rag_config (каталоговый slug).
+
+    Fallback для ненумерованных заголовков (ADR-010f):
+      clause_number = None → "{doc_slug}/_h{idx}", где idx — порядковый
+      номер заголовка в пределах родительского раздела.
+    """
+    clause = active_clauses[idx]
+    number = clause.get("number")
+    if number:
+        return f"{doc_key}/{number}"
+    # Ненумерованный заголовок: номер в пределах родительского раздела
+    parent_idx = -1
+    level = clause.get("level", 0)
+    for j in range(idx - 1, -1, -1):
+        if (active_clauses[j].get("level") or 0) < level:
+            parent_idx = j
+            break
+    ordinal = idx - parent_idx
+    return f"{doc_key}/_h{ordinal}"
+
+
+def _write_rag_jsonl(
+    md_text: str,
+    json_headings: list[dict] | None,
+    rag_config: dict | None,
+    input_path: str | Path,
+    out_dir: str | Path,
+    file_stem: str,
+) -> None:
+    """Сгенерировать Markdown/<file>/rag_chunks.jsonl + rag_assets.json (--rag).
+
+    doc_key определяется через _find_doc_key(); при отсутствии документа
+    в конфиге — log.warning и пропуск (архитектура §7 error handling).
+
+    Атомарно перезаписывает rag_chunks.jsonl и rag_assets.json
+    (производные файлы); .md и image/ не модифицируются.
+    """
+    if not rag_config:
+        return
+    doc_key = _find_doc_key(input_path, rag_config)
+    if doc_key is None:
+        log.warning(f"  Документ не найден в rag_config: {file_stem}")
+        return
+    try:
+        run_rag_pipeline(
+            md_text,
+            json_headings,
+            rag_config,
+            doc_key,
+            Path(out_dir) / "image",
+            out_dir,
+        )
+    except Exception as e:
+        log.error(f"  Ошибка RAG-генерации: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 13. Tokenizer Chunking (ADR-010)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _init_tokenizer(config: dict) -> tuple[Callable[[str], int], str]:
+    """Загрузить Qwen3-Embedding-8B tokenizer через transformers.AutoTokenizer.
+
+    config['defaults'] должен содержать:
+      - tokenizer: str            (HF model id, "Qwen/Qwen3-Embedding-8B")
+      - tokenizer_revision: str   (опционально, "main")
+      - allow_degraded_fallback: bool (default False)
+      - tokenizer_fallback_ratio: float (default 3.5, только при allow_degraded_fallback)
+
+    Returns:
+        (tokenize_fn, chunking_method)
+        tokenize_fn: text → token_count
+        chunking_method: "qwen3" | "degraded_chars_per_token"
+
+    Raises:
+        RuntimeError — если токенизатор недоступен и fallback запрещён.
+    """
+    model_id = config.get("defaults", {}).get("tokenizer", "Qwen/Qwen3-Embedding-8B")
+    revision = config.get("defaults", {}).get("tokenizer_revision", "main")
+
+    # Попытка 1: transformers + HuggingFace
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            revision=revision,
+            local_files_only=False,   # первый раз: скачать
+            trust_remote_code=False,
+        )
+        log.info(f"Токенизатор: transformers/{model_id} (загружен)")
+        return (lambda text: len(tokenizer.encode(text)), "qwen3")
+    except ImportError:
+        log.error(
+            "transformers не установлен — RAG-индексация невозможна. "
+            "Установите: pip install transformers>=4.51.0"
+        )
+    except Exception as e:
+        log.error(f"Не удалось загрузить токенизатор {model_id}: {e}")
+
+    # Попытка 2: явный деградированный fallback (только если разрешён)
+    allow_fallback = config.get("defaults", {}).get("allow_degraded_fallback", False)
+    if allow_fallback:
+        ratio = float(config.get("defaults", {}).get("tokenizer_fallback_ratio", 3.5))
+        log.warning(
+            f"Работаю в деградированном режиме: chars/token={ratio}. "
+            f"chunking_method='degraded_chars_per_token'"
+        )
+        return (lambda text: max(1, int(len(text) / ratio)), "degraded_chars_per_token")
+
+    # Без fallback: жёсткая ошибка
+    raise RuntimeError(
+        "RAG-индексация невозможна: токенизатор Qwen3 недоступен. "
+        "Установите transformers>=4.51.0 и убедитесь в доступе к HuggingFace Hub, "
+        "либо включите allow_degraded_fallback: true в rag_config.yaml (с потерей точности)."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 14. Asset Registry (ADR-010d)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TABLE_CAPTION_RE = re.compile(
+    r"^(?:\*\s*)?(?:Т\s*а\s*б\s*л\s*и\s*ц\s*а|Таблиц[аы])\s*(\d+(?:\.\d+)*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_tables_from_md(md_text: str) -> list[dict]:
+    """Найти все Markdown-таблицы в тексте.
+
+    Алгоритм (ADR-010 §4.1):
+      1. Разбить md_text на строки
+      2. Детектить таблицы: строка содержит '|', следующая строка — '|---|'
+      3. Для каждой таблицы:
+         - caption: подпись до или после таблицы («Таблица N» или «Таблица N.M — ...»)
+         - md_lines: [start_line, end_line)
+         - image_path: "image/table_{N}.png" (N — порядковый номер)
+
+    Returns:
+        [{asset_id, asset_type, caption, md_lines, image_path, row_count,
+          chunk_ids, _md_block}, ...]
+        asset_id заполняется позже (doc_slug); _md_block — приватное поле
+        для связывания с чанками (удаляется при записи).
+    """
+    lines = md_text.splitlines()
+    tables: list[dict] = []
+    i = 0
+    n = 0  # счётчик таблиц
+    while i < len(lines):
+        stripped = lines[i].strip()
+        # Детектим начало таблицы: строка с '|' И следующая с '|---'
+        if stripped.startswith("|") and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if re.match(r"^\|[\s\-:|]+\|$", next_line):
+                n += 1
+                start = i
+                # Ищем конец таблицы (строки с '|')
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    i += 1
+                end = i
+                caption = _find_table_caption_md(lines, start, end, n)
+                md_block = "\n".join(lines[start:end])
+                tables.append({
+                    "asset_id": None,  # doc_slug добавляется позже
+                    "asset_type": "table",
+                    "caption": caption,
+                    "md_lines": [start, end],
+                    "image_path": f"image/table_{n}.png",
+                    "row_count": max(0, (end - start) - 2),  # минус заголовок и разделитель
+                    "chunk_ids": [],
+                    "_md_block": md_block,
+                })
+                continue
+        i += 1
+    return tables
+
+
+def _find_table_caption_md(
+    lines: list[str],
+    start: int,
+    end: int,
+    n: int,
+) -> str:
+    """Найти подпись таблицы в строках Markdown.
+
+    Ищет «Таблица N» / «Таблица N.M» до таблицы (пропуская пустые строки
+    и курсивные маркеры '*') и после неё. Возвращает нормализованную
+    подпись или пустую строку.
+    """
+    def _match(line: str) -> str | None:
+        m = _TABLE_CAPTION_RE.match(line.strip().strip("*"))
+        if m:
+            return re.sub(r"\s+", " ", line.strip().strip("*"))
+        return None
+
+    # Перед таблицей: до 3 непустых строк выше
+    j = start - 1
+    scanned = 0
+    while j >= 0 and scanned < 3:
+        if lines[j].strip():
+            scanned += 1
+            cap = _match(lines[j])
+            if cap:
+                return cap
+        j -= 1
+
+    # После таблицы: до 3 непустых строк ниже
+    j = end
+    scanned = 0
+    while j < len(lines) and scanned < 3:
+        if lines[j].strip():
+            scanned += 1
+            cap = _match(lines[j])
+            if cap:
+                return cap
+        j += 1
+
+    return ""
+
+
+def _extract_images_from_md(md_text: str) -> list[dict]:
+    """Найти все изображения в Markdown.
+
+    Паттерн: ![caption](image/fig_N.ext)
+    """
+    images: list[dict] = []
+    for m in re.finditer(r"!\[(.*?)\]\((image/.*?)\)", md_text):
+        line_num = md_text[: m.start()].count("\n")
+        images.append({
+            "asset_id": None,  # заполняется позже
+            "asset_type": "image",
+            "caption": m.group(1),
+            "image_path": m.group(2),
+            "md_line": line_num,
+            "chunk_ids": [],
+        })
+    return images
+
+
+def _build_asset_registry(
+    md_text: str,
+    doc_slug: str,
+    img_dir: str | Path | None,
+    document_id: str | None = None,
+) -> dict:
+    """Построить реестр активов rag_assets.json.
+
+    Регистрирует таблицы и изображения из итогового Markdown.
+    Пути image_path — относительные к директории .md (image/).
+
+    Если img_dir передан и файл изображения не существует — актив
+    пропускается с log.warning (архитектура §9 error handling).
+    """
+    tables = _extract_tables_from_md(md_text)
+    images = _extract_images_from_md(md_text)
+
+    for i, table in enumerate(tables, 1):
+        table["asset_id"] = f"{doc_slug}/table/{i}"
+    for i, img in enumerate(images, 1):
+        img["asset_id"] = f"{doc_slug}/fig/{i}"
+
+    # Если image/ не найден — реестр активов пуст (архитектура §9):
+    # без директории изображений активы не имеют смысла.
+    img_dir_path = Path(img_dir) if img_dir else None
+    if img_dir_path is None:
+        log.warning(f"  image/ не найден: реестр активов будет пустым")
+        return {
+            "document_id": document_id,
+            "doc_slug": doc_slug,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "image_dir": "image",
+            "assets": {"tables": [], "images": []},
+        }
+
+    kept_tables = []
+    for table in tables:
+        if (img_dir_path / Path(table["image_path"]).name).exists():
+            kept_tables.append(table)
+        else:
+            log.warning(
+                f"  Пропускаю asset {table['asset_id']}: "
+                f"{table['image_path']} не существует"
+            )
+    tables = kept_tables
+
+    kept_images = []
+    for img in images:
+        if (img_dir_path / Path(img["image_path"]).name).exists():
+            kept_images.append(img)
+        else:
+            log.warning(
+                f"  Пропускаю asset {img['asset_id']}: "
+                f"{img['image_path']} не существует"
+            )
+    images = kept_images
+
+    return {
+        "document_id": document_id,
+        "doc_slug": doc_slug,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "image_dir": "image",
+        "assets": {
+            "tables": tables,
+            "images": images,
+        },
+    }
+
+
+def _link_assets_to_chunks(
+    assets: dict,
+    chunks: list[dict],
+) -> None:
+    """Для каждого актива найти чанки, в которых он упоминается.
+
+    Мутирует assets in-place (заполняет chunk_ids) и чанки (assets).
+
+    Таблица связывается с чанком, если текст чанка содержит её Markdown-блок
+    (точное совпадение) или подпись. Изображение — если текст чанка содержит
+    его image_path или ссылку ![..](image_path).
+    """
+    for table in assets["assets"]["tables"]:
+        md_block = table.get("_md_block", "")
+        caption = table.get("caption") or ""
+        for chunk in chunks:
+            text = chunk.get("text", "")
+            if (md_block and md_block in text) or (caption and caption in text):
+                if chunk["chunk_id"] not in table["chunk_ids"]:
+                    table["chunk_ids"].append(chunk["chunk_id"])
+                if table["asset_id"] not in chunk.get("assets", []):
+                    chunk.setdefault("assets", []).append(table["asset_id"])
+
+    for img in assets["assets"]["images"]:
+        img_ref = f"![]({img['image_path']})"
+        for chunk in chunks:
+            text = chunk.get("text", "")
+            if img["image_path"] in text or img_ref in text:
+                if chunk["chunk_id"] not in img["chunk_ids"]:
+                    img["chunk_ids"].append(chunk["chunk_id"])
+                if img["asset_id"] not in chunk.get("assets", []):
+                    chunk.setdefault("assets", []).append(img["asset_id"])
+
+
+def write_rag_assets(assets: dict, output_path: str | Path) -> None:
+    """Записать rag_assets.json (атомарно), убрав приватные поля."""
+    out = json.loads(json.dumps(assets, ensure_ascii=False))  # глубокое копирование
+    for table in out["assets"]["tables"]:
+        table.pop("_md_block", None)
+    content = json.dumps(out, ensure_ascii=False, indent=2)
+    safe_write(output_path, content)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 15. RAG Pipeline Orchestrator (ADR-010)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _classify_input(input_path: Path) -> str:
+    """Классифицировать входной файл.
+
+    Returns:
+        "pdf": PDF, требует OCR (таблицы ВСЕГДА вырезаются в image/)
+        "docx": DOCX/DOC, требует конвертации + OCR
+        "md_standalone": .md вне Markdown/ → AI-постобработка
+        "md_rag": .md внутри Markdown/ → RAG-индексация (только --rag)
+        "unknown": неподдерживаемый тип
+    """
+    suffix = input_path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in (".docx", ".doc"):
+        return "docx"
+    if suffix == ".md":
+        if "Markdown" in input_path.parts:
+            return "md_rag"
+        return "md_standalone"
+    return "unknown"
+
+
+def _run_rag_only(md_path: Path, rag_config: dict | None) -> bool:
+    """RAG-индексация существующего Markdown (без OCR/постобработки).
+
+    Вход: Markdown/<file>/<file>.md
+    Действия:
+      1. Читает .md файл (read-only)
+      2. Проверяет наличие image/ рядом
+      3. Инициализирует токенизатор (Qwen3 или degraded fallback)
+      4. build_rag_jsonl_v2() → ПЕРЕЗАПИСЫВАЕТ rag_chunks.jsonl
+      5. _build_asset_registry() → ПЕРЕЗАПИСЫВАЕТ rag_assets.json
+    НЕ модифицирует .md, НЕ запускает OCR, НЕ извлекает изображения.
+    """
+    md_text = md_path.read_text(encoding="utf-8")
+    doc_dir = md_path.parent
+    img_dir = doc_dir / "image"
+
+    if not img_dir.is_dir():
+        log.warning(f"  image/ не найден: {img_dir} — реестр активов будет пустым")
+
+    doc_key = _find_doc_key(md_path.name, rag_config)
+    if doc_key is None:
+        log.warning(f"Документ не найден в rag_config: {md_path.name}")
+        return False
+
+    if rag_config is None:
+        log.warning(f"rag_config не загружен: {md_path.name}")
+        return False
+
+    try:
+        run_rag_pipeline(
+            md_text,
+            None,
+            rag_config,
+            doc_key,
+            img_dir if img_dir.is_dir() else None,
+            doc_dir,
+        )
+        return True
+    except Exception as e:
+        log.error(f"  Ошибка RAG-индексации: {e}")
+        return False
+
+
+def run_rag_pipeline(
+    md_text: str,
+    json_headings: list[dict] | None,
+    rag_config: dict,
+    doc_key: str,
+    img_dir: str | Path | None,
+    out_dir: str | Path,
+) -> bool:
+    """Оркестратор RAG: токенизатор → JSONL v2 → assets → атомарная запись.
+
+    Атомарно ПЕРЕЗАПИСЫВАЕТ:
+      - {out_dir}/rag_chunks.jsonl
+      - {out_dir}/rag_assets.json
+    .md и image/ не модифицируются.
+
+    Returns:
+        True при успехе.
+    """
+    tokenize, chunking_method = _init_tokenizer(rag_config)
+
+    jsonl = build_rag_jsonl_v2(
+        md_text, json_headings, rag_config, doc_key, tokenize, chunking_method,
+    )
+
+    # Чанки (для связывания активов)
+    chunks: list[dict] = []
+    for line in jsonl.splitlines():
+        if line.strip():
+            chunks.append(json.loads(line))
+
+    # Реестр активов
+    document_id = rag_config.get("documents", {}).get(doc_key, {}).get("document_id")
+    assets = _build_asset_registry(md_text, doc_key, img_dir, document_id=document_id)
+    _link_assets_to_chunks(assets, chunks)
+
+    # Пересобрать JSONL с заполненными assets в чанках
+    jsonl_lines = [json.dumps(c, ensure_ascii=False) for c in chunks]
+    jsonl_out = "\n".join(jsonl_lines) + ("\n" if jsonl_lines else "")
+
+    rag_path = Path(out_dir) / "rag_chunks.jsonl"
+    safe_write(rag_path, jsonl_out)
+    log.info(f"  RAG JSONL перезаписан: {rag_path} ({len(chunks)} строк)")
+
+    assets_path = Path(out_dir) / "rag_assets.json"
+    write_rag_assets(assets, assets_path)
+    log.info(f"  RAG Assets перезаписан: {assets_path}")
+
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 11. CLI и Main
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2568,30 +4203,42 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   %(prog)s -i dir/ --ai
   %(prog)s -i file.pdf --ai --config my_config.yaml
   %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
-  %(prog)s -i file.pdf --ai-table          # + vision-распознавание таблиц
-  %(prog)s -i file.pdf --ai-table --ai     # + vision + AI-постобработка (gap-filling)
+  %(prog)s -i file.pdf --rag               # дополнительно RAG JSONL + assets
+  %(prog)s -i file.pdf --ai --rag          # AI-постобработка + RAG
+  %(prog)s -i Markdown/file/file.md --rag  # RAG-индексация проверенного MD
         """,
     )
 
     parser.add_argument(
         "-i", "--input",
         required=True,
-        help="Входной файл или папка (PDF/DOCX/DOC/MD). Для .md обязателен флаг --ai",
+        help="Входной файл или папка (PDF/DOCX/DOC/MD). "
+        ".md вне Markdown/ требует --ai; .md внутри Markdown/ требует --rag",
     )
     parser.add_argument(
         "--ai",
         action="store_true",
-        help="Включить AI-постобработку. Для .md — единственный режим (без OCR)",
-    )
-    parser.add_argument(
-        "--ai-table",
-        action="store_true",
-        help="AI-распознавание таблиц через vision-модель (вырезка из PDF + Gemini)",
+        help="Полный AI-цикл: vision-распознавание таблиц + gap-filling + "
+        "AI-постобработка. Для .md вне Markdown/ — единственный режим (без OCR). "
+        "Таблицы вырезаются в image/ ВСЕГДА (без --ai); --ai добавляет vision-коррекцию",
     )
     parser.add_argument(
         "--config",
         default="./config_ai.yaml",
         help="Путь к config_ai.yaml (по умолч. ./config_ai.yaml)",
+    )
+    parser.add_argument(
+        "--rag",
+        action="store_true",
+        help="Сгенерировать/перезаписать RAG-файлы "
+        "(Markdown/<файл>/rag_chunks.jsonl + rag_assets.json). "
+        "Для .md внутри Markdown/ — единственный режим: только индексация "
+        "без OCR/AI, .md и image/ не модифицируются",
+    )
+    parser.add_argument(
+        "--rag-config",
+        default="./rag_config.yaml",
+        help="Путь к rag_config.yaml (по умолч. ./rag_config.yaml)",
     )
 
     return parser.parse_args(argv)
@@ -2600,25 +4247,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def process_file(
     input_path: str,
     use_ai: bool,
-    use_ai_table: bool,
     config: dict,
     api_key: str,
     folder_id: str,
     output_base: str,
     tmp_base: str,
+    use_rag: bool = False,
+    rag_config: dict | None = None,
 ) -> bool:
     """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
 
-    Args:
-        use_ai_table: Включить vision-распознавание таблиц (--ai-table).
+    Режимы (ADR-010e, трёхэтапный CLI):
+      - pdf/docx: OCR + постобработка; таблицы ВСЕГДА вырезаются в image/
+        (PyMuPDF, без --ai); --ai дополнительно запускает vision/AI-коррекцию
+      - .md внутри Markdown/ + --rag: только RAG-индексация проверенного MD
+        (без OCR/AI/извлечения), перезаписывает rag_chunks.jsonl + rag_assets.json
+      - .md вне Markdown/: AI-постобработка (--ai) и/или RAG (--rag)
 
     Returns:
         True при успехе, False при ошибке.
     """
     input_path = str(Path(input_path).resolve())
-    file_stem = Path(input_path).stem
+    input_path_obj = Path(input_path)
+    file_stem = input_path_obj.stem
     log.info(f"{'=' * 60}")
     log.info(f"Обработка: {input_path}")
+
+    file_type = _classify_input(input_path_obj)
+
+    # ── Режим .md внутри Markdown/ + --rag: ТОЛЬКО индексация ──
+    if file_type == "md_rag":
+        if not use_rag:
+            log.error(".md в Markdown/: требуется флаг --rag")
+            return False
+        log.info(f"RAG-индексация проверенного Markdown: {input_path}")
+        ok = _run_rag_only(input_path_obj, rag_config)
+        log.info(f"{'=' * 60}")
+        return ok
+
+    if file_type == "unknown":
+        log.error(f"Неподдерживаемый тип файла: {input_path}")
+        return False
 
     # Выходные папки
     out_dir = Path(output_base) / file_stem
@@ -2628,25 +4297,29 @@ def process_file(
     ensure_dir(img_dir)
     ensure_dir(file_tmp_dir)
 
-    # Режим: .md + --ai → только AI-постобработка, без OCR и скриптов
-    ext = Path(input_path).suffix.lower()
+    # Режим: .md вне Markdown/ → только постобработка, без OCR и скриптов
+    ext = input_path_obj.suffix.lower()
     if ext == ".md":
-        if use_ai:
-            log.info(f"AI-постобработка MD: {file_stem}.md")
-            md_text = Path(input_path).read_text(encoding="utf-8")
-            ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
-            result = ai_postprocess(md_text, ai_cfg, file_stem)
-            if result:
-                out_path = Path(input_path).parent / f"{file_stem}_ai.md"
+        if use_ai or use_rag:
+            log.info(f"Обработка MD: {file_stem}.md (ai={use_ai}, rag={use_rag})")
+            md_text = input_path_obj.read_text(encoding="utf-8")
+            if use_ai:
+                ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
+                result = ai_postprocess(md_text, ai_cfg, file_stem)
+                if not result:
+                    log.error("AI-постобработка не дала результата")
+                    return False
+                out_path = input_path_obj.parent / f"{file_stem}_ai.md"
                 safe_write(out_path, result)
                 log.info(f"Результат: {out_path} ({len(result)} символов)")
-                log.info(f"{'=' * 60}")
-                return True
-            else:
-                log.error("AI-постобработка не дала результата")
-                return False
+                md_text = result
+            # --rag: JSONL + assets из готового MD (_source_page = null, нет Yandex JSON)
+            if use_rag:
+                _write_rag_jsonl(md_text, None, rag_config, input_path, out_dir, file_stem)
+            log.info(f"{'=' * 60}")
+            return True
         else:
-            log.error(".md файл требует флаг --ai")
+            log.error(".md файл требует флаг --ai (или --rag)")
             return False
 
     # Этап 1: DOCX → PDF (если нужно)
@@ -2682,6 +4355,14 @@ def process_file(
         # Сохраняем raw.md
         safe_write(file_tmp_dir / "raw.md", md_text)
 
+        # Этап 3b: Заголовки разделов из Yandex JSON → ##/###/#### (ADR-8)
+        headings = _extract_headings_from_json(pages)
+        if headings:
+            md_text = _apply_headings_to_md(md_text, headings)
+            log.info(f"  Заголовков заменено: {len(headings)}")
+        else:
+            log.info("  Заголовки не найдены — MD без изменений")
+
         # Этап 4: Извлечение изображений
         if pictures:
             extracted = extract_images_from_pdf(
@@ -2693,13 +4374,16 @@ def process_file(
         else:
             log.info("  Нет pictures для извлечения")
 
-        # Этап 4b: Vision-распознавание таблиц (если --ai-table)
-        if use_ai_table and pages:
-            log.info("Vision-распознавание таблиц:")
+        # Этап 4b: Вырезание таблиц в image/table_N.png — ВСЕГДА (ADR-010e)
+        # Локальная операция PyMuPDF, не требует --ai.
+        table_images: list[dict] = []
+        if pages:
+            log.info("Вырезание таблиц из PDF:")
             table_images = extract_table_images(pdf_path, pages, img_dir)
             log.info(f"  Вырезано таблиц: {len(table_images)}")
 
-            if table_images:
+            # Vision/AI-распознавание таблиц — только с --ai
+            if use_ai and table_images:
                 vision_api_key = os.environ.get(
                     config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"),
                     "",
@@ -2713,42 +4397,136 @@ def process_file(
                     log.warning("  PROVOD_API_KEY не задан — vision-распознавание пропущено")
 
         # Этап 5: Скриптовая постобработка
-        md_text = run_script_postprocess(md_text, img_dir)
+        md_text = run_script_postprocess(
+            md_text, img_dir,
+            page_boundaries=page_boundaries,
+            table_images=table_images if use_ai else None,
+        )
 
-        # Этап 6: AI-постобработка (если --ai)
+        # Этап 6+7 (объединённый): AI-коррекция таблиц + постобработка (если --ai)
         if use_ai:
-            ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
-            md_text = ai_postprocess(md_text, ai_cfg, file_stem)
+            # Системный промпт из ai_postprocess (уже объединён с правилами таблиц)
+            combined_prompt = config.get("ai_postprocess", {}).get("prompt", "")
 
-        # Этап 6b: Gap-filling — проверить таблицы vision-результатом (если --ai + --ai-table)
-        if use_ai and use_ai_table:
+            # Конфиг для вызова: настройки провайдера из ai_postprocess,
+            # промпт — объединённый
+            ai_cfg = dict(config.get("ai_postprocess", config.get("postprocess", config)))
+            ai_cfg["prompt"] = combined_prompt
+
+            # 1. Загрузить все vision-таблицы как dict[id] = текст
+            vision_tables: dict[str, str] = {}
             table_files = sorted(Path(file_tmp_dir).glob("table_*.md"))
+            for f in table_files:
+                content = f.read_text(encoding="utf-8")
+                # Извлечь ID из первой строки: <!-- t_pN_M -->
+                m = re.match(r"<!--\s*(t_p\d+_\d+)\s*-->", content)
+                if m:
+                    vision_tables[m.group(1)] = content
             if table_files:
-                log.info("Gap-filling: сверка таблиц с vision-результатом")
-                table_texts = "\n\n".join(
-                    f.read_text(encoding="utf-8") for f in table_files
+                log.info(
+                    f"  Vision-таблиц для сверки: {len(table_files)} "
+                    f"(с ID: {len(vision_tables)})"
                 )
-                # Передаём полный текст: markdown + таблицы из vision
-                gap_input = (
-                    f"Проверь все таблицы в Markdown-файле ниже с файлами таблиц, "
-                    f"полученными из vision-распознавания. "
-                    f"Дополни пропущенные или нераспознанные данные в таблицах. "
-                    f"Не выдумывай данные.\n\n"
-                    f"=== Markdown-файл ===\n{md_text}\n\n"
-                    f"=== Файлы таблиц (vision-распознавание) ===\n{table_texts}\n"
-                )
-                ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
-                gap_result = _call_ai_api(gap_input, ai_cfg)
-                if gap_result:
-                    md_text = gap_result
-                    log.info(f"  Gap-filling: применён ({len(gap_result)} символов)")
+
+            # 2. Чанковать ТОЛЬКО md_text
+            md_chunks = _chunk_text(md_text, AI_MAX_CHARS)
+
+            # Чекпойнтинг (как в ai_postprocess)
+            ckpt_dir = Path("tmp") / ".ai_checkpoints"
+            safe_label = re.sub(r'[^a-zA-Z0-9_-]', '_', file_stem)
+            ckpt_path = ckpt_dir / f"{safe_label}.json"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+            results: list[str | None] = [None] * len(md_chunks)
+            if ckpt_path.exists():
+                try:
+                    saved = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                    if isinstance(saved, list) and len(saved) == len(md_chunks):
+                        results = saved
+                        done = sum(1 for r in results if r is not None)
+                        log.info(f"  Чекпойнт: {done}/{len(md_chunks)}")
+                except Exception as e:
+                    log.warning(f"  Ошибка чекпойнта: {e}")
+
+            # 3. Для каждого чанка — свой набор эталонов
+            chunks_with_tables = 0
+            for i, r in enumerate(results):
+                if r is not None:
+                    log.info(f"  Часть {i + 1}/{len(md_chunks)} — из чекпойнта")
+                    continue
+                chunk = md_chunks[i]
+
+                # Найти все ID в чанке
+                ids_in_chunk = set(re.findall(r"<!--\s*(t_p\d+_\d+)\s*-->", chunk))
+
+                # Собрать только matching vision-таблицы
+                matching: list[str] = []
+                for tid in sorted(ids_in_chunk, key=_table_id_sort_key):
+                    if tid in vision_tables:
+                        matching.append(vision_tables[tid])
+
+                if matching:
+                    chunk_input = (
+                        f"=== Markdown-файл ===\n{chunk}\n\n"
+                        f"=== Эталонные таблицы ===\n"
+                        + "\n\n".join(matching) + "\n"
+                    )
+                    chunks_with_tables += 1
                 else:
-                    log.warning("  Gap-filling: модель не ответила")
+                    chunk_input = chunk
+
+                # Контекст из предыдущего чанка
+                if i > 0:
+                    prev_lines = md_chunks[i - 1].strip().split("\n")
+                    ctx = (
+                        "\n".join(prev_lines[-3:])
+                        if len(prev_lines) >= 3
+                        else md_chunks[i - 1].strip()
+                    )
+                    chunk_input = f"[Контекст]\n{ctx}\n[/Контекст]\n\n{chunk_input}"
+
+                log.info(f"  Часть {i + 1}/{len(md_chunks)} ({len(chunk_input)} символов)")
+                result = _call_ai_api(chunk_input, ai_cfg, f"{file_stem} [ч.{i + 1}]")
+                results[i] = result if result else chunk
+                try:
+                    ckpt_path.write_text(
+                        json.dumps(results, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+
+            md_text = "\n\n".join(r for r in results if r)
+
+            # Логировать покрытие
+            log.info(f"  Чанков с эталонами: {chunks_with_tables}/{len(md_chunks)}")
+
+            # Пост-проверка: остались ли неснятые ID-маркеры
+            remaining_ids = set(re.findall(r"<!--\s*(t_p\d+_\d+)\s*-->", md_text))
+            if remaining_ids:
+                log.warning(
+                    f"  ⚠ Неснятые ID-маркеры ({len(remaining_ids)}): "
+                    f"{', '.join(sorted(remaining_ids, key=_table_id_sort_key))}"
+                    f" — сверка для этих таблиц не прошла"
+                )
+            else:
+                log.info("  Все ID-маркеры сняты")
+
+            try:
+                ckpt_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            log.info(f"  AI-обработка: {len(md_chunks)} чанков → {len(md_text)} символов")
 
         # Сохраняем итоговый .md
         md_path = out_dir / f"{file_stem}.md"
         safe_write(md_path, md_text)
         log.info(f"Итоговый Markdown: {md_path} ({len(md_text)} символов)")
+
+        # Этап 8b: RAG JSONL (если --rag) — из финального MD + Yandex JSON
+        if use_rag:
+            _write_rag_jsonl(md_text, headings, rag_config, input_path, out_dir, file_stem)
 
     except Exception as e:
         log.error(f"  Ошибка обработки: {e}")
@@ -2781,7 +4559,7 @@ def main() -> None:
 
     log.info(f"Вход: {args.input}")
     log.info(f"AI: {args.ai}")
-    log.info(f"AI-Table: {args.ai_table}")
+    log.info(f"RAG: {args.rag}")
     log.info(f"Выход: {output_base}")
     log.info(f"Лог: {log_path}")
 
@@ -2806,8 +4584,17 @@ def main() -> None:
             log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
             sys.exit(1)
 
-    # Загружаем конфиг AI (если нужен — для --ai или --ai-table)
-    config = load_config(args.config) if (args.ai or args.ai_table) else {}
+    # Загружаем конфиг AI (если нужен — для --ai)
+    config = load_config(args.config) if args.ai else {}
+
+    # Загружаем rag_config (если --rag); при ошибке — пропустить RAG-генерацию
+    rag_config = None
+    if args.rag:
+        try:
+            rag_config = load_rag_config(args.rag_config)
+            log.info(f"RAG-конфиг загружен: {args.rag_config}")
+        except Exception as e:
+            log.error(f"Не удалось загрузить rag_config: {e} — RAG-генерация пропущена")
 
     # Обрабатываем каждый файл
     success = 0
@@ -2816,12 +4603,13 @@ def main() -> None:
         ok = process_file(
             str(file_path),
             args.ai,
-            args.ai_table,
             config,
             api_key,
             folder_id,
             output_base,
             tmp_base,
+            use_rag=args.rag,
+            rag_config=rag_config,
         )
         if ok:
             success += 1
