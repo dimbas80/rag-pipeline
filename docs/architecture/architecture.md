@@ -91,6 +91,70 @@ libreoffice --headless --convert-to pdf input.docx --outdir tmp/
 
 **Решение:** Функция `wrap_equations()` **не нужна**. LaTeX-формулы в Yandex-ответе уже обёрнуты в `$...$`. Исключена из пайплайна.
 
+### ADR-7: Section-aware chunking для устранения дублирования таблиц
+
+**Проблема:** `_chunk_text()` разбивает документ по лимиту 24000 символов, игнорируя границы разделов. AI в каждом чанке с неполным разделом выносит таблицы в конец вывода, создавая дубликаты при сборке.
+
+**Решение (2 компонента):**
+1. **`_chunk_text()` — двухфазный алгоритм:** Фаза 1 — партиционирование текста по границам разделов (regex: `**N. Title**`, `### N. Title`, `#### N.N. Title`). Фаза 2 — сборка чанков из целых секций. Секции > max_chars разбиваются по параграфам (старая логика).
+2. **Промпт — удаление табличных инструкций:** Убрать пункты 13-15 (объединение таблиц, вынос примечаний, форматирование подписей) — скриптовая постобработка уже делает это. Добавить запрет на перемещение таблиц в «ЧТО НЕЛЬЗЯ».
+
+**Rationale:** Устранение первопричины (разрыв разделов) + устранение инструкций, провоцирующих перемещение таблиц. Минимальные изменения: только `_chunk_text()` и `config_ai.yaml`.
+
+Полный текст: [ADR-007](decision-records/adr-007-section-aware-chunking.md)
+
+### ADR-8: Извлечение заголовков разделов из Yandex JSON → Markdown headings
+
+**Проблема:** `_block_to_md()` рендерит блоки `LAYOUT_TYPE_SECTION_HEADER` с номером раздела (например, «3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ») как `**жирный текст**`. Это неправильно — для Markdown-заголовков должны использоваться `##`, `###`, `####`. Для последующей RAG-индексации нужна корректная иерархия разделов.
+
+**Почему через Yandex JSON, а не постфактум-парсинг MD:** Парсинг готового Markdown ненадёжен — `**200 кА**` (табличное значение) и `**3.2.1. Молниеприемники**` (заголовок) визуально идентичны. В Yandex JSON заголовки разделов идентифицируются по комбинации layoutType + bounding box + текстового паттерна, что надёжно отличает их от табличных ячеек и обычного текста.
+
+**Решение:** Добавить две функции в пайплайн, работающие после `parse_yandex_json_to_md()` и до `run_script_postprocess()`:
+
+1. **`_extract_headings_from_json(pages)`** — извлекает заголовки из сырых JSON-страниц по 5 правилам:
+   - **Правило 1 (текст):** текст начинается с номера раздела: `^\d+\.(\d+\.)*\s` (напр. «3.», «3.2.1.»)
+   - **Правило 2 (длина):** len(text) < 100 символов И слов < 10
+   - **Правило 3 (позиция):** rel_x < 0.50 (левый край страницы, не таблица)
+   - **Правило 4 (одна строка):** на той же странице и Y-координате (±15px) нет других блоков — это ключевой фильтр, отсекающий ячейки таблиц
+   - **Правило 5 (уровень):** глубина нумерации: «3» → level 1 (##), «3.2» → level 2 (###), «3.2.1» → level 3 (####), «3.2.1.1» → level 4 (#####)
+   
+   Возвращает: `[{"page": N, "y": Y, "level": L, "number": "3.2.1", "text": "Молниеприемники", "full_text": "3.2.1. Молниеприемники"}, ...]`
+
+2. **`_apply_headings_to_md(md_text, headings)`** — находит в MD-тексте строки `**full_text**` и заменяет их на `#{level+1} full_text`. Использует `re.escape()` для безопасной обработки спецсимволов в тексте заголовка.
+
+**Rationale:** Геометрические признаки из JSON (rel_x, Y-изоляция) надёжнее текстовых эвристик на MD. Валидировано на ГОСТ СО153-34.21.122-2003 (29 страниц): найдено 68 заголовков, включая глубокую вложенность до 4 уровней. «Один блок на строке» надёжно отсекает false positives — ячейки таблиц («1 Входящие линии», «2 Антенны») всегда находятся на Y-линии с другими блоками.
+
+**Fallback:** Если Yandex JSON недоступен (старая модель без blocks[]), `_extract_headings_from_json()` возвращает пустой список, `_apply_headings_to_md()` пропускает MD без изменений.
+
+**Коррекция regex:** В задании указан паттерн `^\d+(\.\d+)*\s`, но он не матчит «1. ВВЕДЕНИЕ» — финальная точка после группы цифр не сопровождается цифрой. Правильный паттерн: `^\d+\.(\d+\.)*\s` — номер всегда заканчивается точкой перед пробелом.
+
+**Параметр rel_x:** В задании указан порог 0.45, но на тестовых данных заголовки «1. ВВЕДЕНИЕ» (x=0.455), «4.4. Соединения» (x=0.450) и «4.5. Заземление» (x=0.452) превышают этот порог. Рекомендованный порог: 0.50. Фильтр «один блок на строке» выполняет основную работу по отсеву false positives, поэтому небольшое ослабление rel_x безопасно.
+
+**Интеграция в pipeline:**
+```
+parse_yandex_json_to_md(pages)    → md_text, pictures, page_boundaries
+_extract_headings_from_json(pages) → headings
+_apply_headings_to_md(md_text, headings) → md_text (с ##/###/####)
+run_script_postprocess(md_text)
+```
+
+---
+
+### ADR-9: md_to_rag_jsonl — конвертация MD в JSONL для RAG-индексации
+
+**Проблема:** После Этапа 1 MD-файлы имеют корректную иерархию заголовков `##`/`###`/`####`/`#####`. Нужно преобразовать их в структурированный JSONL для RAG-индексации, где каждая строка — clause с полным контекстом (метаданные документа, иерархия разделов, номер страницы, кросс-ссылки).
+
+**Решение:** Добавить секцию 12 в `pipeline.py` — `md_to_rag_jsonl` (~150 строк). Активируется флагом `--rag`.
+
+Ключевые решения:
+- **ADR-9a:** Clause = каждый заголовок от `##` до `#####`. Текст ограничен следующим заголовком любого уровня.
+- **ADR-9b:** Oversized clause (> max_chunk_chars=1500) разбиваются по границам параграфов с повторением метаданных.
+- **ADR-9c:** Номера страниц берутся из `_extract_headings_from_json()` (ADR-8) — без повторного парсинга JSON.
+- **ADR-9d:** Конфигурация в `rag_config.yaml` с секциями `defaults`, `references.patterns`, `documents.<slug>`.
+- **ADR-9e:** Интеграция как секция 12 в pipeline.py, флаг `--rag`, позиция после всей постобработки.
+
+Полный текст: [ADR-009](decision-records/adr-009-md-to-rag-jsonl.md)
+
 ---
 
 ## 3. Module Decomposition
@@ -112,11 +176,15 @@ pipeline.py (~800 lines)
 │   └── _poll_yandex_operation(operation_id, api_key, folder_id)
 │
 ├── 3. JSON → Markdown Parser      (~200 lines)
-│   ├── parse_yandex_json_to_md(json_path)
-│   ├── _extract_markdown_field(pages)
-│   ├── _parse_tables_from_json(pages)
-│   ├── _parse_pictures_from_json(pages)
-│   └── _parse_blocks_to_text(pages)      # Fallback
+│   ├── parse_yandex_json_to_md(json_path, pages=None)
+│   ├── _block_to_md(block)
+│   ├── _table_to_md(table)
+│   ├── _find_table_caption_for(blocks, table, all_tables)
+│   └── _stitch_continuation_tables(md_text, ...)
+│
+├── 3b. Heading Extractor           (~60 lines)
+│   ├── _extract_headings_from_json(pages)   → list[dict]
+│   └── _apply_headings_to_md(md_text, headings) → str
 │
 ├── 4. Image Extractor             (~80 lines)
 │   ├── extract_images_from_pdf(pdf_path, pictures, page_dims, output_img_dir)
@@ -152,10 +220,21 @@ pipeline.py (~800 lines)
 │   ├── _call_ai_api(text, config, context)
 │   └── ai_postprocess(md_text, config, file_label)
 │
-└── 11. CLI & Main                 (~120 lines)
-    ├── parse_args(argv)
-    ├── process_file(file_path, use_ai, config, api_key, folder_id, output_base, tmp_base)
-    └── main()
+├── 11. CLI & Main                 (~120 lines)
+│   ├── parse_args(argv)
+│   ├── process_file(file_path, use_ai, use_rag, config, rag_config, api_key, folder_id, output_base, tmp_base)
+│   └── main()
+│
+└── 12. RAG JSONL Converter        (~150 lines)
+    ├── load_rag_config(config_path) → dict
+    ├── _extract_heading_number(heading_text) → str | None
+    ├── _build_ancestors(headings_tree, idx) → dict
+    ├── parse_md_structure(md_text) → list[dict]
+    ├── extract_clause_text(md_text, heading_line, next_heading_line) → str
+    ├── extract_references(text, patterns) → list[str]
+    ├── _get_page_for_heading(number, json_headings) → int | None
+    ├── _split_oversized_clause(text, max_chars) → list[str]
+    └── build_rag_jsonl(md_text, json_headings, rag_config, doc_key) → str
 ```
 
 ---
@@ -173,11 +252,18 @@ pipeline.py (~800 lines)
 │   └─ Сохраняет JSON → tmp/<file>/yandex_result.json
 │
 ├─ parse_yandex_json_to_md()
-│   ├─ _extract_markdown_field()      → базовый Markdown
-│   ├─ _parse_tables_from_json()      → Markdown-таблицы (из структурированных ячеек)
-│   ├─ _parse_pictures_from_json()    → список {page, bbox}
-│   └─ Сборка: markdown_field + таблицы → единый .md
+│   ├─ Сборка: блоки (Y-сортировка) + таблицы → единый .md
+│   ├─ _block_to_md(): LAYOUT_TYPE_SECTION_HEADER → **жирный** (временно)
+│   └─ Возвращает (md_text, pictures, page_boundaries)
 │   Сохраняет → tmp/<file>/raw.md
+│
+├─ _extract_headings_from_json(pages)
+│   ├─ 5 правил: текст ^\d+\. → len<100 → rel_x<0.50 → Y-изоляция → уровень
+│   └─ Возвращает [{"page", "level", "full_text", ...}, ...]
+│
+├─ _apply_headings_to_md(md_text, headings)
+│   ├─ Поиск **full_text** в md_text → замена на #{level+1} full_text
+│   └─ Если headings пуст → md_text без изменений
 │
 ├─ extract_images_from_pdf()
 │   ├─ PyMuPDF: page.get_images() → список встроенных изображений
@@ -200,7 +286,15 @@ pipeline.py (~800 lines)
 │   ├─ _call_ai_api()            (Provod API: gemini-3.5-flash → claude-sonnet-5)
 │   └─ Сборка результата
 │
-└─ Сохранение: Markdown/<file>/<file>.md + image/
+├─ [--rag] build_rag_jsonl()
+│   ├─ parse_md_structure(md_text) → список clause
+│   ├─ extract_clause_text() для каждого clause
+│   ├─ _get_page_for_heading() → source.page из _extract_headings_from_json()
+│   ├─ extract_references() → кросс-ссылки
+│   ├─ _split_oversized_clause() для clause > max_chunk_chars
+│   └─ JSONL → Markdown/<документ>/rag_chunks.jsonl
+│
+└─ Сохранение: Markdown/<файл>/<файл>.md + image/
    Промежуточные → tmp/<file>/
    Лог → tmp/Create_Markdown_VisionOCR.log
 ```
@@ -266,6 +360,49 @@ def _parse_pictures_from_json(pages: list[dict]) -> list[dict]:
 def _parse_blocks_to_text(pages: list[dict]) -> str:
     """Fallback: собрать текст из блоков (layoutType: TEXT, LIST, UNSPECIFIED).
     Группирует строки по bounding box'ам, определяет абзацы и списки."""
+
+### 5.2b Heading Extractor
+
+```python
+def _extract_headings_from_json(pages: list[dict]) -> list[dict]:
+    """Извлечь заголовки разделов из Yandex OCR JSON.
+
+    Алгоритм (5 правил):
+      1. Собрать все блоки со всех страниц с page_number, y, x_left, rel_x, text
+      2. Отфильтровать кандидатов:
+         - text matches ^\\d+\\.(\\d+\\.)*\\s  (начинается с номера раздела)
+         - len(text) < 100
+         - len(text.split()) < 10
+         - rel_x < 0.50  (x_left / page_width)
+      3. Проверка «один блок на строке»: на той же странице и
+         Y-координате (±15 px) нет других блоков
+      4. Определить уровень по глубине номера:
+         - "3"       → level 1 → ##
+         - "3.2"     → level 2 → ###
+         - "3.2.1"   → level 3 → ####
+         - "3.2.1.1" → level 4 → #####
+
+    Returns:
+        [{"page": N, "y": Y, "level": L, "number": "3.2.1",
+          "text": "Молниеприемники", "full_text": "3.2.1. Молниеприемники"}, ...]
+    """
+
+def _apply_headings_to_md(md_text: str, headings: list[dict]) -> str:
+    """Заменить **жирные** заголовки на правильные Markdown-заголовки.
+
+    Для каждого heading в headings:
+      1. Построить поисковый паттерн: \\*\\*{re.escape(full_text)}\\*\\*
+      2. Заменить на: {"#" * (level + 1)} {full_text}
+
+    Если headings пуст — вернуть md_text без изменений (fallback).
+
+    Edge cases:
+      - Дублирующиеся заголовки (например, в оглавлении): re.sub() с count=1
+        заменяет только первое вхождение
+      - Спецсимволы в тексте (*, [, etc.): re.escape()
+      - Заголовок уже может быть обработан ранее: проверка, что строка
+        начинается с **, а не с #
+    """
 ```
 
 ### 5.3 Image Extractor
@@ -345,6 +482,195 @@ def _chunk_text(text: str, max_chars: int = 24000) -> list[str]:
     """Разбить Markdown на чанки, сохраняя целостность таблиц и кодовых блоков."""
 ```
 
+### 5.5b RAG JSONL Converter
+
+```python
+def load_rag_config(config_path: str | Path) -> dict:
+    """Загрузить rag_config.yaml.
+    Returns: полный словарь конфига с defaults, references, documents.
+    Raises: FileNotFoundError, yaml.YAMLError."""
+
+def _extract_heading_number(heading_text: str) -> str | None:
+    """Извлечь номер раздела из текста заголовка.
+    Примеры: '3.2.1. Молниеприемники' → '3.2.1'
+             '1.1. Общие положения' → '1.1'
+    Regex: ^(\\d+(?:\\.\\d+)*)\\.\\s
+    Returns: номер (строка) или None."""
+
+def _build_ancestors(
+    headings: list[dict],
+    idx: int,
+) -> dict[str, str | None]:
+    """Построить chapter/section/clause для данного heading по индексу.
+    Ищет ближайшие предшествующие heading меньшего уровня.
+    Returns: {'chapter': '3', 'section': '3.2', 'clause': '3.2.1'}.
+    Поля, для которых предок не найден, равны None."""
+
+def parse_md_structure(md_text: str) -> list[dict]:
+    """Разобрать Markdown на иерархию clause.
+
+    Алгоритм:
+      1. Разбить текст на строки (splitlines)
+      2. Найти все строки-заголовки: ^(#{2,5})\\s+(.+)$
+      3. Для каждого заголовка:
+         - level = len(match[1]) (## → 2, ### → 3, #### → 4, ##### → 5)
+         - heading_text = match[2]
+         - number = _extract_heading_number(heading_text)
+         - line_num = индекс строки
+      4. Для каждого heading определить next_heading_line_num:
+         - Индекс строки следующего heading в списке (любого уровня)
+         - Для последнего heading — len(lines)
+      5. Построить список clause, каждый с полями:
+         - level, number, heading_text, line_num, next_line_num
+
+    Returns:
+        [{
+            'level': 2,          # 2=##, 3=###, 4=####, 5=#####
+            'number': '3',       # извлечённый номер
+            'heading_text': '3. Защита от прямых ударов молнии',
+            'line_num': 42,      # 0-based индекс строки заголовка
+            'next_line_num': 78, # 0-based индекс строки след. заголовка (эксклюзив)
+                                 # или len(lines) для последнего
+        }, ...]
+
+    Corner cases:
+      - Заголовки без номера (напр. '## Введение') → number=None,
+        пропускаются? Нет, clause всё равно создаётся
+        (chapter/section/clause = null)
+      - Оглавление (Content) — если heading_text содержит 'Содержание'
+        И doc_meta.ignore_sections содержит 'Содержание' →
+        пропускается вся секция (см. build_rag_jsonl)
+      - Дублирующиеся заголовки (оглавление + основной текст) —
+        обрабатываются оба (оглавление фильтруется через ignore_sections)
+    """
+
+def extract_clause_text(
+    md_text: str,
+    heading_line: int,
+    next_heading_line: int,
+) -> str:
+    """Извлечь текст clause между двумя заголовками.
+
+    Алгоритм:
+      1. lines = md_text.splitlines()
+      2. Извлечь lines[heading_line + 1 : next_heading_line]
+      3. Join через \\n
+      4. strip() ведущих/завершающих пробелов и пустых строк
+
+    Таблицы и изображения сохраняются как есть (Markdown).
+    Не модифицирует текст.
+
+    Returns: текст clause (может быть пустой строкой).
+    """
+
+def extract_references(
+    text: str,
+    patterns: list[str],
+) -> list[str]:
+    """Извлечь кросс-ссылки из текста clause.
+
+    Алгоритм:
+      1. Для каждого regexp-паттерна из patterns:
+         - re.findall(pattern, text)
+         - Для каждого совпадения: привести к канонической форме
+           (напр. 'табл. 3.1' → 'табл. 3.1')
+      2. Дедупликация (set → sorted list)
+      3. Вернуть список (может быть пустым)
+
+    Returns: list[str] уникальных ссылок в порядке возрастания.
+    """
+
+def _get_page_for_heading(
+    number: str,
+    json_headings: list[dict] | None,
+) -> int | None:
+    """Найти номер страницы для clause по номеру раздела.
+
+    Использует результат _extract_headings_from_json() (ADR-8):
+      json_headings = [{'page': N, 'number': '3.2.1', ...}, ...]
+
+    Алгоритм:
+      1. Если json_headings пуст или None → вернуть None
+      2. Построить индекс: {heading['number']: heading['page']}
+         (первое вхождение для каждого номера)
+      3. Найти json_headings[i] где heading['number'] == number
+      4. Вернуть page (0-based), или None
+
+    Edge cases:
+      - Номер не найден в JSON (нетипичный формат) → None
+      - Несколько headings с одинаковым номером (оглавление + текст)
+        → берётся первое (из оглавления — page > 0, корректно)
+    """
+
+def _split_oversized_clause(
+    text: str,
+    max_chars: int,
+) -> list[str]:
+    """Разбить текст clause на подчанки по границам параграфов.
+
+    Алгоритм:
+      1. Если len(text) <= max_chars → [text]
+      2. Разбить text по \\n\\n (параграфы)
+      3. Объединить параграфы в группы ≤ max_chars:
+         - Таблицы (строка начинается с '|') не разрывать:
+           собрать все смежные строки таблицы в один блок
+         - Кодовые блоки (```...```) не разрывать
+      4. Каждая группа → подчанок
+      5. Вернуть list[str]
+
+    Гарантия: если один параграф/таблица > max_chars — он публикуется
+    как есть (log.warning).
+
+    Returns: список подчанков (всегда минимум 1 элемент).
+    """
+
+def build_rag_jsonl(
+    md_text: str,
+    json_headings: list[dict] | None,
+    rag_config: dict,
+    doc_key: str,
+) -> str:
+    """Построить JSONL-строку для RAG-индексации.
+
+    Алгоритм:
+      1. Загрузить doc_meta = rag_config['documents'][doc_key]
+         Если doc_key не найден → raise ValueError
+      2. defaults = rag_config['defaults']
+      3. patterns = rag_config['references']['patterns']
+         (если defaults.extract_references = true)
+      4. ignore_sections = doc_meta.get('ignore_sections', [])
+      5. clauses = parse_md_structure(md_text)
+
+      6. Для каждого clause:
+         a. Проверить ignore_sections: если heading_text содержит
+            имя игнорируемой секции → пропустить ВСЕ clause до
+            следующего heading того же или выше уровня
+            (реализация: флаг skip_until_level)
+         b. Извлечь текст: extract_clause_text(md_text, line_num, next_line_num)
+         c. Пропустить если текст пустой (article heading без контента)
+         d. Определить chapter/section/clause через _build_ancestors()
+         e. Определить source.page через _get_page_for_heading(number, json_headings)
+         f. Извлечь references через extract_references(text, patterns)
+         g. Если len(text) > max_chunk_chars:
+            - Разбить через _split_oversized_clause(text, max_chunk_chars)
+            - Для каждого подчанка создать отдельную JSONL-строку
+            - Добавить суффикс «(ч. N)» к clause
+         h. Собрать JSON-объект и записать как строку в JSONL
+
+      7. Вернуть полную JSONL-строку (разделитель \\n)
+
+    Returns:
+        JSONL-строка, каждая строка — валидный JSON-объект.
+        Пример строки:
+        {"document_id":"СО 153-34.21.122-2003","document_id_alt":null,
+         "title":"Инструкция...","edition":"2003","date_enacted":"2003-06-30",
+         "date_amended":null,"amended_by":null,"chapter":"3","section":"3.2",
+         "clause":"3.2.1","text":"Внешняя МЗС ...",
+         "source":{"file":"СО153-34_21_122-2003.pdf","page":7},
+         "references":["табл. 3.1"]}
+    """
+```
+
 ### 5.6 CLI & Main
 
 ```python
@@ -352,19 +678,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Разобрать аргументы командной строки.
     -i/--input (required): входной файл или папка
     --ai (flag): включить AI-постобработку
+    --rag (flag): сгенерировать JSONL для RAG-индексации
+    --rag-config (default: ./rag_config.yaml): путь к rag_config.yaml
     --config (default: ./config_ai.yaml): путь к конфигу AI"""
 
 def process_file(
     input_path: str,
     use_ai: bool,
+    use_rag: bool,
     config: dict,
+    rag_config: dict | None,
     api_key: str,
     folder_id: str,
     output_base: str,
     tmp_base: str,
 ) -> bool:
-    """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
-    Returns: True при успехе."""
+    """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → [RAG] → сохранение.
+    Returns: True при успехе.
+    НОВОЕ: use_rag + rag_config для RAG JSONL генерации."""
 
 def main() -> None:
     """Точка входа. Парсинг аргументов, итерация по файлам, process_file()."""
@@ -410,6 +741,13 @@ libreoffice          # headless конвертация DOCX/DOC → PDF
 | Изображения: не найдены в PDF | `log.warning`, продолжить без изображений |
 | AI: все модели недоступны | `log.error`, вернуть исходный Markdown |
 | AI: ошибка сети | 3 ретрая на основную модель, затем fallback |
+| Heading extraction: не найдено заголовков | `log.info("Заголовки не найдены")`, MD без изменений |
+| Heading extraction: JSON без blocks[] | `_extract_headings_from_json()` → `[]`, fallback на MD как есть |
+| Heading extraction: ошибка regex | `log.warning`, пропустить конкретный heading |
+| RAG: rag_config.yaml не найден | `log.error`, пропустить RAG-генерацию |
+| RAG: doc_key не найден в конфиге | `log.error`, пропустить файл (нельзя определить метаданные) |
+| RAG: clause текст > max_chunk_chars и неразбиваем | `log.warning`, опубликовать как есть |
+| RAG: JSON-сериализация ошибка | `log.error`, пропустить конкретный clause |
 
 **Принцип:** ошибка в одном файле не останавливает обработку остальных. `process_file()` возвращает `False`, `main()` считает статистику.
 
@@ -441,6 +779,41 @@ postprocess:
     Ты — редактор технических текстов...
 ```
 
+### rag_config.yaml
+
+```yaml
+# Глобальные настройки
+defaults:
+  output_format: "jsonl"
+  max_chunk_chars: 1500
+  include_tables: true
+  include_images: true
+  extract_references: true
+
+# Паттерны кросс-ссылок
+references:
+  patterns:
+    - 'см\\.\\s*(?:п\\.|пункт)\\s*(\\d+(?:\\.\\d+)*)'
+    - '(?:согласно|по)\\s+(?:п\\.|пункту)\\s*(\\d+(?:\\.\\d+)*)'
+    - '(?:табл\\.|таблица)\\s*(\\d+(?:\\.\\d+)*)'
+    - 'разд\\.\\s*(\\d+(?:\\.\\d+)*)'
+    - '(?:гл\\.|глава)\\s*(\\d+(?:\\.\\d+)*)'
+
+# Каталог документов (slug → метаданные)
+documents:
+  so153_molniezashita:
+    document_id: "СО 153-34.21.122-2003"
+    document_id_alt: null
+    title: "Инструкция по устройству молниезащиты..."
+    edition: "2003"
+    date_enacted: "2003-06-30"
+    date_amended: null
+    amended_by: null
+    source_file: "СО153-34_21_122-2003 Молниезащита.pdf"
+    ignore_sections:
+      - "Содержание"
+```
+
 ---
 
 ## 9. Output Structure
@@ -450,6 +823,7 @@ postprocess:
 ├── Markdown/
 │   └── <имя_файла>/
 │       ├── <имя_файла>.md       # Итоговый Markdown
+│       ├── rag_chunks.jsonl      # RAG JSONL (если --rag)
 │       └── image/                # fig_1.png, fig_2.jpg, ...
 ├── tmp/
 │   ├── Create_Markdown_VisionOCR.log  # Общий лог
@@ -473,6 +847,7 @@ postprocess:
 | `wrap_equations()` | Нужна | **Не нужна** |
 | Сборка Markdown | `content_list_v2.json` | Поле `markdown` + `tables` |
 | Разбиение PDF | `page_splitter.py` (200 стр/200 МБ) | Yandex лимит: 200 стр/10 МБ — та же логика |
+| RAG-индексация | Отсутствует | **Новая:** `--rag`, JSONL из MD-заголовков |
 
 ---
 
@@ -485,3 +860,9 @@ postprocess:
 3. **Сопоставление изображений по IoU:** Алгоритм `_match_images_to_pictures()` может не найти соответствие для некоторых изображений (разные DPI, сжатие). Решение: если изображение не сопоставлено — вставить его в конец документа с комментарием.
 
 4. **Таймаут Yandex OCR для больших PDF:** Лимит 10 минут на операцию может не хватить для 200-страничного PDF. Решение: если PDF > 50 страниц — разбивать на части по 30 страниц (аналогично `page_splitter.py`).
+
+5. **Heading-to-page mapping без OCR:** Если `--rag` используется с `.md` файлом (без Yandex OCR), `_extract_headings_from_json()` вернёт `[]`, и все `source.page` будут `null`. Это приемлемо — RAG всё равно работает, но без привязки к страницам.
+
+6. **Нестандартная нумерация разделов:** Некоторые ГОСТ используют римские цифры (I, II, IV) или буквы (а, б, в) для нумерации приложений. Regex `^\\d+(\\.\\d+)*\\.\\s` не сматчит такие номера — `_extract_heading_number()` вернёт `None`. Решение: для приложений номер определяется позиционно (первый heading после «Приложение» → appendix «А»). Не реализовано в v1 — приложения без номеров получают `chapter/section/clause = null`.
+
+7. **Матчинг doc_key по имени файла:** Если источник — DOCX (конвертируется в PDF), имя файла во временной папке отличается от имени в конфиге. Решение: матчить `source_file` из конфига по `input_path.name` (не `pdf_path.name`). Для `.md` файлов — по `stem`. Реализовать матчинг в `main()` до вызова `process_file()`.

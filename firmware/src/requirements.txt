@@ -1,0 +1,9 @@
+# Create_Markdown_YA — зависимости пайплайна (firmware/src)
+httpx>=0.24
+pyyaml>=6.0
+pymupdf>=1.22
+beautifulsoup4>=4.11
+python-dotenv>=1.0
+
+# RAG v2 (ADR-010): Qwen3-Embedding-8B native tokenizer
+transformers>=4.51.0

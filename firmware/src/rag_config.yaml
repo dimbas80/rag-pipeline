@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Конфигурация RAG-индексации нормативных документов v2 (ADR-010)
+# Спецификация: docs/software/rag_config_spec.yaml
+# Изменения v2: max_chunk_tokens (Qwen3 tokenizer), status/status_reason,
+#               replaced_by_document_id (официальный номер документа-преемника)
+# ═══════════════════════════════════════════════════════════════════════════
+
+defaults:
+  output_format: "jsonl"               # jsonl (построчно)
+  max_chunk_tokens: 7000               # макс. размер чанка в токенах Qwen3
+  tokenizer: "Qwen/Qwen3-Embedding-8B" # HF model id для transformers.AutoTokenizer
+  tokenizer_revision: "main"           # фиксированная ревизия токенизатора
+  allow_degraded_fallback: false       # запретить молчаливый chars/token fallback
+  tokenizer_fallback_ratio: 3.5        # chars/token (только при allow_degraded_fallback: true)
+  include_tables: true                 # таблицы — в text как Markdown
+  include_images: true                 # ![fig_N](image/fig_N.jpg) — как есть
+  extract_references: true             # авто regexp: «см. п.», «табл.», «гл.»
+  default_status: "active"             # статус по умолчанию если не указан
+
+# ── Паттерны references ──
+references:
+  patterns:
+    - 'см\.\s*(?:п\.|пункт)\s*(\d+(?:\.\d+)*)'
+    - '(?:согласно|по)\s+(?:п\.|пункту)\s*(\d+(?:\.\d+)*)'
+    - '(?:табл\.|таблица)\s*(\d+(?:\.\d+)*)'
+    - 'разд\.\s*(\d+(?:\.\d+)*)'
+    - '(?:гл\.|глава)\s*(\d+(?:\.\d+)*)'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# КАТАЛОГ ДОКУМЕНТОВ
+# ═══════════════════════════════════════════════════════════════════════════
+documents:
+  # ── СО 153-34.21.122-2003 (Молниезащита) ──
+  so153_molniezashita:
+    document_id: "СО 153-34.21.122-2003"
+    document_id_alt: null
+    title: "Инструкция по устройству молниезащиты зданий, сооружений и промышленных коммуникаций"
+    edition: "2003"
+    date_enacted: "2003-06-30"
+    date_amended: null
+    amended_by: null
+    source_file: "СО153-34_21_122-2003 Молниезащита.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:                   # пропустить при индексации
+      - "Содержание"
+
+  # ── СП 89.13330.2016 (Котельные установки) ──
+  sp89_kotelnye:
+    document_id: "СП 89.13330.2016"
+    document_id_alt: "СНиП II-35-76"
+    title: "Котельные установки"
+    edition: "2016"
+    date_enacted: "2017-06-17"
+    date_amended: "2021-05-18"
+    amended_by: "Приказ Минстроя РФ № 295/пр от 18.05.2021"
+    source_file: "СП 89.13330.2016 Котельные установки.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Предисловие"
+      - "Содержание"
+
+  # ── Пример недействующего документа: СНиП 2.04.05-86 ──
+  old_snip:
+    document_id: "СНиП 2.04.05-86"
+    document_id_alt: null
+    title: "Отопление, вентиляция и кондиционирование"
+    edition: "1986"
+    date_enacted: "1987-01-01"
+    date_amended: null
+    amended_by: null
+    source_file: "СНиП_2.04.05-86.pdf"
+    status: inactive
+    status_reason: "Заменён на СП 60.13330.2012"
+    replaced_by_document_id: "СП 60.13330.2012"   # официальный номер документа-преемника
+    replaced_by_doc_key: "sp60_otoplenie"         # ключ каталога (slug) при необходимости
+    ignore_sections:
+      - "Содержание"
