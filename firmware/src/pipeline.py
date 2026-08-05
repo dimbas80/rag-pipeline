@@ -2183,7 +2183,11 @@ def rename_images(md_text: str, img_dir: str | Path) -> tuple[str, int]:
     if not img_dir.exists():
         return md_text, 0
 
-    img_files = sorted(img_dir.glob("*"))
+    # Все изображения кроме table_N.png (их не переименовываем — это вырезанные таблицы)
+    img_files = sorted(
+        p for p in img_dir.glob("*")
+        if p.is_file() and not p.name.startswith("table_")
+    )
     if not img_files:
         return md_text, 0
 

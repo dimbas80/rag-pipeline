@@ -159,6 +159,24 @@ python3 pipeline.py -i file.pdf --rag --rag-config my_rag.yaml
 | `references` | `patterns` | Список regexp для поиска ссылок |
 | `documents` | `<doc_key>` | Метаданные документа: `document_id`, `title`, `edition`, `source_file` |
 | `documents` | `ignore_sections` | Секции, исключаемые из индексации (например, «Содержание») |
+### Пример заполнения rag_config.yaml
+documents:                                                                                                                                                    
+        pue_7:                                           # slug — любое уникальное латинское имя                                                                    
+          document_id: "ПУЭ"                             # официальный номер/обозначение
+          document_id_alt: null                          # старое обозначение если было (СНиП → СП)                                                                 
+          title: "Правила устройства электроустановок"   # полное название                                                                                          
+          edition: "7"                                   # редакция                                                                                                 
+          date_enacted: "2003-01-01"                     # дата ввода в действие                                                                                    
+          date_amended: "2022-01-01"                     # дата последних изменений (null если не было)                                                             
+          amended_by: "Приказ Минэнерго №123"            # кем изменён (null если не было)                                                                          
+          source_file: "ПУЭ_7.pdf"                       # ИМЯ ФАЙЛА — по нему ищется документ при --rag                                                            
+          status: active                                 # active или inactive                                                                                      
+          status_reason: null                            # для inactive: причина (для active: null)                                                                 
+          replaced_by_document_id: null                  # для inactive: официальный номер преемника                                                                
+          replaced_by_doc_key: null                      # для inactive: slug преемника в этом же конфиге                                                           
+          ignore_sections:                               # какие разделы пропустить при индексации                                                                  
+            - "Содержание"                                                                                                                                          
+            - "Предисловие"   
 
 ### Сопоставление файлов
 
