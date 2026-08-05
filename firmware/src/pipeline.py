@@ -3748,7 +3748,7 @@ def _write_rag_jsonl(
     out_dir: str | Path,
     file_stem: str,
 ) -> None:
-    """Сгенерировать Markdown/<file>/rag_chunks.jsonl + rag_assets.json (--rag).
+    """Сгенерировать {file_stem}_chunks.jsonl + {file_stem}_assets.json (--rag).
 
     doc_key определяется через _find_doc_key(); при отсутствии документа
     в конфиге — log.warning и пропуск (архитектура §7 error handling).
@@ -3770,6 +3770,7 @@ def _write_rag_jsonl(
             doc_key,
             Path(out_dir) / "image",
             out_dir,
+            file_stem,
         )
     except Exception as e:
         log.error(f"  Ошибка RAG-генерации: {e}")
@@ -4135,6 +4136,7 @@ def _run_rag_only(md_path: Path, rag_config: dict | None) -> bool:
             doc_key,
             img_dir if img_dir.is_dir() else None,
             doc_dir,
+            md_path.stem,
         )
         return True
     except Exception as e:
@@ -4149,12 +4151,13 @@ def run_rag_pipeline(
     doc_key: str,
     img_dir: str | Path | None,
     out_dir: str | Path,
+    file_stem: str,
 ) -> bool:
     """Оркестратор RAG: токенизатор → JSONL v2 → assets → атомарная запись.
 
     Атомарно ПЕРЕЗАПИСЫВАЕТ:
-      - {out_dir}/rag_chunks.jsonl
-      - {out_dir}/rag_assets.json
+      - {out_dir}/{file_stem}_chunks.jsonl
+      - {out_dir}/{file_stem}_assets.json
     .md и image/ не модифицируются.
 
     Returns:
@@ -4181,11 +4184,11 @@ def run_rag_pipeline(
     jsonl_lines = [json.dumps(c, ensure_ascii=False) for c in chunks]
     jsonl_out = "\n".join(jsonl_lines) + ("\n" if jsonl_lines else "")
 
-    rag_path = Path(out_dir) / "rag_chunks.jsonl"
+    rag_path = Path(out_dir) / f"{file_stem}_chunks.jsonl"
     safe_write(rag_path, jsonl_out)
     log.info(f"  RAG JSONL перезаписан: {rag_path} ({len(chunks)} строк)")
 
-    assets_path = Path(out_dir) / "rag_assets.json"
+    assets_path = Path(out_dir) / f"{file_stem}_assets.json"
     write_rag_assets(assets, assets_path)
     log.info(f"  RAG Assets перезаписан: {assets_path}")
 

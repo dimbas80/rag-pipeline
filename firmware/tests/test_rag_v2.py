@@ -428,6 +428,7 @@ ASSET_MD = (
 
 
 class TestAssetRegistry:
+    SOURCE_STEM = "СО153-34_21_122-2003 Молниезащита"
     def test_extract_tables_from_md(self):
         tables = pipeline._extract_tables_from_md(ASSET_MD)
         assert len(tables) == 1
@@ -508,7 +509,7 @@ class TestAssetRegistry:
         img_dir.mkdir()
         (img_dir / "table_1.png").write_bytes(b"png")
         assets = pipeline._build_asset_registry(ASSET_MD, "so153", img_dir)
-        out = tmp_path / "rag_assets.json"
+        out = tmp_path / f"{self.SOURCE_STEM}_assets.json"
         pipeline.write_rag_assets(assets, out)
         data = json.loads(out.read_text(encoding="utf-8"))
         assert "_md_block" not in data["assets"]["tables"][0]
@@ -579,8 +580,8 @@ class TestRunRagOnly:
         assert (img_dir / "table_1.png").read_bytes() == img_hash_before
 
         # Производные файлы созданы рядом с MD
-        assert (md_path.parent / "rag_chunks.jsonl").exists()
-        assert (md_path.parent / "rag_assets.json").exists()
+        assert (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").exists()
+        assert (md_path.parent / f"{self.SOURCE_STEM}_assets.json").exists()
 
     def test_rag_only_idempotent(self, tmp_path, rag_config):
         """Повторный запуск --rag даёт идентичный результат."""
@@ -588,9 +589,9 @@ class TestRunRagOnly:
         with patch("pipeline._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
             assert pipeline._run_rag_only(md_path, rag_config) is True
-            first = (md_path.parent / "rag_chunks.jsonl").read_text(encoding="utf-8")
+            first = (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").read_text(encoding="utf-8")
             assert pipeline._run_rag_only(md_path, rag_config) is True
-            second = (md_path.parent / "rag_chunks.jsonl").read_text(encoding="utf-8")
+            second = (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").read_text(encoding="utf-8")
         assert first == second
 
     def test_rag_only_atomic_no_tmp_left(self, tmp_path, rag_config):
@@ -610,7 +611,7 @@ class TestRunRagOnly:
                    return_value=(lambda t: len(t) // 3, "qwen3")):
             ok = pipeline._run_rag_only(md_path, rag_config)
         assert ok is False
-        assert not (md_path.parent / "rag_chunks.jsonl").exists()
+        assert not (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").exists()
 
     def test_rag_only_no_image_dir(self, tmp_path, rag_config):
         """image/ отсутствует → реестр активов пуст, но JSONL создаётся."""
@@ -624,13 +625,14 @@ class TestRunRagOnly:
             ok = pipeline._run_rag_only(md_path, rag_config)
         assert ok is True
         assets = json.loads(
-            (md_path.parent / "rag_assets.json").read_text(encoding="utf-8")
+            (md_path.parent / f"{self.SOURCE_STEM}_assets.json").read_text(encoding="utf-8")
         )
         assert assets["assets"]["tables"] == []
         assert assets["assets"]["images"] == []
 
 
 class TestRunRagPipeline:
+    SOURCE_STEM = "СО153-34_21_122-2003 Молниезащита"
     def test_writes_jsonl_and_assets(self, tmp_path, rag_config):
         out_dir = tmp_path / "out"
         img_dir = out_dir / "image"
@@ -649,10 +651,11 @@ class TestRunRagPipeline:
                    return_value=(lambda t: len(t) // 3, "qwen3")):
             ok = pipeline.run_rag_pipeline(
                 md, None, rag_config, "so153_molniezashita", img_dir, out_dir,
+                self.SOURCE_STEM,
             )
         assert ok is True
-        jsonl_path = out_dir / "rag_chunks.jsonl"
-        assets_path = out_dir / "rag_assets.json"
+        jsonl_path = out_dir / f"{self.SOURCE_STEM}_chunks.jsonl"
+        assets_path = out_dir / f"{self.SOURCE_STEM}_assets.json"
         assert jsonl_path.exists()
         assert assets_path.exists()
 
@@ -673,6 +676,7 @@ class TestRunRagPipeline:
             pipeline.run_rag_pipeline(
                 "## 3. ТЕКСТ\nТекст.\n", None, rag_config,
                 "so153_molniezashita", None, tmp_path,
+                self.SOURCE_STEM,
             )
 
 
@@ -682,6 +686,7 @@ class TestRunRagPipeline:
 
 
 class TestProcessFileTableExtraction:
+    SOURCE_STEM = "СО153-34_21_122-2003 Молниезащита"
     def _pages(self):
         return [{
             "result": {
@@ -772,8 +777,8 @@ class TestProcessFileTableExtraction:
             )
         assert ok is True
         # Производные файлы рядом с MD, без вложенного Markdown/
-        assert (doc_dir / "rag_chunks.jsonl").exists()
-        assert (doc_dir / "rag_assets.json").exists()
+        assert (doc_dir / f"{self.SOURCE_STEM}_chunks.jsonl").exists()
+        assert (doc_dir / f"{self.SOURCE_STEM}_assets.json").exists()
         assert not (doc_dir / "Markdown").exists()
 
 

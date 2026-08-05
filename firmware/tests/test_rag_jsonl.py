@@ -591,7 +591,7 @@ def test_process_file_rag_writes_jsonl(tmp_path, rag_config):
         )
 
     assert ok is True
-    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "rag_chunks.jsonl"
+    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "СО153-34_21_122-2003 Молниезащита_chunks.jsonl"
     assert rag_path.exists()
     rows = [json.loads(l) for l in rag_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(rows) == 1
@@ -602,7 +602,7 @@ def test_process_file_rag_writes_jsonl(tmp_path, rag_config):
     assert rows[0]["chunking_method"] == "qwen3"
     assert "chunk_id" in rows[0]
     # rag_assets.json создаётся
-    assets_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "rag_assets.json"
+    assets_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "СО153-34_21_122-2003 Молниезащита_assets.json"
     assert assets_path.exists()
 
 
@@ -625,7 +625,7 @@ def test_process_file_rag_no_doc_key(tmp_path, rag_config):
         )
     assert ok is True
     # rag_chunks.jsonl не создан (doc_key не найден)
-    assert not (Path(out_base) / "unknown" / "rag_chunks.jsonl").exists()
+    assert not (Path(out_base) / "unknown" / "unknown_chunks.jsonl").exists()
 
 
 def test_process_file_without_rag_no_jsonl(tmp_path, rag_config):
@@ -644,7 +644,7 @@ def test_process_file_without_rag_no_jsonl(tmp_path, rag_config):
             output_base=out_base, tmp_base=tmp_base,
         )
     assert ok is True
-    assert not (Path(out_base) / "input" / "rag_chunks.jsonl").exists()
+    assert not (Path(out_base) / "input" / "input_chunks.jsonl").exists()
 
 
 def test_process_file_md_rag(tmp_path, rag_config):
@@ -663,7 +663,7 @@ def test_process_file_md_rag(tmp_path, rag_config):
             use_rag=True, rag_config=rag_config,
         )
     assert ok is True
-    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "rag_chunks.jsonl"
+    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "СО153-34_21_122-2003 Молниезащита_chunks.jsonl"
     assert rag_path.exists()
     rows = [json.loads(l) for l in rag_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert len(rows) == 1
@@ -704,7 +704,7 @@ def test_process_file_md_ai_rag(tmp_path, rag_config):
             use_rag=True, rag_config=rag_config,
         )
     assert ok is True
-    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "rag_chunks.jsonl"
+    rag_path = Path(out_base) / "СО153-34_21_122-2003 Молниезащита" / "СО153-34_21_122-2003 Молниезащита_chunks.jsonl"
     assert rag_path.exists()
     rows = [json.loads(l) for l in rag_path.read_text(encoding="utf-8").splitlines() if l.strip()]
     chapters = [r["chapter"] for r in rows]
