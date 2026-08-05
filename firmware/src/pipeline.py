@@ -1187,7 +1187,7 @@ def _stitch_continuation_tables(
 # 3b. Heading Extractor (ADR-8)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_HEADING_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)*)\.\s")
+_HEADING_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)*)(?:\.\s|\s)")
 _HEADING_Y_TOLERANCE = 15.0
 _HEADING_MAX_LEN = 100
 _HEADING_MAX_WORDS = 10
@@ -1246,6 +1246,12 @@ def _extract_headings_from_json(pages: list[dict] | None = None) -> list[dict]:
             # Правило 1: текст начинается с номера раздела
             m = _HEADING_NUMBER_RE.match(text)
             if not m:
+                continue
+
+            # Правило 1b: однобуквенные номера без точек — только 1-2 цифры (главы)
+            # «200 кА» — не заголовок; «11 Гарантии» — заголовок
+            number_raw = m.group(1)
+            if "." not in number_raw and len(re.sub(r"[^\d]", "", number_raw)) > 2:
                 continue
 
             # Правило 2: длина и число слов

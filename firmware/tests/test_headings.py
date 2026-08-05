@@ -85,15 +85,18 @@ def test_extract_headings_deep_levels():
 
 
 def test_extract_headings_regex_number_requires_dot():
-    """Правило 1: «200 кА» без точки после числа — НЕ заголовок."""
+    """Правило 1b: «200 кА» без точки — однобуквенный номер > 2 цифр, НЕ заголовок."""
     pages = [_page([_block("200 кА", x=100, y=100)])]
     assert pipeline._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_regex_number_with_trailing_dot():
-    """Правило 1: «3. ЗАЩИТА» — точка после номера обязательна."""
+    """Правило 1: «3 ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ» — точка после номера не обязательна."""
     pages = [_page([_block("3 ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ", x=100, y=100)])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    found = pipeline._extract_headings_from_json(pages)
+    assert len(found) == 1
+    assert found[0]["number"] == "3"
+    assert found[0]["text"] == "ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ"
 
 
 def test_extract_headings_length_rule():

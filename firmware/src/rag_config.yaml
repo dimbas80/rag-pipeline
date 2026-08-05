@@ -65,6 +65,24 @@ documents:
       - "Предисловие"
       - "Содержание"
 
+  # ── СП 89.13330.2016 (Кабели силовые с пластмассовой изоляцией на номинальное напряжение 0,66; 1 и 3 кВ) ──
+  GOST_31996_kabel:
+    document_id: "ГОСТ 31996—2012"
+    document_id_alt: null
+    title: "Кабели силовые с пластмассовой изоляцией на номинальное напряжение 0,66; 1 и 3 кВ"
+    edition: "2012"
+    date_enacted: "2014-01-01"
+    date_amended: null
+    amended_by: null
+    source_file: "ГОСТ 31996-2012 Кабели.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Предисловие"
+      - "Содержание"
+
   # ── Пример недействующего документа: СНиП 2.04.05-86 ──
   old_snip:
     document_id: "СНиП 2.04.05-86"
