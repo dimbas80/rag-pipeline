@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import pipeline
 
-RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_config.yaml")
+RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
 
 
 @pytest.fixture(scope="module")

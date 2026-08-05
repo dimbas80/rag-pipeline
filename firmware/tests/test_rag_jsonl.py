@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import pipeline
 
-RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_config.yaml")
+RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
 
 # Тестовый JSON ГОСТ СО153-34.21.122-2003 (как в test_headings.py)
 TEST_JSON = "/mnt/sdb/!База_ГОСТ/tmp/СО153-34_21_122-2003 Молниезащита/yandex_result.json"
