@@ -12,7 +12,7 @@
 cd firmware/src
 
 # Установка зависимостей
-pip install httpx pyyaml pymupdf beautifulsoup4 "transformers>=4.51.0"
+pip install httpx pyyaml pymupdf beautifulsoup4
 
 # Базовое распознавание (без AI)
 python3 pipeline.py -i document.pdf
@@ -113,32 +113,19 @@ DOCX → PDF (LibreOffice)
 4. **AI-проход**: для каждого чанка извлекаются ID, подставляются только релевантные vision-эталоны. AI сверяет таблицы с одинаковыми ID, удаляет маркеры из выдачи
 5. **Пост-проверка**: если после AI остались `<!-- t_p... -->` — warning в лог
 
-## Генерация RAG JSONL v2 (`--rag`)
+## Генерация RAG JSONL (`--rag`)
 
-Флаг `--rag` создаёт/перезаписывает файлы `rag_chunks.jsonl` (JSONL v2, ADR-010)
-и `rag_assets.json` (реестр таблиц/изображений) для индексации документа в
-RAG-системах (ChromaDB, Qdrant и т.д.).
-
-### Трёхэтапный режим (ADR-010e)
-
-1. **Генерация** (PDF/DOCX): таблицы ВСЕГДА вырезаются в `image/table_N.png`
-   локально через PyMuPDF, независимо от `--ai`; `--ai` добавляет
-   vision/AI-коррекцию.
-2. **Проверка человеком**: правки в `Markdown/<файл>/<файл>.md`.
-3. **RAG-индексация** (`.md` внутри `Markdown/` + `--rag`): читает только
-   проверенный Markdown, БЕЗ OCR/AI/извлечения, атомарно перезаписывает
-   `rag_chunks.jsonl` + `rag_assets.json`. `.md` и `image/` не модифицируются.
+Флаг `--rag` создаёт файл `rag_chunks.jsonl` для индексации документа в RAG-системах (ChromaDB, Qdrant и т.д.).
 
 ### Использование
 
 ```bash
-python3 pipeline.py -i file.pdf --rag                # JSONL v2 + assets
-python3 pipeline.py -i file.pdf --ai --rag           # AI + RAG
+python3 pipeline.py -i file.pdf --rag                # только JSONL
+python3 pipeline.py -i file.pdf --ai --rag           # AI + JSONL
 python3 pipeline.py -i file.pdf --rag --rag-config my_rag.yaml
-python3 pipeline.py -i Markdown/file/file.md --rag   # RAG-индексация проверенного MD
 ```
 
-### Формат выхода (JSONL v2)
+### Формат выхода
 
 Каждая строка `rag_chunks.jsonl` — валидный JSON-объект:
 
@@ -146,20 +133,12 @@ python3 pipeline.py -i Markdown/file/file.md --rag   # RAG-индексация 
 {
   "document_id": "СО 153-34.21.122-2003",
   "title": "Инструкция по устройству молниезащиты...",
-  "status": "active",
-  "chunk_id": "so153_molniezashita/3.2.1",
-  "chapter": "3",
-  "section": "3.2",
-  "clause": "3.2.1",
-  "section_path": "3 → 3.2 → 3.2.1",
-  "heading_texts": {"chapter": "3. ЗАЩИТА...", "section": "3.2. Внешняя...", "clause": "3.2.1. Молниеприемники"},
+  "chapter": "3. Защита от прямых ударов молнии",
+  "section": "3.2. Внешняя молниезащитная система",
+  "clause": "3.2.1. Молниеприемники",
   "text": "Молниеприемники могут быть специально установленными...",
-  "source": {"file": "СО153-...pdf"},
-  "_source_page": 7,
-  "assets": ["so153_molniezashita/table/1"],
-  "references": ["п. 3.2.2", "табл. 3.4"],
-  "chunk_tokens": 1450,
-  "chunking_method": "qwen3"
+  "page": 12,
+  "references": ["п. 3.2.2", "табл. 3.4"]
 }
 ```
 
@@ -167,23 +146,18 @@ python3 pipeline.py -i Markdown/file/file.md --rag   # RAG-индексация 
 
 1. MD-документ разбирается на структурные единицы (chapter/section/clause) по заголовкам `##`/`###`/`####`
 2. Каждая единица с непустым текстом становится отдельной JSON-строкой
-3. Токены считаются Qwen3-native токенизатором (`Qwen/Qwen3-Embedding-8B` через `transformers.AutoTokenizer`)
-4. Номера страниц сохраняются как внутреннее `_source_page` (публичное `source.page` удалено)
-5. Кросс-ссылки («см. п. 3.2.2», «табл. 3.4») извлекаются по regexp-паттернам из конфига
-6. Чанки длиннее `max_chunk_tokens` (по умолчанию 7000) разбиваются с суффиксом `/part_N` и «(ч. N)»
+3. Номера страниц восстанавливаются из Yandex JSON (только для PDF, для `.md` — `null`)
+4. Кросс-ссылки («см. п. 3.2.2», «табл. 3.4») извлекаются по regexp-паттернам из конфига
+5. Чанки длиннее `max_chunk_chars` (по умолчанию 1500) разбиваются с суффиксом `(ч. 1)`, `(ч. 2)`...
 
 ### Конфигурация: rag_config.yaml
 
 | Секция | Поле | Описание |
 |--------|------|----------|
-| `defaults` | `max_chunk_tokens` | Максимальный размер чанка в токенах (по умолчанию 7000) |
-| `defaults` | `tokenizer` | HF model id токенизатора: `Qwen/Qwen3-Embedding-8B` |
-| `defaults` | `allow_degraded_fallback` | `false`: токенизатор обязателен; `true`: явный chars/token fallback с warning |
-| `defaults` | `tokenizer_fallback_ratio` | chars/token для degraded-режима (по умолчанию 3.5) |
+| `defaults` | `max_chunk_chars` | Максимальный размер чанка (по умолчанию 1500) |
 | `defaults` | `extract_references` | Извлекать кросс-ссылки (`true`/`false`) |
 | `references` | `patterns` | Список regexp для поиска ссылок |
-| `documents` | `<doc_key>` | Метаданные документа: `document_id`, `title`, `edition`, `source_file`, `status` |
-| `documents` | `status` | `active` / `inactive`; для inactive — `status_reason`, `replaced_by_document_id` (официальный номер), `replaced_by_doc_key` (slug, опционально) |
+| `documents` | `<doc_key>` | Метаданные документа: `document_id`, `title`, `edition`, `source_file` |
 | `documents` | `ignore_sections` | Секции, исключаемые из индексации (например, «Содержание») |
 
 ### Сопоставление файлов
@@ -208,8 +182,7 @@ python3 pipeline.py -i Markdown/file/file.md --rag   # RAG-индексация 
 ├── Markdown/
 │   └── <имя_файла>/
 │       ├── <имя_файла>.md       # итоговый Markdown
-│       ├── rag_chunks.jsonl      # RAG JSONL v2 (если --rag)
-│       ├── rag_assets.json       # реестр таблиц/изображений (если --rag)
+│       ├── rag_chunks.jsonl      # RAG JSONL (если --rag)
 │       └── image/                # извлечённые изображения
 │           ├── fig_1.png
 │           └── ...
