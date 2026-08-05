@@ -1188,6 +1188,11 @@ def _stitch_continuation_tables(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _HEADING_NUMBER_RE = re.compile(r"^(\d+(?:\.\d+)*)(?:\.\s|\s)")
+# Римские цифры I–XXX с точкой и пробелом: «II. Состав разделов»
+_HEADING_ROMAN_RE = re.compile(
+    r"^(M{0,3}(?:CM|CD|D?C{0,3})?(?:XC|XL|L?X{0,3})?(?:IX|IV|V?I{0,3}))\.\s",
+    re.IGNORECASE,
+)
 _HEADING_Y_TOLERANCE = 15.0
 _HEADING_MAX_LEN = 100
 _HEADING_MAX_WORDS = 10
@@ -1245,14 +1250,21 @@ def _extract_headings_from_json(pages: list[dict] | None = None) -> list[dict]:
 
             # Правило 1: текст начинается с номера раздела
             m = _HEADING_NUMBER_RE.match(text)
+            is_roman = False
             if not m:
-                continue
+                # Правило 1r: римские цифры «II. Состав разделов...»
+                m = _HEADING_ROMAN_RE.match(text)
+                if not m:
+                    continue
+                is_roman = True
 
             # Правило 1b: однобуквенные номера без точек — только 1-2 цифры (главы)
             # «200 кА» — не заголовок; «11 Гарантии» — заголовок
-            number_raw = m.group(1)
-            if "." not in number_raw and len(re.sub(r"[^\d]", "", number_raw)) > 2:
-                continue
+            # Для римских цифр правило не применяется
+            if not is_roman:
+                number_raw = m.group(1)
+                if "." not in number_raw and len(re.sub(r"[^\d]", "", number_raw)) > 2:
+                    continue
 
             # Правило 2: длина и число слов
             if len(text) >= _HEADING_MAX_LEN or len(text.split()) >= _HEADING_MAX_WORDS:
