@@ -3059,6 +3059,7 @@ def _build_ancestors(
       - section: свой номер для ###, иначе ближайший предыдущий ###
         (только в пределах текущей главы)
       - clause:  свой номер для ####/#####, иначе ближайший предыдущий ####/#####
+        (только в пределах текущей главы)
 
     Новый top-level chapter (##) всегда сбрасывает section/clause в None:
     нельзя наследовать ###/#### из предыдущей главы (регрессия: повторный
@@ -3098,7 +3099,10 @@ def _build_ancestors(
         clause = current.get("number")
         if clause is None:
             # Ненумерованный подпункт — наследуем от предыдущего ####/#####
+            # только в пределах текущей главы: не выходим за ##
             for j in range(idx - 1, -1, -1):
+                if headings[j].get("level") == 2:
+                    break
                 if (headings[j].get("level") or 0) >= 4:
                     clause = headings[j].get("number")
                     break
@@ -3115,7 +3119,8 @@ def _build_heading_texts(
     Аналог _build_ancestors(), но возвращает ТЕКСТЫ заголовков, а не номера:
       - chapter: текст ближайшего ##
       - section: текст ближайшего ### (только в пределах текущей главы)
-      - clause:  текст текущего ####/##### (или ближайшего предыдущего)
+      - clause:  текст текущего ####/##### (или ближайшего предыдущего,
+        только в пределах текущей главы)
 
     Новый top-level chapter (##) всегда сбрасывает section/clause в None.
 
@@ -3150,8 +3155,14 @@ def _build_heading_texts(
 
     if level >= 4:
         clause_text = current.get("heading_text")
-        if clause_text is None:
+        if clause_text is None or current.get("number") is None:
+            # Ненумерованный подпункт (или заголовок без текста) — наследуем
+            # текст от предыдущего ####/#####, но только в пределах текущей
+            # главы: не выходим за ## (аналог ограничения для section).
+            clause_text = None
             for j in range(idx - 1, -1, -1):
+                if headings[j].get("level") == 2:
+                    break
                 if (headings[j].get("level") or 0) >= 4:
                     clause_text = headings[j].get("heading_text")
                     break

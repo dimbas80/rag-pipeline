@@ -301,6 +301,63 @@ def test_build_ancestors_section_bounded_by_chapter():
     assert pipeline._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": "2.1"}
 
 
+def test_build_ancestors_unnumbered_clause_bounded_by_chapter():
+    """Регрессия: ненумерованный #### после нового ## не наследует clause из предыдущей главы.
+
+    Последовательность: ## 4 (с #### 4.7.1) → ## 1 → #### без номера.
+    Раньше backward scan для ненумерованного clause проходил через границу
+    новой главы и подставлял чужой номер '4.7.1'.
+    """
+    md = (
+        "## 4. Старое\n"
+        "### 4.7. Раздел\n"
+        "#### 4.7.1. Пункт\n"
+        "## 1. Новое\n"
+        "#### Без номера\n"
+        "Текст\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_ancestors(s, 4) == {
+        "chapter": "1",
+        "section": None,
+        "clause": None,
+    }
+
+
+def test_build_heading_texts_unnumbered_clause_bounded_by_chapter():
+    """Регрессия: heading_texts.clause для ненумерованного #### после нового ## = None."""
+    md = (
+        "## 4. Старое\n"
+        "### 4.7. Раздел\n"
+        "#### 4.7.1. Пункт\n"
+        "## 1. Новое\n"
+        "#### Без номера\n"
+        "Текст\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_heading_texts(s, 4) == {
+        "chapter": "1. Новое",
+        "section": None,
+        "clause": None,
+    }
+
+
+def test_build_heading_texts_unnumbered_subclause_inherits_text():
+    """Ненумерованный ##### наследует текст предыдущего #### внутри той же главы."""
+    md = (
+        "## 3. ЗАЩИТА\n"
+        "### 3.2. Внешняя МЗС\n"
+        "#### 3.2.1. Молниеприемники\n"
+        "##### Общие соображения\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_heading_texts(s, 3) == {
+        "chapter": "3. ЗАЩИТА",
+        "section": "3.2. Внешняя МЗС",
+        "clause": "3.2.1. Молниеприемники",
+    }
+
+
 def test_build_heading_texts_new_chapter_resets():
     """Регрессия: heading_texts для нового ## не наследует section/clause тексты."""
     md = (
