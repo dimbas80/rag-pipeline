@@ -22,6 +22,12 @@ QAGraph (run/stream/resume, разделы 2.2, 6.4).
 Любой OpenAI-совместимый провайдер подключается правкой YAML без
 изменения кода.
 
+Расчёты по формулам: если ответ LLM содержит Python-код в блоке
+```python ... ```, он автоматически исполняется execute_calculation()
+(только стандартная библиотека, timeout 5 с, изоляция PYTHONPATH и cwd);
+результат вставляется в ответ после блока кода, чтобы пользователь мог
+проверить и формулу, и вычисление.
+
 Установка:
     pip install -r requirements.txt
 
@@ -32,7 +38,9 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -934,6 +942,72 @@ def ask_clarification(state: QAGraphState, config=None) -> dict:
     return update
 
 
+# ─── Расчёты по формулам (execute_calculation) ────────────────────────
+# ТЗ: generate_answer может вернуть Python-код в блоке ```python ... ```.
+# execute_calculation() исполняет такие блоки (timeout 5 с, запрещены
+# input()/while True, изоляция PYTHONPATH и cwd) и вставляет результат
+# в ответ сразу после блока кода — пользователь видит и формулу, и код,
+# и результат и может проверить вычисление.
+
+PYTHON_FENCE_PATTERN = re.compile(r"```python\n(.*?)\n```", re.DOTALL)
+
+CALC_BANNED_MESSAGE = (
+    "[Ошибка: интерактивный ввод или бесконечный цикл запрещён]"
+)
+CALC_TIMEOUT_MESSAGE = "[Ошибка: превышено время исполнения]"
+CALC_NO_OUTPUT_MESSAGE = "[выполнено без вывода]"
+
+
+def execute_calculation(answer: str, timeout: int = 5) -> str:
+    """Находит ```python-блоки в ответе, исполняет, вставляет результат.
+
+    Каждый блок ```python ... ``` исполняется в отдельном subprocess:
+      - только стандартная библиотека (PYTHONPATH очищен — нет доступа
+        к модулям проекта);
+      - cwd — свежая временная директория (нет доступа к файлам проекта);
+      - timeout (по умолчанию 5 c) — защита от зависаний;
+      - `input()` и `while True` запрещены на этапе разбора.
+
+    Результат исполнения вставляется после блока кода:
+
+        ```python
+        print(2 + 3)
+        ```
+        **Результат:**
+        ```
+        5
+        ```
+
+    Если блок не найден — ответ возвращается без изменений.
+    Если код завершился с ошибкой/таймаутом/без вывода — вместо результата
+    вставляется соответствующее сообщение в квадратных скобках.
+    """
+    def run_block(code: str) -> str:
+        if "input(" in code or "while True" in code:
+            return CALC_BANNED_MESSAGE
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                r = subprocess.run(
+                    ["python3", "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=tmp,
+                    env={**os.environ, "PYTHONPATH": ""},  # изоляция
+                )
+        except subprocess.TimeoutExpired:
+            return CALC_TIMEOUT_MESSAGE
+        if r.returncode == 0:
+            return r.stdout.strip() or CALC_NO_OUTPUT_MESSAGE
+        return f"[Ошибка: {r.stderr.strip()[:200]}]"
+
+    def replace_block(m):
+        result = run_block(m.group(1))
+        return f"{m.group(0)}\n**Результат:**\n```\n{result}\n```"
+
+    return PYTHON_FENCE_PATTERN.sub(replace_block, answer)
+
+
 # ─── Узел 6: generate_answer (раздел 5.6) ─────────────────────────────
 
 GENERATE_ANSWER_PROMPT = """Ты — эксперт по нормативным документам (ГОСТ, СП, СНиП, СанПиН).
@@ -950,6 +1024,10 @@ GENERATE_ANSWER_PROMPT = """Ты — эксперт по нормативным 
 4. Если в результатах поиска нет ответа — честно скажи об этом
    и предложи переформулировать запрос.
 5. Не выдумывай информацию, которой нет в предоставленных фрагментах.
+7. Если для ответа нужен расчёт по формуле — напиши Python-код
+   в блоке ```python ... ```. Используй только стандартную библиотеку.
+   Вместо запятой в числах пиши точку: 1.2 а не 1,2.
+   Я исполню код и покажу результат пользователю.
 6. Будь краток, но точен.
 
 ВОПРОС: {query}
@@ -977,12 +1055,13 @@ CITATION_REGEN_INSTRUCTION = (
 
 
 def generate_answer(state: QAGraphState, config=None) -> dict:
-    """Узел 6: генерация ответа + пост-валидация цитат (раздел 5.6).
+    """Узел 6: генерация ответа + расчёты + пост-валидация цитат (5.6).
 
     - Пустые search_results → fallback-ответ без вызова LLM.
-    - После генерации проверяется наличие цитат (has_citations);
-      при отсутствии — однократная перегенерация с доп. инструкцией
-      (max 1 доп. попытка).
+    - После генерации ответ LLM проходит через execute_calculation():
+      ```python-блоки исполняются, результат вставляется после блока кода.
+    - Затем проверяется наличие цитат (has_citations); при отсутствии —
+      однократная перегенерация с доп. инструкцией (max 1 доп. попытка).
     - LLM недоступен → fallback-ответ + error (раздел 7.1).
     """
     cfg = _get_qa_config(config)
@@ -1012,6 +1091,9 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
         except RuntimeError as exc:
             last_exc = exc
             break
+        # Расчёты по формулам (ТЗ): если ответ содержит ```python-блок —
+        # исполняем его и вставляем результат после блока кода.
+        answer = execute_calculation(answer)
         if has_citations(answer):
             return {"final_answer": answer}
         if attempt == 0:

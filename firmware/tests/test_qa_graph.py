@@ -1272,6 +1272,172 @@ def test_generate_answer_llm_error_fallback(monkeypatch):
     assert "временно недоступен" in out["final_answer"]
     assert "LLM API недоступен" in out["error"]
 
+
+# ─── Расчёты по формулам: execute_calculation ─────────────────────────
+
+def test_execute_calculation_no_code_block_unchanged():
+    answer = "Просто текст с цитатой [ГОСТ 31996-2012, п. 5.2]"
+    assert qa_graph.execute_calculation(answer) == answer
+
+
+def test_execute_calculation_executes_python_block():
+    answer = "Расчёт:\n```python\nprint(2 + 3)\n```"
+    out = qa_graph.execute_calculation(answer)
+    assert "```python\nprint(2 + 3)\n```" in out
+    assert "**Результат:**" in out
+    assert "5" in out
+
+
+def test_execute_calculation_inserts_result_after_block():
+    answer = (
+        "Формула:\n```python\n"
+        "h = 30 / 1.2\n"
+        "print(f\"h = {h:.1f}\")\n"
+        "```\nКонец"
+    )
+    out = qa_graph.execute_calculation(answer)
+    # Результат вставляется после блока кода, до остального текста
+    assert out.index("**Результат:**") > out.index("```python")
+    assert out.index("Конец") > out.index("**Результат:**")
+    assert "h = 25.0" in out
+
+
+def test_execute_calculation_multiple_blocks():
+    answer = (
+        "```python\nprint(1)\n```\n"
+        "```python\nprint(2)\n```"
+    )
+    out = qa_graph.execute_calculation(answer)
+    assert out.count("**Результат:**") == 2
+    assert "1" in out
+    assert "2" in out
+
+
+def test_execute_calculation_bans_input():
+    answer = "```python\nx = input('> ')\nprint(x)\n```"
+    out = qa_graph.execute_calculation(answer)
+    assert "интерактивный ввод" in out
+
+
+def test_execute_calculation_bans_while_true():
+    answer = "```python\nwhile True:\n    pass\n```"
+    out = qa_graph.execute_calculation(answer)
+    assert "бесконечный цикл" in out
+
+
+def test_execute_calculation_runtime_error():
+    answer = "```python\nraise ValueError('boom')\n```"
+    out = qa_graph.execute_calculation(answer)
+    assert "Ошибка" in out
+    assert "boom" in out
+
+
+def test_execute_calculation_timeout():
+    # Бесконечный цикл, не ловящийся строковым запретом (не «while True»)
+    answer = "```python\nfor _ in iter(int, 1):\n    pass\n```"
+    out = qa_graph.execute_calculation(answer, timeout=1)
+    assert "превышено время исполнения" in out
+
+
+def test_execute_calculation_no_output():
+    answer = "```python\nx = 1 + 1\n```"
+    out = qa_graph.execute_calculation(answer)
+    assert "выполнено без вывода" in out
+
+
+def test_execute_calculation_ignores_non_python_fences():
+    answer = "```bash\necho hi\n```"
+    assert qa_graph.execute_calculation(answer) == answer
+
+
+def test_generate_answer_executes_python_block(monkeypatch):
+    """Ответ LLM с ```python-блоком: результат исполняется и вставляется."""
+
+    def fake_llm(messages, config, node_name, **kw):
+        return (
+            "Согласно [ГОСТ 31996-2012, табл. 19]:\n"
+            "```python\nprint(2 + 2)\n```"
+        )
+
+    monkeypatch.setattr(qa_graph, "llm_chat", fake_llm)
+    out = qa_graph.generate_answer(
+        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
+        _cfg(),
+    )
+    assert "**Результат:**" in out["final_answer"]
+    assert "4" in out["final_answer"]
+
+
+def test_generate_answer_executes_calculation_on_each_attempt(monkeypatch):
+    """Без цитат → перегенерация; execute_calculation вызывается 2 раза."""
+    answers = iter([
+        "```python\nprint(1)\n```",  # без цитат → перегенерация
+        "Ответ [ГОСТ 31996-2012, п. 1]\n```python\nprint(2)\n```",
+    ])
+    calls = {"n": 0}
+    original = qa_graph.execute_calculation
+
+    def fake_llm(messages, config, node_name, **kw):
+        return next(answers)
+
+    def fake_exec(answer, timeout=5):
+        calls["n"] += 1
+        return original(answer, timeout=timeout)
+
+    monkeypatch.setattr(qa_graph, "llm_chat", fake_llm)
+    monkeypatch.setattr(qa_graph, "execute_calculation", fake_exec)
+    out = qa_graph.generate_answer(
+        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
+        _cfg(),
+    )
+    assert calls["n"] == 2
+    assert "**Результат:**" in out["final_answer"]
+    assert "2" in out["final_answer"]
+
+
+def test_generate_answer_llm_error_skips_calculation(monkeypatch):
+    calls = {"n": 0}
+
+    def boom(messages, config, node_name, **kw):
+        raise RuntimeError("llm down")
+
+    def fake_exec(answer, timeout=5):
+        calls["n"] += 1
+        return answer
+
+    monkeypatch.setattr(qa_graph, "llm_chat", boom)
+    monkeypatch.setattr(qa_graph, "execute_calculation", fake_exec)
+    out = qa_graph.generate_answer(
+        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
+        _cfg(),
+    )
+    assert calls["n"] == 0
+    assert "временно недоступен" in out["final_answer"]
+
+
+def test_generate_answer_prompt_has_calculation_rule(monkeypatch):
+    captured = {}
+
+    def fake_llm(messages, config, node_name, **kw):
+        captured["system"] = messages[0]["content"]
+        return "ответ [ГОСТ 31996-2012, п. 1]"
+
+    monkeypatch.setattr(qa_graph, "llm_chat", fake_llm)
+    qa_graph.generate_answer(
+        _state(
+            query="высота молниеотвода",
+            search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}],
+        ),
+        _cfg(),
+    )
+    system = captured["system"]
+    assert "Если для ответа нужен расчёт по формуле" in system
+    assert "```python ... ```" in system
+    assert "1.2 а не 1,2" in system
+    assert "Я исполню код и покажу результат пользователю" in system
+    # Правило добавлено после «Не выдумывай информацию» (по ТЗ)
+    assert system.index("Не выдумывай информацию") < system.index("расчёт по формуле")
+
 # ══════════════════════════════════════════════════════════════════════
 # Юнит 3: сборка графа и QAGraph (разделы 4, 2.2, 6.4)
 # ══════════════════════════════════════════════════════════════════════
