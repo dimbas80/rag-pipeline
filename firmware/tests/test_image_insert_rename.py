@@ -261,3 +261,67 @@ def test_rename_skips_table_images(tmp_path: Path):
     assert out == "![Рисунок 1](image/fig_1.png)\n![table_1](image/table_1.png)"
     assert (img_dir / "table_1.png").exists()
     assert (img_dir / "fig_1.png").exists()
+
+
+def test_rename_no_clobber_fig_1_to_14(tmp_path: Path):
+    """БАГ 3: алфавитная сортировка fig_10 перед fig_2 затирала файлы.
+
+    При полном извлечении 14 картинок (fig_1..fig_14) переименований
+    быть НЕ должно: каждый fig_N остаётся со СВОИМ содержимым,
+    в папке остаются все 14 файлов, alt-тексты нормализованы.
+    """
+    img_dir = tmp_path / "image"
+    img_dir.mkdir()
+    contents = {}
+    for n in range(1, 15):
+        data = f"content-of-fig-{n}".encode()
+        contents[n] = data
+        (img_dir / f"fig_{n}.png").write_bytes(data)
+    md = "\n".join(f"![fig_{n}](image/fig_{n}.png)" for n in range(1, 15))
+
+    out, n = rename_images(md, img_dir)
+
+    assert n == 0  # имена уже правильные — ни одного переименования
+    files = sorted(p.name for p in img_dir.iterdir())
+    assert set(files) == {f"fig_{n}.png" for n in range(1, 15)}  # все 14 на месте
+    # Приёмка п.2: fig_2 содержит СВОЁ содержимое, а не fig_10
+    for num in range(1, 15):
+        assert (img_dir / f"fig_{num}.png").read_bytes() == contents[num]
+    # Приёмка: единый формат alt-текста ![Рисунок N]
+    assert out == "\n".join(
+        f"![Рисунок {num}](image/fig_{num}.png)" for num in range(1, 15)
+    )
+
+
+def test_rename_gap_compaction_no_clobber(tmp_path: Path):
+    """Выпадение вырезки (fig_1, fig_3) → номера схлопываются без потерь."""
+    img_dir = tmp_path / "image"
+    img_dir.mkdir()
+    (img_dir / "fig_1.png").write_bytes(b"F1")
+    (img_dir / "fig_3.png").write_bytes(b"F3")
+    md = "![fig_1](image/fig_1.png)\n![fig_3](image/fig_3.png)"
+
+    out, n = rename_images(md, img_dir)
+
+    assert n == 1
+    assert (img_dir / "fig_1.png").read_bytes() == b"F1"
+    assert (img_dir / "fig_2.png").read_bytes() == b"F3"  # fig_3 → fig_2
+    assert not (img_dir / "fig_3.png").exists()
+    assert out == "![Рисунок 1](image/fig_1.png)\n![Рисунок 2](image/fig_2.png)"
+
+
+def test_rename_hash_after_fig_no_clobber(tmp_path: Path):
+    """Хэш-файлы сортируются ПОСЛЕ fig_N и не затирают их."""
+    img_dir = tmp_path / "image"
+    img_dir.mkdir()
+    (img_dir / "fig_1.png").write_bytes(b"F1")
+    (img_dir / "abc123.png").write_bytes(b"ABC")
+    md = "![fig_1](image/fig_1.png)\n![image](image/abc123.png)"
+
+    out, n = rename_images(md, img_dir)
+
+    assert n == 1
+    assert (img_dir / "fig_1.png").read_bytes() == b"F1"  # не затёрт
+    assert (img_dir / "fig_2.png").read_bytes() == b"ABC"
+    assert not (img_dir / "abc123.png").exists()
+    assert out == "![Рисунок 1](image/fig_1.png)\n![Рисунок 2](image/fig_2.png)"

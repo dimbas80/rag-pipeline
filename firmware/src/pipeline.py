@@ -2286,6 +2286,24 @@ def merge_tables(md_text: str) -> str:
 # 7. Постобработка: изображения и подписи
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _fig_num(p: Path) -> int:
+    """Числовой номер из имени fig_N (fig_10 → 10); 0 для не-fig имён."""
+    m = re.search(r"fig_(\d+)", p.name)
+    return int(m.group(1)) if m else 0
+
+
+def _fig_sort_key(p: Path) -> tuple[int, int, str]:
+    """Ключ сортировки для rename_images: fig_N по номеру, не-fig после.
+
+    Возвращает (группа, номер, имя):
+      - fig_N файлы: (0, N, name) — числовой порядок (fig_2 перед fig_10);
+      - не-fig (хэш-имена от старого экстрактора): (1, 0, name) — после
+        всех fig_N, детерминированно по имени, не затирая fig_N.
+    """
+    n = _fig_num(p)
+    return (0 if n else 1, n, p.name)
+
+
 def rename_images(md_text: str, img_dir: str | Path) -> tuple[str, int]:
     """Переименовать хеш-изображения в fig_N, поправить ссылки."""
     img_dir = Path(img_dir)
@@ -2297,9 +2315,15 @@ def rename_images(md_text: str, img_dir: str | Path) -> tuple[str, int]:
         return md_text, 0
 
     # Все изображения кроме table_N.png (их не переименовываем — это вырезанные таблицы)
+    # БАГ: алфавитная сортировка ставила "fig_10" перед "fig_2" — fig_10
+    # переименовывался в fig_2 и затирал оригинал (из 14 файлов оставалось 6).
+    # Сортируем ПО ЧИСЛОВОМУ номеру fig_ (см. _fig_sort_key): при полном
+    # извлечении fig_1..fig_14 переименований нет вовсе, при выпадении
+    # вырезок (fig_1, fig_3, ...) номера схлопываются без перезаписи.
     img_files = sorted(
-        p for p in img_dir.glob("*")
-        if p.is_file() and not p.name.startswith("table_")
+        (p for p in img_dir.glob("*")
+         if p.is_file() and not p.name.startswith("table_")),
+        key=_fig_sort_key,
     )
     if not img_files:
         return md_text, 0
