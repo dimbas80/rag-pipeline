@@ -261,6 +261,178 @@ def test_build_ancestors_unnumbered_subclause():
     assert pipeline._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": "3.2.1"}
 
 
+def test_build_ancestors_new_chapter_resets_section_clause():
+    """Регрессия: новый top-level ## не наследует section/clause из предыдущей главы.
+
+    В СО153 после главы «4. ...» идёт раздел «### 4.7. ...», затем повторный
+    top-level «## 1/2/3» (рекомендации). Раньше «## 1» получал чужой section 4.7.
+    """
+    md = (
+        "## 4. ЗАЩИТА ОТ ВТОРИЧНЫХ ВОЗДЕЙСТВИЙ МОЛНИИ\n"
+        "### 4.7. Защита оборудования в существующих зданиях\n"
+        "## 1. Разработка эксплуатационно-технической документации\n"
+    )
+    s = _struct(md)
+    # Второй top-level ## 1: section/clause сброшены, глава — своя
+    assert pipeline._build_ancestors(s, 2) == {"chapter": "1", "section": None, "clause": None}
+
+
+def test_build_ancestors_new_chapter_after_clause_resets():
+    """Новый ## сбрасывает даже наследованный clause от предыдущего ####."""
+    md = (
+        "## 3. ЗАЩИТА\n"
+        "### 3.2. Внешняя МЗС\n"
+        "#### 3.2.1. Молниеприемники\n"
+        "## 2. Порядок приемки\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": None}
+
+
+def test_build_ancestors_section_bounded_by_chapter():
+    """Регрессия: #### в новой главе без ### не наследует section из предыдущей главы."""
+    md = (
+        "## 3. ЗАЩИТА\n"
+        "### 3.2. Внешняя молниезащитная система\n"
+        "## 2. ПОРЯДОК ПРИЕМКИ\n"
+        "#### 2.1. Оформление\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": "2.1"}
+
+
+def test_build_ancestors_unnumbered_clause_bounded_by_chapter():
+    """Регрессия: ненумерованный #### после нового ## не наследует clause из предыдущей главы.
+
+    Последовательность: ## 4 (с #### 4.7.1) → ## 1 → #### без номера.
+    Раньше backward scan для ненумерованного clause проходил через границу
+    новой главы и подставлял чужой номер '4.7.1'.
+    """
+    md = (
+        "## 4. Старое\n"
+        "### 4.7. Раздел\n"
+        "#### 4.7.1. Пункт\n"
+        "## 1. Новое\n"
+        "#### Без номера\n"
+        "Текст\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_ancestors(s, 4) == {
+        "chapter": "1",
+        "section": None,
+        "clause": None,
+    }
+
+
+def test_build_heading_texts_unnumbered_clause_bounded_by_chapter():
+    """Регрессия: heading_texts.clause для ненумерованного #### после нового ## = None."""
+    md = (
+        "## 4. Старое\n"
+        "### 4.7. Раздел\n"
+        "#### 4.7.1. Пункт\n"
+        "## 1. Новое\n"
+        "#### Без номера\n"
+        "Текст\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_heading_texts(s, 4) == {
+        "chapter": "1. Новое",
+        "section": None,
+        "clause": None,
+    }
+
+
+def test_build_heading_texts_unnumbered_subclause_inherits_text():
+    """Ненумерованный ##### наследует текст предыдущего #### внутри той же главы."""
+    md = (
+        "## 3. ЗАЩИТА\n"
+        "### 3.2. Внешняя МЗС\n"
+        "#### 3.2.1. Молниеприемники\n"
+        "##### Общие соображения\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_heading_texts(s, 3) == {
+        "chapter": "3. ЗАЩИТА",
+        "section": "3.2. Внешняя МЗС",
+        "clause": "3.2.1. Молниеприемники",
+    }
+
+
+def test_build_heading_texts_new_chapter_resets():
+    """Регрессия: heading_texts для нового ## не наследует section/clause тексты."""
+    md = (
+        "## 4. ЗАЩИТА ОТ ВТОРИЧНЫХ ВОЗДЕЙСТВИЙ МОЛНИИ\n"
+        "### 4.7. Защита оборудования в существующих зданиях\n"
+        "## 1. Разработка эксплуатационно-технической документации\n"
+    )
+    s = _struct(md)
+    assert pipeline._build_heading_texts(s, 2) == {
+        "chapter": "1. Разработка эксплуатационно-технической документации",
+        "section": None,
+        "clause": None,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _build_embedding_text
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_build_embedding_text_full():
+    """Все три заголовка + текст; порядок chapter → section → clause."""
+    ht = {
+        "chapter": "2. ОБЩИЕ ПОЛОЖЕНИЯ",
+        "section": "2.3. Параметры токов молнии",
+        "clause": "2.3.1. Амплитуда",
+    }
+    text = "Исходный текст."
+    assert pipeline._build_embedding_text(ht, text) == (
+        "Заголовок главы: 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
+        "Заголовок раздела: 2.3. Параметры токов молнии\n"
+        "Заголовок пункта: 2.3.1. Амплитуда\n"
+        "\n"
+        "Исходный текст."
+    )
+
+
+def test_build_embedding_text_short_section_only():
+    """Короткий раздел: глава + раздел + текст (без пустых строк/None)."""
+    ht = {
+        "chapter": "2. ОБЩИЕ ПОЛОЖЕНИЯ",
+        "section": "2.3. Параметры токов молнии",
+        "clause": None,
+    }
+    text = "Молния представляет собой импульс тока."
+    emb = pipeline._build_embedding_text(ht, text)
+    assert emb == (
+        "Заголовок главы: 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
+        "Заголовок раздела: 2.3. Параметры токов молнии\n"
+        "\n"
+        "Молния представляет собой импульс тока."
+    )
+    # Исходный текст присутствует целиком
+    assert emb.endswith(text)
+
+
+def test_build_embedding_text_chapter_only():
+    """Только глава (top-level): один заголовок + текст."""
+    ht = {"chapter": "1. ВВЕДЕНИЕ", "section": None, "clause": None}
+    assert pipeline._build_embedding_text(ht, "Текст.") == (
+        "Заголовок главы: 1. ВВЕДЕНИЕ\n"
+        "\n"
+        "Текст."
+    )
+
+
+def test_build_embedding_text_no_headings():
+    """Нет заголовков (или None) → только исходный текст."""
+    assert pipeline._build_embedding_text({}, "text") == "text"
+    assert pipeline._build_embedding_text(None, "text") == "text"
+    assert pipeline._build_embedding_text(
+        {"chapter": None, "section": None, "clause": None}, "text"
+    ) == "text"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # extract_references
 # ═══════════════════════════════════════════════════════════════════════════

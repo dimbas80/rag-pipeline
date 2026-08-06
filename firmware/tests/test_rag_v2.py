@@ -310,7 +310,8 @@ class TestBuildRagJsonlV2:
         required = {
             "document_id", "title", "status", "chunk_id",
             "chapter", "section", "clause", "section_path", "heading_texts",
-            "text", "source", "_source_page", "assets", "references",
+            "text", "embedding_text", "embedding_tokens",
+            "source", "_source_page", "assets", "references",
             "chunk_tokens", "chunking_method",
         }
         for line in jsonl.splitlines():
@@ -404,6 +405,153 @@ class TestBuildRagJsonlV2:
         assert rows
         assert rows[0]["chunk_id"] == "so153_molniezashita/3"
         assert rows[1]["chunk_id"] == "so153_molniezashita/_h1"
+
+    def test_chunk_id_unique_with_repeated_headings(self, rag_config):
+        """Повторные numbered top-level главы → уникальные chunk_id.
+
+        Первый ID остаётся базовым, повторы получают /occurrence_{N}.
+        Регрессия СО153: «## 1/2/3» в разделе рекомендаций дублировали
+        introduction «## 1» и «## 2» — последний перезаписывал первый.
+        """
+        md = (
+            "## 1. ВВЕДЕНИЕ\n"
+            "Вводный текст.\n"
+            "\n"
+            "## 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
+            "Текст главы 2.\n"
+            "\n"
+            "## 1. Разработка эксплуатационно-технической документации\n"
+            "Текст рекомендаций 1.\n"
+            "\n"
+            "## 2. Порядок приемки устройств молниезащиты в эксплуатацию\n"
+            "Текст рекомендаций 2.\n"
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
+        ids = [r["chunk_id"] for r in rows]
+        assert len(ids) == len(set(ids))
+        # Первый /1 и /2 — базовые; повторы — с occurrence-суффиксом
+        assert "so153_molniezashita/1" in ids
+        assert "so153_molniezashita/1/occurrence_2" in ids
+        assert "so153_molniezashita/2" in ids
+        assert "so153_molniezashita/2/occurrence_2" in ids
+        # Детерминированность: повторный запуск даёт те же ID
+        jsonl2 = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        ids2 = [json.loads(l)["chunk_id"] for l in jsonl2.splitlines() if l.strip()]
+        assert ids2 == ids
+
+    def test_chunk_id_occurrence_three(self, rag_config):
+        """Третий повтор получает /occurrence_3."""
+        md = (
+            "## 1. ПЕРВАЯ\n"
+            "Текст 1.\n"
+            "\n"
+            "## 1. ВТОРАЯ\n"
+            "Текст 2.\n"
+            "\n"
+            "## 1. ТРЕТЬЯ\n"
+            "Текст 3.\n"
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
+        ids = [r["chunk_id"] for r in rows]
+        assert len(ids) == len(set(ids))
+        assert "so153_molniezashita/1" in ids
+        assert "so153_molniezashita/1/occurrence_2" in ids
+        assert "so153_molniezashita/1/occurrence_3" in ids
+
+    def test_embedding_text_short_section_only(self, rag_config):
+        """Короткий section-only чанк: heading context + исходный текст.
+
+        Регрессия СО153: у «2.3» text всего 158 символов; в embedding_text
+        обязан попасть контекст главы «2. ...» и раздела «2.3. ...».
+        """
+        md = (
+            "## 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
+            "Текст главы.\n"
+            "\n"
+            "### 2.3. Параметры токов молнии\n"
+            "Молния представляет собой импульс тока."
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
+        assert rows[1]["chunk_id"] == "so153_molniezashita/2.3"
+        r = rows[1]
+        # Заголовки главы и раздела + исходный текст
+        assert r["embedding_text"].startswith(
+            "Заголовок главы: 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
+            "Заголовок раздела: 2.3. Параметры токов молнии\n"
+        )
+        assert r["embedding_text"].endswith(r["text"])
+        assert r["embedding_text"].endswith("Молния представляет собой импульс тока.")
+        # embedding_tokens — для фактического embedding_text, chunk_tokens — для text
+        assert r["embedding_tokens"] == _tok(r["embedding_text"])
+        assert r["chunk_tokens"] == _tok(r["text"])
+        assert r["embedding_tokens"] > r["chunk_tokens"]
+
+    def test_embedding_text_oversized_parts(self, rag_config):
+        """Oversized чанк: каждая часть получает свои embedding_text/embedding_tokens."""
+        cfg = dict(rag_config)
+        cfg["defaults"] = dict(rag_config["defaults"], max_chunk_tokens=15)
+        paras = [f"Абзац {i} с детальным описанием молниеприемника и токоотвода. " * 2 for i in range(4)]
+        md = (
+            "## 3. ЗАЩИТА\n"
+            "\n"
+            "### 3.2. Внешняя молниезащитная система\n"
+            "\n"
+            "#### 3.2.1. Молниеприемники\n"
+            + "\n\n".join(paras)
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, [{"page": 5, "number": "3.2.1"}], cfg, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
+        assert len(rows) >= 2
+        for r in rows:
+            # Заголовки повторяются в каждой части, текст — конкретной части
+            assert r["embedding_text"].startswith(
+                "Заголовок главы: 3. ЗАЩИТА\n"
+                "Заголовок раздела: 3.2. Внешняя молниезащитная система\n"
+                "Заголовок пункта: 3.2.1. Молниеприемники\n"
+            )
+            assert r["embedding_text"].endswith(r["text"])
+            assert r["embedding_tokens"] == _tok(r["embedding_text"])
+            assert r["chunk_tokens"] == _tok(r["text"])
+        # Части не пересекаются и в сумме покрывают исходный текст
+        # (extract_clause_text() обрезает хвостовые пробелы)
+        joined = "\n\n".join(r["text"] for r in rows)
+        assert joined == "\n\n".join(paras).strip()
+
+    def test_embedding_text_with_occurrence_id(self, rag_config):
+        """Повторный top-level: occurrence-суффикс и заголовки своего блока."""
+        md = (
+            "## 1. ВВЕДЕНИЕ\n"
+            "Вводный текст.\n"
+            "\n"
+            "## 1. Разработка эксплуатационно-технической документации\n"
+            "Текст рекомендаций 1.\n"
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
+        r0, r1 = rows
+        assert r0["chunk_id"] == "so153_molniezashita/1"
+        assert r0["embedding_text"].startswith("Заголовок главы: 1. ВВЕДЕНИЕ")
+        # Повтор: своя глава, без чужого section
+        assert r1["chunk_id"] == "so153_molniezashita/1/occurrence_2"
+        assert r1["section"] is None
+        assert r1["embedding_text"].startswith(
+            "Заголовок главы: 1. Разработка эксплуатационно-технической документации"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
