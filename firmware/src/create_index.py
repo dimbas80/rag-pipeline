@@ -9,7 +9,8 @@ sparse — локальный fastembed (Qdrant/bm25).
     pip install -r requirements.txt
 
 Перед запуском:
-    - поднять Qdrant: docker run -p 6333:6333 qdrant/qdrant
+    - Qdrant работает в локальном режиме: сам управляет файлами в ./qdrant_data
+      (или --qdrant-path), сервер поднимать не нужно
     - задать SILICONFLOW_API_KEY (в .env рядом с запуском или --api-key)
 
 Запуск:
@@ -247,7 +248,8 @@ def main():
     ap.add_argument("--assets", required=True, type=Path, help="JSON с assets.json документа")
     ap.add_argument("--collection", default=DEFAULT_COLLECTION,
                     help=f"Имя коллекции Qdrant (по умолчанию {DEFAULT_COLLECTION})")
-    ap.add_argument("--qdrant-url", default="http://localhost:6333")
+    ap.add_argument("--qdrant-path", default="./qdrant_data",
+                    help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--api-key", help="API-ключ SiliconFlow (или SILICONFLOW_API_KEY в .env)")
     ap.add_argument(
@@ -278,7 +280,7 @@ def main():
     print(f"Загружаю sparse-эмбеддер {SPARSE_MODEL} ...")
     sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
 
-    client = QdrantClient(url=args.qdrant_url)
+    client = QdrantClient(path=args.qdrant_path)
 
     embed_texts = [build_embed_text(c, assets_by_id, doc_meta) for c in chunks]
 

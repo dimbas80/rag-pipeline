@@ -242,7 +242,8 @@ def main():
     ap.add_argument("--query", help="Поисковый запрос")
     ap.add_argument("--retrieve-k", type=int, default=30, help="Сколько кандидатов взять из Qdrant (default: 30)")
     ap.add_argument("--final-k", type=int, default=6, help="Сколько вернуть после реранка (default: 6)")
-    ap.add_argument("--qdrant-url", default="http://localhost:6333")
+    ap.add_argument("--qdrant-path", default="./qdrant_data",
+                    help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
     ap.add_argument("--api-key", help="API-ключ SiliconFlow (или SILICONFLOW_API_KEY в .env)")
     ap.add_argument("--domain", help="Фильтр по payload.domain")
     ap.add_argument("--document_type", help="Фильтр по payload.document_type")
@@ -252,7 +253,7 @@ def main():
     ap.add_argument("--list-collections", action="store_true", help="Список коллекций Qdrant")
     args = ap.parse_args()
 
-    client = QdrantClient(url=args.qdrant_url)
+    client = QdrantClient(path=args.qdrant_path)
 
     if args.list_collections:
         list_collections(client)
