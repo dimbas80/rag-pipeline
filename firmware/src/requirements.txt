@@ -1,0 +1,5 @@
+qdrant-client
+fastembed
+requests
+python-dotenv
+tqdm
