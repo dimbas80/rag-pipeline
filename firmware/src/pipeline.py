@@ -4069,6 +4069,8 @@ def _build_asset_registry(
     doc_slug: str,
     img_dir: str | Path | None,
     document_id: str | None = None,
+    document_type: str | None = None,
+    domain: str | None = None,
 ) -> dict:
     """Построить реестр активов rag_assets.json.
 
@@ -4094,6 +4096,8 @@ def _build_asset_registry(
         return {
             "document_id": document_id,
             "doc_slug": doc_slug,
+            "document_type": document_type,
+            "domain": domain,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "image_dir": "image",
             "assets": {"tables": [], "images": []},
@@ -4124,6 +4128,8 @@ def _build_asset_registry(
     return {
         "document_id": document_id,
         "doc_slug": doc_slug,
+        "document_type": document_type,
+        "domain": domain,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "image_dir": "image",
         "assets": {
@@ -4279,8 +4285,14 @@ def run_rag_pipeline(
             chunks.append(json.loads(line))
 
     # Реестр активов
-    document_id = rag_config.get("documents", {}).get(doc_key, {}).get("document_id")
-    assets = _build_asset_registry(md_text, doc_key, img_dir, document_id=document_id)
+    doc_cfg = rag_config.get("documents", {}).get(doc_key, {})
+    document_id = doc_cfg.get("document_id")
+    document_type = doc_cfg.get("document_type")
+    domain = doc_cfg.get("domain")
+    assets = _build_asset_registry(
+        md_text, doc_key, img_dir,
+        document_id=document_id, document_type=document_type, domain=domain,
+    )
     _link_assets_to_chunks(assets, chunks)
 
     # Пересобрать JSONL с заполненными assets в чанках
