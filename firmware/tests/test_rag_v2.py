@@ -875,7 +875,10 @@ class TestProcessFileTableExtraction:
         pdf = tmp_path / "СО153-34_21_122-2003 Молниезащита.pdf"
         pdf.write_bytes(b"%PDF-1.4 fake")
         md = "## 3. ЗАЩИТА\nТекст.\n"
-        config = {"table_vision": {"api_key_env": "PROVOD_API_KEY"}}
+        config = {
+            "ai_postprocess": {"prompt": "test prompt"},
+            "table_vision": {"api_key_env": "PROVOD_API_KEY"},
+        }
 
         with patch("pipeline.send_to_yandex_ocr", return_value=self._pages()), \
              patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \

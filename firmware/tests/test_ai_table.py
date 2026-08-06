@@ -17,6 +17,7 @@ from pipeline import (
     recognize_tables_vision,
     process_file,
 )
+import pipeline
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -358,6 +359,70 @@ def test_process_file_signature():
     params = list(sig.parameters.keys())
     assert "use_ai_table" not in params, f"use_ai_table не должен быть в {params}"
     assert "use_ai" in params, f"use_ai должен быть в {params}"
+
+
+def _ai_pages():
+    """Минимальная страница OCR для process_file с --ai (без таблиц)."""
+    return [{
+        "result": {
+            "textAnnotation": {
+                "width": 1240, "height": 1754,
+                "blocks": [], "tables": [], "pictures": [],
+            }
+        }
+    }]
+
+
+def test_process_file_ai_prompt_fallback_to_table_vision(tmp_path):
+    """combined_prompt: нет ai_postprocess.prompt → берётся table_vision.prompt."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    md = "## 1. ТЕКСТ\nТекст.\n"
+    config = {
+        "ai_postprocess": {"api_key_env": "DEEPSEEK_API_KEY"},
+        "table_vision": {"prompt": "table vision prompt"},
+    }
+
+    captured = {}
+
+    def _fake_call_ai(text, cfg, context=""):
+        captured["prompt"] = cfg.get("prompt")
+        return md
+
+    with patch("pipeline.send_to_yandex_ocr", return_value=_ai_pages()), \
+         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("pipeline.extract_images_from_pdf", return_value=[]), \
+         patch("pipeline.extract_table_images", return_value=[]), \
+         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m), \
+         patch("pipeline._call_ai_api", side_effect=_fake_call_ai):
+        ok = pipeline.process_file(
+            str(pdf), use_ai=True, config=config,
+            api_key="key", folder_id="folder",
+            output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
+        )
+
+    assert ok is True
+    assert captured.get("prompt") == "table vision prompt"
+
+
+def test_process_file_ai_prompt_missing_exits(tmp_path):
+    """Нет prompt ни в ai_postprocess, ни в table_vision → ошибка (SystemExit)."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+    md = "## 1. ТЕКСТ\nТекст.\n"
+    config = {"ai_postprocess": {"api_key_env": "DEEPSEEK_API_KEY"}}
+
+    with patch("pipeline.send_to_yandex_ocr", return_value=_ai_pages()), \
+         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("pipeline.extract_images_from_pdf", return_value=[]), \
+         patch("pipeline.extract_table_images", return_value=[]), \
+         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+        with pytest.raises(SystemExit):
+            pipeline.process_file(
+                str(pdf), use_ai=True, config=config,
+                api_key="key", folder_id="folder",
+                output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
+            )
 
 
 if __name__ == "__main__":

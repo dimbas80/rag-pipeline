@@ -58,9 +58,6 @@ YANDEX_MAX_SIZE_MB = 10
 YANDEX_POLL_TIMEOUT = 600  # 10 минут
 YANDEX_POLL_INTERVAL = 2
 
-# Поддерживаемые расширения
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".md"}
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1. Утилиты
@@ -149,18 +146,21 @@ def ensure_dir(path: str | Path) -> Path:
 
 
 def find_input_files(input_path: str) -> list[Path]:
-    """Найти все PDF/DOCX/DOC файлы по пути (файл или папка)."""
+    """Проверить входной путь: только один файл (PDF/DOCX/DOC/MD).
+
+    Батч-режим удалён: папки не принимаются, возвращается максимум один файл.
+    """
     p = Path(input_path)
     if p.is_file():
         return [p]
-    elif p.is_dir():
-        files = []
-        for ext in SUPPORTED_EXTENSIONS:
-            files.extend(sorted(p.rglob(f"*{ext}")))
-        return files
-    else:
-        log.error(f"Путь не найден: {input_path}")
+    if p.is_dir():
+        log.error(
+            f"Входная папка не поддерживается: {input_path} — "
+            "укажите один файл (PDF/DOCX/DOC/MD)"
+        )
         return []
+    log.error(f"Путь не найден: {input_path}")
+    return []
 
 
 def safe_write(path: str | Path, content: str) -> None:
@@ -1366,111 +1366,110 @@ def extract_images_from_pdf(
     log.info(f"Извлечение изображений из PDF (pictures: {len(pictures)})")
 
     try:
-        doc = fitz.open(str(pdf_path))
+        with fitz.open(str(pdf_path)) as doc:
+            page_count = doc.page_count
+            saved_images = []
+            fig_counter = 0
+        
+            # Извлекаем размеры страниц из textAnnotation для масштабирования
+            # Yandex возвращает координаты в пикселях, PyMuPDF использует points
+            page_dims: dict[int, tuple[float, float]] = {}
+            if pages:
+                for page_idx, page_data in enumerate(pages):
+                    ta = page_data.get("result", {}).get("textAnnotation", {})
+                    tw = ta.get("width")
+                    th = ta.get("height")
+                    if tw and th:
+                        page_dims[page_idx] = (float(tw), float(th))
+        
+            # Группируем pictures по страницам
+            pics_by_page: dict[int, list[dict]] = {}
+            for pic in pictures:
+                pg = pic.get("page", 0)
+                if pg not in pics_by_page:
+                    pics_by_page[pg] = []
+                pics_by_page[pg].append(pic)
+        
+            for page_idx in range(page_count):
+                if page_idx not in pics_by_page:
+                    continue
+        
+                page = doc[page_idx]
+                page_rect = page.rect  # points
+        
+                # ADR-2: Масштабирование координат Yandex → PyMuPDF
+                # scale = ta[width] / page.rect.width  (пикселей на point)
+                # Чтобы конвертировать пиксель в point: point = pixel / scale
+                dims = page_dims.get(page_idx)
+                if dims:
+                    scale_x = dims[0] / page_rect.width
+                    scale_y = dims[1] / page_rect.height
+                else:
+                    # Fallback: предполагаем стандартное A4 (595 x 842 points) при 300 DPI
+                    # 300 DPI → A4 в пикселях: 2480 x 3508
+                    scale_x = 2480.0 / page_rect.width if page_rect.width > 0 else 1.0
+                    scale_y = 3508.0 / page_rect.height if page_rect.height > 0 else 1.0
+                    log.debug(f"  Страница {page_idx}: нет page_dims, fallback A4 300 DPI")
+        
+                for pic in pics_by_page[page_idx]:
+                    bbox = pic.get("bbox", {})
+                    vertices = bbox.get("vertices", [])
+                    if len(vertices) < 4:
+                        log.warning(
+                            f"  ({page_idx}): картинка без bbox.vertices (<4) — "
+                            "ПРОПУЩЕНА, fig_N не присвоен"
+                        )
+                        continue
+        
+                    fig_counter += 1
+                    ext = ".png"
+        
+                    # Преобразуем вершины в rect для fitz
+                    xs = [int(v.get("x", 0)) for v in vertices]
+                    ys = [int(v.get("y", 0)) for v in vertices]
+        
+                    x0, x1 = min(xs), max(xs)
+                    y0, y1 = min(ys), max(ys)
+        
+                    # Масштабируем: Yandex-пиксели → PyMuPDF points
+                    fitz_rect = fitz.Rect(
+                        x0 / scale_x, y0 / scale_y,
+                        x1 / scale_x, y1 / scale_y,
+                    )
+        
+                    filename = f"fig_{fig_counter}{ext}"
+                    output_path = output_img_dir / filename
+        
+                    pix = _crop_and_save_image(page, fitz_rect, output_path, 2.0)
+                    if pix is not None:
+                        # Реальные размеры сохранённого pixmap
+                        log.info(
+                            f"  fig_{fig_counter} (стр.{page_idx}): извлечено "
+                            f"({pix.width}x{pix.height})"
+                        )
+                        saved_images.append({
+                            "fig_num": fig_counter,
+                            "page": page_idx,
+                            "filename": filename,
+                            "bbox": bbox,
+                        })
+                    else:
+                        # Проверяем, rect ли за границей страницы
+                        if not page_rect.intersects(fitz_rect):
+                            log.warning(
+                                f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
+                                "rect за границей страницы"
+                            )
+                        else:
+                            log.warning(
+                                f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
+                                "ошибка вырезки"
+                            )
+        
     except Exception as e:
         log.error(f"  Не удалось открыть PDF: {e}")
         return []
 
-    page_count = doc.page_count
-    saved_images = []
-    fig_counter = 0
-
-    # Извлекаем размеры страниц из textAnnotation для масштабирования
-    # Yandex возвращает координаты в пикселях, PyMuPDF использует points
-    page_dims: dict[int, tuple[float, float]] = {}
-    if pages:
-        for page_idx, page_data in enumerate(pages):
-            ta = page_data.get("result", {}).get("textAnnotation", {})
-            tw = ta.get("width")
-            th = ta.get("height")
-            if tw and th:
-                page_dims[page_idx] = (float(tw), float(th))
-
-    # Группируем pictures по страницам
-    pics_by_page: dict[int, list[dict]] = {}
-    for pic in pictures:
-        pg = pic.get("page", 0)
-        if pg not in pics_by_page:
-            pics_by_page[pg] = []
-        pics_by_page[pg].append(pic)
-
-    for page_idx in range(page_count):
-        if page_idx not in pics_by_page:
-            continue
-
-        page = doc[page_idx]
-        page_rect = page.rect  # points
-
-        # ADR-2: Масштабирование координат Yandex → PyMuPDF
-        # scale = ta[width] / page.rect.width  (пикселей на point)
-        # Чтобы конвертировать пиксель в point: point = pixel / scale
-        dims = page_dims.get(page_idx)
-        if dims:
-            scale_x = dims[0] / page_rect.width
-            scale_y = dims[1] / page_rect.height
-        else:
-            # Fallback: предполагаем стандартное A4 (595 x 842 points) при 300 DPI
-            # 300 DPI → A4 в пикселях: 2480 x 3508
-            scale_x = 2480.0 / page_rect.width if page_rect.width > 0 else 1.0
-            scale_y = 3508.0 / page_rect.height if page_rect.height > 0 else 1.0
-            log.debug(f"  Страница {page_idx}: нет page_dims, fallback A4 300 DPI")
-
-        for pic in pics_by_page[page_idx]:
-            bbox = pic.get("bbox", {})
-            vertices = bbox.get("vertices", [])
-            if len(vertices) < 4:
-                log.warning(
-                    f"  ({page_idx}): картинка без bbox.vertices (<4) — "
-                    "ПРОПУЩЕНА, fig_N не присвоен"
-                )
-                continue
-
-            fig_counter += 1
-            ext = ".png"
-
-            # Преобразуем вершины в rect для fitz
-            xs = [int(v.get("x", 0)) for v in vertices]
-            ys = [int(v.get("y", 0)) for v in vertices]
-
-            x0, x1 = min(xs), max(xs)
-            y0, y1 = min(ys), max(ys)
-
-            # Масштабируем: Yandex-пиксели → PyMuPDF points
-            fitz_rect = fitz.Rect(
-                x0 / scale_x, y0 / scale_y,
-                x1 / scale_x, y1 / scale_y,
-            )
-
-            filename = f"fig_{fig_counter}{ext}"
-            output_path = output_img_dir / filename
-
-            pix = _crop_and_save_image(page, fitz_rect, output_path, 2.0)
-            if pix is not None:
-                # Реальные размеры сохранённого pixmap
-                log.info(
-                    f"  fig_{fig_counter} (стр.{page_idx}): извлечено "
-                    f"({pix.width}x{pix.height})"
-                )
-                saved_images.append({
-                    "fig_num": fig_counter,
-                    "page": page_idx,
-                    "filename": filename,
-                    "bbox": bbox,
-                })
-            else:
-                # Проверяем, rect ли за границей страницы
-                if not page_rect.intersects(fitz_rect):
-                    log.warning(
-                        f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
-                        "rect за границей страницы"
-                    )
-                else:
-                    log.warning(
-                        f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
-                        "ошибка вырезки"
-                    )
-
-    doc.close()
     # Итоговый summary
     # total = fig_counter, т.к. картинки без bbox.vertices (<4) не получают fig_N,
     # и тогда len(pictures) дал бы «фантомные» номера в списке пропущенных.
@@ -1658,51 +1657,50 @@ def extract_table_images(
         log.info("  Нет таблиц в JSON — пропускаю вырезку")
         return []
 
-    doc = fitz.open(str(pdf_path))
-    table_images: list[dict] = []
-    table_counter = 0  # сквозной счётчик по всем страницам
-
-    for pi, page_data in enumerate(pages):
-        ta = page_data.get("result", {}).get("textAnnotation", {})
-        tables = ta.get("tables", [])
-
-        if not tables:
-            continue
-
-        page = doc[pi]
-        ya_w = float(ta.get("width", 1))
-        ya_h = float(ta.get("height", 1))
-        sx = page.rect.width / ya_w if ya_w > 0 else 1.0
-        sy = page.rect.height / ya_h if ya_h > 0 else 1.0
-
-        for ti, table in enumerate(tables):
-            bbox = table.get("boundingBox", {}).get("vertices", [])
-            if len(bbox) < 4:
-                log.warning(f"  Таблица стр.{pi+1}#{ti+1}: нет boundingBox")
+    with fitz.open(str(pdf_path)) as doc:
+        table_images: list[dict] = []
+        table_counter = 0  # сквозной счётчик по всем страницам
+    
+        for pi, page_data in enumerate(pages):
+            ta = page_data.get("result", {}).get("textAnnotation", {})
+            tables = ta.get("tables", [])
+    
+            if not tables:
                 continue
-
-            xs = [float(v.get("x", 0)) for v in bbox]
-            ys = [float(v.get("y", 0)) for v in bbox]
-            x0 = min(xs) * sx - 2
-            y0 = max(0, min(ys) * sy - 32)  # +30px вверх для заголовка
-            x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
-
-            rect = fitz.Rect(x0, y0, x1, y1)
-            pix = page.get_pixmap(clip=rect, dpi=200)
-
-            table_counter += 1
-            fname = f"table_{table_counter}.png"
-            pix.save(str(img_dir / fname))
-
-            table_images.append({
-                "page": pi,
-                "table_idx": table_counter,
-                "path": fname,
-                "id": f"t_p{pi + 1}_{ti}",
-            })
-            log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
-
-    doc.close()
+    
+            page = doc[pi]
+            ya_w = float(ta.get("width", 1))
+            ya_h = float(ta.get("height", 1))
+            sx = page.rect.width / ya_w if ya_w > 0 else 1.0
+            sy = page.rect.height / ya_h if ya_h > 0 else 1.0
+    
+            for ti, table in enumerate(tables):
+                bbox = table.get("boundingBox", {}).get("vertices", [])
+                if len(bbox) < 4:
+                    log.warning(f"  Таблица стр.{pi+1}#{ti+1}: нет boundingBox")
+                    continue
+    
+                xs = [float(v.get("x", 0)) for v in bbox]
+                ys = [float(v.get("y", 0)) for v in bbox]
+                x0 = min(xs) * sx - 2
+                y0 = max(0, min(ys) * sy - 32)  # +30px вверх для заголовка
+                x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
+    
+                rect = fitz.Rect(x0, y0, x1, y1)
+                pix = page.get_pixmap(clip=rect, dpi=200)
+    
+                table_counter += 1
+                fname = f"table_{table_counter}.png"
+                pix.save(str(img_dir / fname))
+    
+                table_images.append({
+                    "page": pi,
+                    "table_idx": table_counter,
+                    "path": fname,
+                    "id": f"t_p{pi + 1}_{ti}",
+                })
+                log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
+    
     return table_images
 
 
@@ -4454,7 +4452,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog="""\\
 Примеры:
   %(prog)s -i file.pdf
-  %(prog)s -i dir/ --ai
+  %(prog)s -i file.pdf --ai
   %(prog)s -i file.pdf --ai --config my_config.yaml
   %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
   %(prog)s -i file.pdf --rag               # дополнительно RAG JSONL + assets
@@ -4466,7 +4464,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-i", "--input",
         required=True,
-        help="Входной файл или папка (PDF/DOCX/DOC/MD). "
+        help="Входной файл (PDF/DOCX/DOC/MD). "
         ".md вне Markdown/ требует --ai; .md внутри Markdown/ требует --rag",
     )
     parser.add_argument(
@@ -4578,11 +4576,9 @@ def process_file(
 
     # Этап 1: DOCX → PDF (если нужно)
     pdf_path = input_path
-    was_docx = False
     if ext in (".docx", ".doc"):
         try:
             pdf_path = str(convert_docx_to_pdf(input_path, file_tmp_dir))
-            was_docx = True
         except Exception as e:
             log.error(f"  Ошибка конвертации DOCX: {e}")
             return False
@@ -4662,8 +4658,17 @@ def process_file(
 
         # Этап 6+7 (объединённый): AI-коррекция таблиц + постобработка (если --ai)
         if use_ai:
-            # Системный промпт из ai_postprocess (уже объединён с правилами таблиц)
-            combined_prompt = config.get("ai_postprocess", {}).get("prompt", "")
+            # Системный промпт: ai_postprocess.prompt, fallback — table_vision.prompt
+            # (аналогично _call_ai_api/recognize_tables_vision)
+            combined_prompt = config.get("ai_postprocess", {}).get("prompt")
+            if not combined_prompt:
+                combined_prompt = config.get("table_vision", {}).get("prompt")
+            if not combined_prompt:
+                log.error(
+                    "не задан промт: укажите prompt в секции ai_postprocess "
+                    "или table_vision конфига"
+                )
+                sys.exit(1)
 
             # Конфиг для вызова: настройки провайдера из ai_postprocess,
             # промпт — объединённый
@@ -4788,25 +4793,18 @@ def process_file(
     except Exception as e:
         log.error(f"  Ошибка обработки: {e}")
         return False
-    finally:
-        # Сконвертированный PDF из DOCX сохраняется в tmp/<file>/ согласно SPEC_YA
-        pass
 
     log.info(f"{'=' * 60}")
     return True
 
 
 def main() -> None:
-    """Точка входа. Парсинг аргументов, итерация по файлам, process_file()."""
+    """Точка входа. Парсинг аргументов, обработка одного файла."""
     args = parse_args()
 
-    # Определяем выходные папки относительно входного файла/папки
+    # Выходные папки относительно входного файла
     input_path = Path(args.input).resolve()
-    if input_path.is_file():
-        base_dir = input_path.parent
-    else:
-        base_dir = input_path
-
+    base_dir = input_path.parent
     output_base = str(base_dir / "Markdown")
     tmp_base = str(base_dir / "tmp")
 
@@ -4828,13 +4826,13 @@ def main() -> None:
     log.info(f"Выход: {output_base}")
     log.info(f"Лог: {log_path}")
 
-    # Находим файлы
+    # Проверяем входной файл (папки не поддерживаются)
     files = find_input_files(args.input)
     if not files:
-        log.error("Файлы не найдены")
+        log.error("Файл не найден")
         sys.exit(1)
-
-    log.info(f"Найдено файлов: {len(files)}")
+    input_file = files[0]
+    log.info(f"Обрабатываю файл: {input_file}")
 
     # Загружаем .env
     env_path = Path(__file__).parent / ".env"
@@ -4842,9 +4840,8 @@ def main() -> None:
     api_key = os.environ.get("YANDEX_API_KEY", "")
     folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
 
-    # Yandex API ключи нужны только если есть не-.md файлы
-    need_yandex = any(f.suffix.lower() != ".md" for f in files)
-    if need_yandex:
+    # Yandex API ключи нужны только для не-.md файлов
+    if input_file.suffix.lower() != ".md":
         if not api_key or not folder_id:
             log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
             sys.exit(1)
@@ -4861,29 +4858,22 @@ def main() -> None:
         except Exception as e:
             log.error(f"Не удалось загрузить rag_config: {e} — RAG-генерация пропущена")
 
-    # Обрабатываем каждый файл
-    success = 0
-    failed = 0
-    for file_path in files:
-        ok = process_file(
-            str(file_path),
-            args.ai,
-            config,
-            api_key,
-            folder_id,
-            output_base,
-            tmp_base,
-            use_rag=args.rag,
-            rag_config=rag_config,
-        )
-        if ok:
-            success += 1
-        else:
-            failed += 1
+    # Обрабатываем один файл
+    ok = process_file(
+        str(input_file),
+        args.ai,
+        config,
+        api_key,
+        folder_id,
+        output_base,
+        tmp_base,
+        use_rag=args.rag,
+        rag_config=rag_config,
+    )
 
     log.info(f"{'=' * 60}")
-    log.info(f"Завершено: успешно {success}, ошибок {failed}")
-    if failed:
+    log.info(f"Завершено: {'успешно' if ok else 'ошибка'}")
+    if not ok:
         sys.exit(1)
 
 
