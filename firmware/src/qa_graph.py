@@ -1,0 +1,1459 @@
+#!/usr/bin/env python3
+"""
+LangGraph QA-система для нормативных документов (ГОСТ, СП, СНиП).
+
+Юнит 1: базовая инфраструктура — состояние графа (QAGraphState),
+конфигурация (QAGraphConfig) и вызов LLM через Chat Completions.
+
+Юнит 2: узлы графа — analyze_query, search_node, evaluate_results,
+reformulate_query, ask_clarification, generate_answer (разделы 5.1–5.6
+архитектуры langgraph-rag-architecture.md).
+
+Юнит 3: сборка StateGraph (build_graph, раздел 4) и класс-обёртка
+QAGraph (run/stream/resume, разделы 2.2, 6.4).
+
+Юнит 4: CLI — argparse (--query/--interactive/--qdrant-path/--api-key/
+--verbose), интерактивный режим «запрос → ответ/уточнение → ответ
+пользователя → …» и __main__-блок (раздел 10 архитектуры).
+
+Юнит 5: конфигурируемые LLM-провайдеры — llm_config.yaml
+(load_llm_config/get_chat_url/get_api_key/llm_chat), CLI-аргументы
+--llm-config/--llm-provider/--llm-model/--api-key (раздел 6 архитектуры).
+Любой OpenAI-совместимый провайдер подключается правкой YAML без
+изменения кода.
+
+Установка:
+    pip install -r requirements.txt
+
+Провайдер/модель по умолчанию: deepseek/deepseek-v4-flash
+(настраивается в firmware/src/llm_config.yaml)
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Sequence, TypedDict
+
+import requests
+import yaml
+from dotenv import load_dotenv
+from fastembed import SparseTextEmbedding
+from langchain_core.messages import BaseMessage, HumanMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
+from qdrant_client import QdrantClient
+# Прямой импорт функций поиска (раздел 2.2 архитектуры — не subprocess):
+# переиспользуются QdrantClient и SparseTextEmbedding между вызовами графа.
+from search import (
+    SPARSE_MODEL,
+    filter_by_rrf_score,
+    hybrid_search,
+    rerank_siliconflow,
+    result_to_dict,
+)
+
+# ─── Константы LLM-чата ───────────────────────────────────────────────
+# Провайдеры, модели и параметры узлов — в llm_config.yaml (раздел 6
+# архитектуры). Здесь только сетевые константы retry/timeout.
+
+API_TIMEOUT = 120
+API_RETRIES = 3
+API_RETRY_BACKOFF = 2.0
+
+# ─── Пост-валидация цитат (раздел 5.6 архитектуры) ────────────────────
+
+CITATION_PATTERN = re.compile(
+    r"\[([А-ЯЁа-яёA-Za-z0-9\s.,/\-]+?)\s*[,;]\s*(?:п\.|пп\.|табл\.|таблица|ст\.|разд\.|прил\.)\s*[\d.]+\]"
+)
+
+
+# ─── Состояние графа (раздел 3 архитектуры) ───────────────────────────
+
+class QAGraphState(TypedDict):
+    """Состояние QA-графа."""
+
+    # ── Входные данные ──
+    query: str
+    """Исходный запрос пользователя (неизменен на протяжении всего графа)."""
+
+    # ── Диалог ──
+    messages: Annotated[Sequence[BaseMessage], add_messages]
+    """История диалога: system, user, assistant — для контекста уточнений."""
+
+    # ── Результаты поиска ──
+    search_results: list[dict]
+    """Результаты поиска после retrieve + rerank.
+    Каждый элемент — словарь из result_to_dict() (search.py):
+    {rank, score, rrf_score, quality, chunk_id, document_id,
+     document_type, domain, title, status, section_path,
+     heading_texts, text, references, assets}
+    """
+
+    # ── Управление потоком ──
+    reformulate_count: int
+    """Счётчик попыток переформулирования запроса (0..2)."""
+
+    # ── Классификация запроса ──
+    query_analysis: dict | None
+    """Результат analyze_query: {is_concrete: bool, key_terms: list[str],
+    suggested_clarification: str | None}"""
+
+    # ── Промежуточные данные ──
+    active_query: str
+    """Текущий поисковый запрос (может отличаться от исходного после
+    reformulate_query или уточнения)."""
+
+    # ── Выход ──
+    final_answer: str | None
+    """Итоговый ответ пользователю (с цитатами) или None если ещё не готов."""
+
+    needs_clarification: str | None
+    """Если не None — текст уточняющего вопроса для пользователя.
+    Устанавливается узлом ask_clarification, очищается после ответа."""
+
+    # ── Обработка ошибок ──
+    error: str | None
+    """Сообщение об ошибке, если что-то пошло не так."""
+
+
+# ─── Конфигурация (раздел 8 архитектуры) ──────────────────────────────
+
+# Путь к llm_config.yaml по умолчанию — рядом с модулем (firmware/src/).
+DEFAULT_LLM_CONFIG_PATH = str(Path(__file__).resolve().parent / "llm_config.yaml")
+
+
+@dataclass
+class QAGraphConfig:
+    """Конфигурация QA-графа: параметры по умолчанию из раздела 8.
+
+    Провайдеры/модели/параметры LLM-узлов — в отдельном файле
+    llm_config.yaml (раздел 6 архитектуры); здесь только путь к нему
+    и опциональные переопределения (CLI --llm-provider/--llm-model/
+    --api-key).
+    """
+
+    # Qdrant
+    qdrant_path: str = "./qdrant_data"
+    collection: str = "technical_standard"
+
+    # Поиск
+    retrieve_k: int = 30
+    final_k: int = 6
+    rrf_threshold: float = 0.15
+
+    # LLM (конфигурируемые провайдеры, раздел 6)
+    llm_config_path: str = DEFAULT_LLM_CONFIG_PATH
+    # Переопределения поверх llm_config.yaml (по умолчанию None — брать
+    # default_provider/default_model из конфига).
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    # Переопределение API-ключа провайдера (CLI --api-key); при None —
+    # чтение api_key_env из окружения/.env.
+    llm_api_key: str | None = None
+
+    # API
+    # SiliconFlow остаётся для embedding/rerank в search_node (search.py)
+    # — без изменений, ключ через SILICONFLOW_API_KEY.
+    siliconflow_api_key: str | None = None
+    siliconflow_base_url: str = "https://api.siliconflow.com"
+
+    # Пороги оценки
+    score_good_threshold: float = 0.7
+    score_medium_threshold: float = 0.4
+    max_reformulate_attempts: int = 2
+
+
+# ─── Разрешение API-ключа ─────────────────────────────────────────────
+
+def resolve_api_key(cli_key: str | None = None, env_path: str | None = None,
+                    env_var: str = "SILICONFLOW_API_KEY") -> str:
+    """Разрешение API-ключа: аргумент → переменная окружения → .env.
+
+    Порядок идентичен существующему search.py (раздел 6.4 архитектуры).
+    Отличие от search.py: вместо sys.exit(2) бросается ValueError —
+    qa_graph.py является импортируемым модулем (класс QAGraph в юните 3),
+    и завершение процесса из конструктора/библиотечной функции недопустимо.
+
+    env_path — опциональный путь к .env-файлу (для тестов и явного
+    указания); при None используется стандартный поиск python-dotenv
+    от текущей директории.
+
+    env_var — имя переменной окружения/.env-ключа. По умолчанию
+    SILICONFLOW_API_KEY (embedding/rerank в search_node). LLM-чат больше
+    НЕ использует этот путь: ключи провайдеров задаются в llm_config.yaml
+    (api_key_env) и читаются через get_api_key() (раздел 6 архитектуры).
+    """
+    load_dotenv(env_path)
+    key = cli_key or os.environ.get(env_var)
+    if not key:
+        raise ValueError(
+            f"{env_var} не задан. Передайте api_key или положите "
+            f"ключ в .env ({env_var}=...)."
+        )
+    return key
+
+
+# ─── Конфигурация LLM-провайдеров (раздел 6 архитектуры) ──────────────
+# Провайдеры, модели и параметры узлов задаются в llm_config.yaml
+# (firmware/src/llm_config.yaml). Любой OpenAI-совместимый провайдер
+# подключается добавлением секции в providers — без изменения кода.
+
+# Кэш загруженных конфигов: путь → dict (чтобы не парсить YAML на
+# каждый вызов llm_chat в рамках одного процесса).
+_llm_config_cache: dict[str, dict] = {}
+
+
+def load_llm_config(path: str | None = None) -> dict:
+    """Загрузка и валидация llm_config.yaml (раздел 6 архитектуры).
+
+    Ожидаемая структура:
+
+        default_provider: str
+        default_model: str
+        providers:
+          <name>:
+            base_url: str        # OpenAI-совместимый /v1/chat/completions
+            api_key_env: str     # имя переменной окружения с ключом
+            models: list[str]
+        nodes:
+          <node_name>:
+            temperature: float
+            max_tokens: int
+
+    Возвращает словарь конфигурации. При отсутствии файла или
+    некорректной структуре бросает ValueError с понятным сообщением.
+    """
+    path = path or DEFAULT_LLM_CONFIG_PATH
+    if not os.path.exists(path):
+        raise ValueError(f"Файл конфигурации LLM не найден: {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Ошибка парсинга YAML в {path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path}: ожидался YAML-словарь, получено {type(data).__name__}"
+        )
+
+    providers = data.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise ValueError(f"{path}: секция 'providers' отсутствует или пуста")
+
+    default_provider = data.get("default_provider")
+    if not isinstance(default_provider, str) or default_provider not in providers:
+        raise ValueError(
+            f"{path}: 'default_provider' должен быть именем из providers "
+            f"(доступны: {', '.join(providers) or '(пусто)'})"
+        )
+
+    for name, provider in providers.items():
+        if not isinstance(provider, dict):
+            raise ValueError(f"{path}: провайдер '{name}' должен быть словарём")
+        for field in ("base_url", "api_key_env"):
+            if not isinstance(provider.get(field), str) or not provider[field].strip():
+                raise ValueError(
+                    f"{path}: у провайдера '{name}' отсутствует строка '{field}'"
+                )
+        models = provider.get("models")
+        if not isinstance(models, list) or not all(
+            isinstance(m, str) for m in models
+        ):
+            raise ValueError(
+                f"{path}: у провайдера '{name}' 'models' должен быть списком строк"
+            )
+
+    if not isinstance(data.get("default_model"), str):
+        raise ValueError(f"{path}: 'default_model' должен быть строкой")
+
+    nodes = data.get("nodes")
+    if not isinstance(nodes, dict) or not nodes:
+        raise ValueError(f"{path}: секция 'nodes' отсутствует или пуста")
+    for node_name, params in nodes.items():
+        if not isinstance(params, dict):
+            raise ValueError(f"{path}: узел '{node_name}' должен быть словарём")
+        for field in ("temperature", "max_tokens"):
+            if not isinstance(params.get(field), (int, float)) or isinstance(
+                params.get(field), bool
+            ):
+                raise ValueError(
+                    f"{path}: у узла '{node_name}' параметр '{field}' должен быть числом"
+                )
+
+    return data
+
+
+def _get_llm_config(config: QAGraphConfig) -> dict:
+    """Загруженный llm_config для QAGraphConfig (с кэшем по пути)."""
+    path = config.llm_config_path or DEFAULT_LLM_CONFIG_PATH
+    if path not in _llm_config_cache:
+        _llm_config_cache[path] = load_llm_config(path)
+    return _llm_config_cache[path]
+
+
+def get_chat_url(llm_cfg: dict, provider_name: str) -> str:
+    """base_url провайдера из загруженного llm_config."""
+    provider = (llm_cfg.get("providers") or {}).get(provider_name)
+    if not isinstance(provider, dict) or not provider.get("base_url"):
+        raise ValueError(
+            f"Провайдер '{provider_name}' не найден в llm_config или "
+            f"не содержит base_url (доступны: "
+            f"{', '.join(llm_cfg.get('providers') or {}) or '(пусто)'})"
+        )
+    return provider["base_url"]
+
+
+def get_api_key(llm_cfg: dict, provider_name: str, override: str | None = None) -> str:
+    """API-ключ провайдера: override (--api-key) → env (api_key_env) → .env."""
+    if override:
+        return override
+    provider = (llm_cfg.get("providers") or {}).get(provider_name)
+    if not isinstance(provider, dict) or not provider.get("api_key_env"):
+        raise ValueError(
+            f"Провайдер '{provider_name}' не найден в llm_config или "
+            f"не содержит api_key_env"
+        )
+    env_name = provider["api_key_env"]
+    load_dotenv()  # .env из текущей директории (как resolve_api_key)
+    key = os.environ.get(env_name)
+    if not key:
+        raise ValueError(
+            f"API-ключ {env_name} для провайдера '{provider_name}' не задан. "
+            f"Положите ключ в .env ({env_name}=...) или передайте --api-key."
+        )
+    return key
+
+
+# ─── Вызов LLM (раздел 6.1 архитектуры) ───────────────────────────────
+
+def llm_chat(
+    messages: list[dict],
+    config: QAGraphConfig | None = None,
+    node_name: str = "generate_answer",
+    provider_override: str | None = None,
+    model_override: str | None = None,
+    timeout: int = API_TIMEOUT,
+) -> str:
+    """Вызов chat completions провайдера из llm_config.yaml с retry.
+
+    Порядок разрешения провайдера/модели (раздел 6.4 архитектуры):
+      1. provider_override / model_override (аргументы функции);
+      2. llm_provider / llm_model (QAGraphConfig, CLI --llm-provider/
+         --llm-model);
+      3. default_provider / default_model (llm_config.yaml).
+
+    temperature/max_tokens — из секции nodes[node_name] конфига.
+    API-ключ — get_api_key (env по api_key_env провайдера, либо
+    переопределение --api-key); URL — get_chat_url (base_url провайдера).
+
+    POST {base_url}
+    {"model": ..., "messages": [...], "temperature": ..., "max_tokens": ...}
+
+    Возвращает text из choices[0].message.content.
+    При исчерпании попыток бросает RuntimeError.
+    """
+    cfg = config or QAGraphConfig()
+    llm_cfg = _get_llm_config(cfg)
+
+    provider = provider_override or cfg.llm_provider or llm_cfg.get("default_provider")
+    model = model_override or cfg.llm_model or llm_cfg.get("default_model")
+    # load_llm_config гарантирует default_provider/default_model; проверка
+    # нужна только для переопределений извне.
+    if not isinstance(provider, str) or not provider:
+        raise ValueError("Не удалось определить провайдера LLM (default_provider)")
+    if not isinstance(model, str) or not model:
+        raise ValueError("Не удалось определить модель LLM (default_model)")
+
+    node_params = (llm_cfg.get("nodes") or {}).get(node_name)
+    if not isinstance(node_params, dict):
+        raise ValueError(
+            f"Узел '{node_name}' не найден в nodes конфигурации LLM "
+            f"(доступны: {', '.join(llm_cfg.get('nodes') or {}) or '(пусто)'})"
+        )
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": node_params.get("temperature", 0.0),
+        "max_tokens": node_params.get("max_tokens", 2048),
+    }
+    headers = {
+        "Authorization": f"Bearer {get_api_key(llm_cfg, provider, override=cfg.llm_api_key)}",
+        "Content-Type": "application/json",
+    }
+    url = get_chat_url(llm_cfg, provider)
+
+    last_exc: Exception | None = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"]
+        except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
+            last_exc = exc
+            if attempt < API_RETRIES:
+                time.sleep(API_RETRY_BACKOFF * attempt)
+    raise RuntimeError(
+        f"LLM chat ({provider}/{model}) failed after {API_RETRIES} attempts: {last_exc}"
+    )
+
+
+# ─── Форматирование результатов поиска (раздел 5.6) ───────────────────
+
+def _heading_to_str(heading_texts) -> str:
+    """heading_texts может быть dict ({chapter, section, clause}) или str."""
+    if not heading_texts:
+        return ""
+    if isinstance(heading_texts, dict):
+        return " → ".join(
+            str(v).strip() for v in heading_texts.values() if str(v).strip()
+        )
+    return str(heading_texts).strip()
+
+
+def _format_search_results(results: list[dict]) -> str:
+    """Форматирование результатов поиска для промпта генерации ответа.
+
+    Формат (раздел 5.6 архитектуры):
+
+        [1] {document_id} | {section_path} | score: {score}
+           {heading_texts}
+           {text}
+           (источник: {title})
+
+    Отсутствующие поля пропускаются/заменяются заглушками — функция не
+    падает на частично заполненных словарях.
+    """
+    blocks = []
+    for i, r in enumerate(results, 1):
+        doc_id = r.get("document_id") or "—"
+        section_path = r.get("section_path") or ""
+        score = r.get("score", 0.0)
+        title = r.get("title") or doc_id
+        text = str(r.get("text") or "").strip()
+
+        header = f"[{i}] {doc_id}"
+        if section_path:
+            header += f" | {section_path}"
+        header += f" | score: {score}"
+        lines = [header]
+        heading = _heading_to_str(r.get("heading_texts"))
+        if heading:
+            lines.append(f"   {heading}")
+        if text:
+            lines.append(f"   {text}")
+        lines.append(f"   (источник: {title})")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+# ─── Парсинг JSON из ответа LLM ───────────────────────────────────────
+
+def _try_json_loads(text: str) -> dict | None:
+    """json.loads, но возвращает None вместо исключения и только для dict."""
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_first_json_object(text: str) -> dict | None:
+    """Извлечь первый валидный JSON-объект {...} из произвольного текста.
+
+    Использует JSONDecoder.raw_decode — корректно обрабатывает строки,
+    экранирование и вложенность без ручного подсчёта скобок.
+    """
+    decoder = json.JSONDecoder()
+    start = 0
+    while True:
+        idx = text.find("{", start)
+        if idx == -1:
+            return None
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            start = idx + 1
+            continue
+        return obj if isinstance(obj, dict) else None
+
+
+def _parse_json_response(text: str | None) -> dict | None:
+    """Безопасный парсинг JSON из ответа LLM.
+
+    Стратегии (по порядку):
+    1. json.loads на весь текст (после strip).
+    2. Снять markdown-обёртку ```json ... ``` / ``` ... ``` и повторить.
+    3. Извлечь первый сбалансированный JSON-объект {...} из текста
+       (LLM часто оборачивает JSON в прозу).
+
+    Если ничего не вышло — возвращает None; fallback на значения по
+    умолчанию выполняет вызывающий код (например, is_concrete=True
+    в узле analyze_query, раздел 5.1).
+    """
+    if not text:
+        return None
+    cleaned = text.strip()
+
+    # 1. Прямой парсинг
+    parsed = _try_json_loads(cleaned)
+    if parsed is not None:
+        return parsed
+
+    # 2. Markdown-обёртка
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.DOTALL)
+    if fence:
+        parsed = _try_json_loads(fence.group(1).strip())
+        if parsed is not None:
+            return parsed
+
+    # 3. Первый JSON-объект в тексте
+    return _extract_first_json_object(cleaned)
+
+
+# ─── Пост-валидация цитат (раздел 5.6) ────────────────────────────────
+
+def has_citations(answer: str) -> bool:
+    """Проверка наличия цитат формата [Документ, пункт/таблица] в ответе.
+
+    Регэксп из раздела 5.6 архитектуры:
+        [СП 89.13330.2016, п. 16.1], [ГОСТ 31996-2012, табл. 19]
+    """
+    return bool(CITATION_PATTERN.search(answer))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Юнит 2: узлы графа (разделы 5.1–5.6 архитектуры)
+# ══════════════════════════════════════════════════════════════════════
+
+# Параметры LLM по узлам (temperature/max_tokens) — в llm_config.yaml,
+# секция nodes (раздел 6.2 архитектуры). Здесь — только промпты.
+
+# ─── Общие вспомогательные функции узлов ──────────────────────────────
+
+
+def _get_qa_config(config=None) -> QAGraphConfig:
+    """Разрешение конфигурации узла.
+
+    Принимает либо сам QAGraphConfig (удобно для прямых вызовов и тестов),
+    либо LangGraph RunnableConfig вида {"configurable": {"qa_config": cfg}}
+    (как будет передавать сборка графа в юните 3). По умолчанию —
+    QAGraphConfig() со значениями из раздела 8.
+    """
+    if isinstance(config, QAGraphConfig):
+        return config
+    if isinstance(config, dict):
+        configurable = config.get("configurable") or {}
+        qa = configurable.get("qa_config")
+        if isinstance(qa, QAGraphConfig):
+            return qa
+    return QAGraphConfig()
+
+
+def _message_to_dict(msg) -> dict | None:
+    """BaseMessage → {"role": ..., "content": ...} для llm_chat.
+
+    Типы LangGraph: human → user, ai → assistant, system → system.
+    Не-текстовые сообщения (tool и т.п.) пропускаются.
+    """
+    role = getattr(msg, "type", None)
+    if role == "human":
+        role = "user"
+    elif role == "ai":
+        role = "assistant"
+    elif role != "system":
+        return None
+    content = getattr(msg, "content", None)
+    if content is None:
+        return None
+    return {"role": role, "content": str(content)}
+
+
+def _build_llm_messages(system_prompt: str, query: str, history=None) -> list[dict]:
+    """Собрать сообщения для llm_chat: system-промпт + история + текущий запрос."""
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history or []:
+        d = _message_to_dict(msg)
+        if d is not None:
+            messages.append(d)
+    messages.append({"role": "user", "content": query})
+    return messages
+
+
+def _fill_template(template: str, **kwargs) -> str:
+    """Подстановка плейсхолдеров {name} без str.format.
+
+    Промпты архитектуры содержат фигурные скобки в примерах JSON
+    (разделы 5.1/5.5) — str.format их бы не пережил. Замена идёт
+    последовательно по именам плейсхолдеров.
+    """
+    out = template
+    for key, value in kwargs.items():
+        out = out.replace("{" + key + "}", str(value))
+    return out
+
+
+# ─── Ленивые синглтоны клиентов (раздел 2.2) ──────────────────────────
+
+_qdrant_clients: dict[str, QdrantClient] = {}
+_sparse_model: SparseTextEmbedding | None = None
+
+
+def _get_qdrant_client(path: str) -> QdrantClient:
+    """Ленивый синглтон QdrantClient — один экземпляр на путь, разделяемый
+    между вызовами графа (раздел 2.2)."""
+    client = _qdrant_clients.get(path)
+    if client is None:
+        client = QdrantClient(path=path)
+        _qdrant_clients[path] = client
+    return client
+
+
+def _get_sparse_model() -> SparseTextEmbedding:
+    """Ленивый синглтон sparse-эмбеддера (Qdrant/bm25) — разделяемый
+    между вызовами графа (раздел 2.2)."""
+    global _sparse_model
+    if _sparse_model is None:
+        _sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
+    return _sparse_model
+
+
+# ─── Узел 1: analyze_query (раздел 5.1) ───────────────────────────────
+
+ANALYZE_QUERY_PROMPT = """Ты — анализатор поисковых запросов к базе нормативных документов
+(ГОСТ, СП, СНиП, СанПиН).
+
+Твоя задача: определить, достаточно ли конкретен запрос для эффективного
+поиска в векторной базе нормативных документов.
+
+Конкретный запрос содержит:
+- Название или номер документа (ГОСТ 31996, СП 89.13330)
+- Предмет поиска (высота молниеотвода, сечение кабеля)
+- Технические термины
+
+Абстрактный запрос:
+- "расскажи про нормативы"
+- "какие есть требования"
+- "что нужно знать про..."
+
+Верни JSON:
+{
+  "is_concrete": true/false,
+  "key_terms": ["список", "ключевых", "терминов"],
+  "suggested_clarification": "уточняющий вопрос или null"
+}"""
+
+
+def analyze_query(state: QAGraphState, config=None) -> dict:
+    """Узел 1: классификация запроса (раздел 5.1).
+
+    Вызывает LLM с промптом анализа, парсит is_concrete/key_terms/
+    suggested_clarification, устанавливает active_query = query.
+    Если LLM вернул не-JSON или упал — fallback is_concrete=True
+    (пропускаем в search, раздел 5.1 «Валидация»).
+    """
+    cfg = _get_qa_config(config)
+    query = state.get("query", "")
+    history = state.get("messages") or []
+
+    messages = _build_llm_messages(ANALYZE_QUERY_PROMPT, query, history)
+    try:
+        raw = llm_chat(messages, cfg, "analyze_query")
+    except RuntimeError:
+        raw = None
+
+    parsed = _parse_json_response(raw) or {}
+
+    is_concrete = parsed.get("is_concrete")
+    if not isinstance(is_concrete, bool):
+        is_concrete = True  # fallback из 5.1: пропускаем в search
+
+    key_terms = parsed.get("key_terms")
+    if not isinstance(key_terms, list):
+        key_terms = []
+
+    suggested = parsed.get("suggested_clarification")
+    if not isinstance(suggested, str) or not suggested.strip():
+        suggested = None
+
+    return {
+        "query_analysis": {
+            "is_concrete": is_concrete,
+            "key_terms": [str(t).strip() for t in key_terms if str(t).strip()],
+            "suggested_clarification": suggested,
+        },
+        # Раздел 5.1, шаг 3: active_query = query (needs_clarification
+        # здесь НЕ устанавливается — это делает ask_clarification).
+        "active_query": query,
+    }
+
+
+# ─── Узел 2: search_node (раздел 5.2) ─────────────────────────────────
+
+def search_node(state: QAGraphState, config=None) -> dict:
+    """Узел 2: гибридный поиск + RRF-фильтр + реранк (раздел 5.2).
+
+    Последовательность:
+      1. hybrid_search(query=active_query, top_k=retrieve_k) — retrieve
+      2. filter_by_rrf_score(threshold=rrf_threshold) — отсев кандидатов
+      3. rerank_siliconflow(top_n=final_k) — реранк
+      4. result_to_dict() — преобразование в список словарей
+
+    Обработка ошибок (раздел 5.2):
+      - hybrid_search не нашёл результатов → search_results = []
+      - rerank_siliconflow упал → fallback на RRF-порядок без реранка
+      - hybrid_search упал (Qdrant недоступен) → error + пустые результаты
+    """
+    cfg = _get_qa_config(config)
+    query = (state.get("active_query") or "").strip() or state.get("query", "")
+    client = _get_qdrant_client(cfg.qdrant_path)
+    sparse_model = _get_sparse_model()
+    api_key = cfg.siliconflow_api_key or resolve_api_key()
+
+    try:
+        candidates = hybrid_search(
+            client,
+            cfg.collection,
+            sparse_model,
+            query,
+            api_key,
+            top_k=cfg.retrieve_k,
+        )
+    except Exception as exc:
+        # Qdrant/эмбеддинг недоступен (раздел 7.1): error → END с fallback-ответом
+        return {
+            "search_results": [],
+            "error": f"Поиск временно недоступен: {exc}",
+        }
+
+    if not candidates:
+        return {"search_results": []}
+
+    filtered = filter_by_rrf_score(candidates, threshold=cfg.rrf_threshold)
+
+    docs = [c.payload.get("text", "") for c in filtered]
+    try:
+        scores = rerank_siliconflow(
+            query, docs, api_key, top_n=min(cfg.final_k, len(docs))
+        )
+        ranked = sorted(zip(filtered, scores), key=lambda x: x[1], reverse=True)[
+            : cfg.final_k
+        ]
+    except Exception:
+        # Rerank API недоступен (раздел 5.2): fallback на RRF-порядок
+        # (сортировка по RRF-score, убывание — как вернул бы Qdrant)
+        ranked = [
+            (c, c.score)
+            for c in sorted(filtered, key=lambda c: c.score, reverse=True)
+        ][: cfg.final_k]
+
+    results = [
+        result_to_dict(point, score, i)
+        for i, (point, score) in enumerate(ranked, 1)
+    ]
+    return {"search_results": results}
+
+
+# ─── Узел 3: evaluate_results (раздел 5.3) ────────────────────────────
+
+def evaluate_results(state: QAGraphState, config=None) -> str:
+    """Узел 3: роутер — оценка качества результатов (раздел 5.3).
+
+    Чистая функция без LLM. Возвращает строку-маршрут:
+      "generate_answer"     — max_score > score_good_threshold (0.7)
+      "reformulate_query"   — 0.4 <= max_score <= 0.7 и попыток < 2
+      "ask_clarification"   — попыток >= 2 или max_score < 0.4 или пусто
+    """
+    cfg = _get_qa_config(config)
+    results = state.get("search_results") or []
+    count = state.get("reformulate_count", 0)
+
+    if not results:
+        return "ask_clarification"
+
+    max_score = max(r.get("score", 0.0) for r in results)
+
+    if max_score > cfg.score_good_threshold:
+        return "generate_answer"
+    if max_score >= cfg.score_medium_threshold:
+        if count < cfg.max_reformulate_attempts:
+            return "reformulate_query"
+        return "ask_clarification"
+    return "ask_clarification"  # max_score < score_medium_threshold
+
+
+# ─── Узел 4: reformulate_query (раздел 5.4) ───────────────────────────
+
+REFORMULATE_QUERY_PROMPT = """Ты — помощник для переформулирования поисковых запросов к базе
+нормативных документов (ГОСТ, СП, СНиП).
+
+Исходный запрос: {query}
+
+Результаты поиска показали недостаточную релевантность.
+Лучшие найденные документы:
+{top_documents_summary}
+
+Переформулируй запрос, используя:
+- Синонимы технических терминов
+- Альтернативные формулировки
+- Номера связанных нормативов (если уместно)
+
+Верни ТОЛЬКО переформулированный запрос, одной строкой, без кавычек."""
+
+
+def _format_top_documents_summary(results: list[dict], limit: int = 3) -> str:
+    """Краткая сводка лучших найденных документов для промпта 5.4."""
+    lines = []
+    for r in results[:limit]:
+        doc_id = r.get("document_id") or "—"
+        title = r.get("title") or doc_id
+        score = r.get("score", 0.0)
+        text = " ".join(str(r.get("text") or "").split())[:200]
+        lines.append(f"- {title} ({doc_id}) | score: {score} | {text}")
+    return "\n".join(lines) if lines else "(результаты поиска отсутствуют)"
+
+
+def reformulate_query(state: QAGraphState, config=None) -> dict:
+    """Узел 4: LLM-переформулировка запроса (раздел 5.4).
+
+    Переформулируется активный запрос (тот, по которому искали и получили
+    плохие результаты). При пустом ответе LLM или ошибке — reformulate_count
+    всё равно инкрементируется, active_query не меняется (раздел 5.4).
+    """
+    cfg = _get_qa_config(config)
+    query = state.get("query", "")
+    active_query = state.get("active_query") or query
+    results = state.get("search_results") or []
+
+    prompt = _fill_template(
+        REFORMULATE_QUERY_PROMPT,
+        query=active_query,
+        top_documents_summary=_format_top_documents_summary(results),
+    )
+    count = state.get("reformulate_count", 0)
+
+    try:
+        raw = llm_chat(
+            [{"role": "system", "content": prompt},
+             {"role": "user", "content": active_query}],
+            cfg,
+            "reformulate_query",
+        )
+    except RuntimeError:
+        raw = ""
+
+    new_query = raw.strip().strip('"').strip()
+    if not new_query:
+        return {"reformulate_count": count + 1}
+
+    return {"active_query": new_query, "reformulate_count": count + 1}
+
+
+# ─── Узел 5: ask_clarification (раздел 5.5) ───────────────────────────
+
+ASK_CLARIFICATION_PROMPT = """Ты — ассистент для уточнения поисковых запросов к нормативным документам.
+
+Пользователь спросил: {query}
+
+Этот запрос недостаточно конкретен / результаты поиска неудовлетворительны.
+
+Сформулируй 1–2 КОНКРЕТНЫХ уточняющих вопроса, которые помогут сузить поиск.
+Вопросы должны:
+- Уточнять номер/название документа (СП, ГОСТ, СанПиН)
+- Уточнять конкретный аспект (проектирование, монтаж, испытания)
+- Уточнять технические параметры
+
+Верни JSON:
+{
+  "questions": ["вопрос 1", "вопрос 2"]
+}"""
+
+DEFAULT_CLARIFICATION_QUESTION = (
+    "Уточните, пожалуйста, номер или название документа по вашему запросу"
+)
+
+
+def _generate_clarification_questions(state: QAGraphState, cfg: QAGraphConfig) -> list[str]:
+    """Шаги 1–2 раздела 5.5: промпт + LLM → 1–2 уточняющих вопроса.
+
+    При не-JSON ответе или ошибке LLM возвращается один дефолтный вопрос.
+    """
+    query = state.get("query", "")
+    history = state.get("messages") or []
+    system_prompt = _fill_template(ASK_CLARIFICATION_PROMPT, query=query)
+    messages = _build_llm_messages(system_prompt, query, history)
+
+    try:
+        raw = llm_chat(messages, cfg, "ask_clarification")
+    except RuntimeError:
+        raw = None
+
+    parsed = _parse_json_response(raw)
+    questions: list[str] = []
+    if parsed and isinstance(parsed.get("questions"), list):
+        questions = [str(q).strip() for q in parsed["questions"] if str(q).strip()]
+    if not questions:
+        questions = [f"{DEFAULT_CLARIFICATION_QUESTION}: {query}"]
+    return questions[:2]
+
+
+def ask_clarification(state: QAGraphState, config=None) -> dict:
+    """Узел 5: уточняющие вопросы + interrupt (раздел 5.5).
+
+    Генерирует 1–2 вопроса, передаёт их в interrupt() — граф
+    останавливается до ответа пользователя. При возобновлении:
+      - ответ пользователя добавляется в messages
+      - active_query = f"{query}. Уточнение: {user_response}"
+      - needs_clarification сбрасывается, reformulate_count = 0
+    """
+    cfg = _get_qa_config(config)
+    questions = _generate_clarification_questions(state, cfg)
+    clarification_text = "\n".join(f"• {q}" for q in questions)
+
+    # LangGraph interrupt — граф останавливается здесь (раздел 5.5, шаг 4)
+    user_response = interrupt(clarification_text)
+
+    # Шаг 5: возобновление после ответа пользователя
+    new_query = f"{state.get('query', '')}. Уточнение: {user_response}"
+    update: dict = {
+        "needs_clarification": None,
+        "active_query": new_query,
+        "reformulate_count": 0,  # сброс счётчика при новом уточнении
+    }
+    if user_response:
+        update["messages"] = [HumanMessage(content=str(user_response))]
+    return update
+
+
+# ─── Узел 6: generate_answer (раздел 5.6) ─────────────────────────────
+
+GENERATE_ANSWER_PROMPT = """Ты — эксперт по нормативным документам (ГОСТ, СП, СНиП, СанПиН).
+Твоя задача — ответить на вопрос пользователя, основываясь ТОЛЬКО
+на предоставленных фрагментах документов.
+
+ПРАВИЛА:
+1. Отвечай на русском языке.
+2. ВСЕГДА указывай источник в формате:
+   [Документ, пункт/таблица]
+   Примеры: [СП 89.13330.2016, п. 16.1], [ГОСТ 31996-2012, табл. 19]
+3. Если информация из нескольких документов — укажи каждый:
+   "Согласно СП 89 п. 16.1 ... по ГОСТ 31996 табл. 19 ..."
+4. Если в результатах поиска нет ответа — честно скажи об этом
+   и предложи переформулировать запрос.
+5. Не выдумывай информацию, которой нет в предоставленных фрагментах.
+6. Будь краток, но точен.
+
+ВОПРОС: {query}
+
+НАЙДЕННЫЕ ФРАГМЕНТЫ ДОКУМЕНТОВ:
+{search_results_formatted}
+
+ОТВЕТ:"""
+
+FALLBACK_EMPTY_RESULTS = (
+    "К сожалению, по вашему запросу не найдено релевантных "
+    "нормативных документов. Попробуйте уточнить запрос: укажите номер ГОСТ/СП "
+    "или конкретный технический аспект."
+)
+
+FALLBACK_LLM_ERROR = (
+    "К сожалению, сервис генерации ответа временно недоступен. "
+    "Попробуйте повторить запрос позже."
+)
+
+CITATION_REGEN_INSTRUCTION = (
+    "В ответе ОБЯЗАТЕЛЬНО укажи источник для каждого утверждения "
+    "в формате [Документ, пункт]."
+)
+
+
+def generate_answer(state: QAGraphState, config=None) -> dict:
+    """Узел 6: генерация ответа + пост-валидация цитат (раздел 5.6).
+
+    - Пустые search_results → fallback-ответ без вызова LLM.
+    - После генерации проверяется наличие цитат (has_citations);
+      при отсутствии — однократная перегенерация с доп. инструкцией
+      (max 1 доп. попытка).
+    - LLM недоступен → fallback-ответ + error (раздел 7.1).
+    """
+    cfg = _get_qa_config(config)
+    query = state.get("query", "")
+    results = state.get("search_results") or []
+
+    # Обработка пустых результатов (раздел 5.6): LLM не вызывается
+    if not results:
+        return {"final_answer": FALLBACK_EMPTY_RESULTS}
+
+    prompt = _fill_template(
+        GENERATE_ANSWER_PROMPT,
+        query=query,
+        search_results_formatted=_format_search_results(results),
+    )
+
+    answer = ""
+    last_exc: Exception | None = None
+    for attempt in range(2):  # max 1 доп. попытка (раздел 5.6)
+        try:
+            answer = llm_chat(
+                [{"role": "system", "content": prompt},
+                 {"role": "user", "content": query}],
+                cfg,
+                "generate_answer",
+            )
+        except RuntimeError as exc:
+            last_exc = exc
+            break
+        if has_citations(answer):
+            return {"final_answer": answer}
+        if attempt == 0:
+            prompt += f"\n\n{CITATION_REGEN_INSTRUCTION}"
+
+    if last_exc is not None:
+        return {
+            "final_answer": FALLBACK_LLM_ERROR,
+            "error": f"LLM API недоступен: {last_exc}",
+        }
+    # Вторая попытка тоже без цитат — возвращаем как есть
+    return {"final_answer": answer}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Юнит 3: сборка графа и класс-обёртка QAGraph (разделы 4, 2.2, 6.4)
+# ══════════════════════════════════════════════════════════════════════
+
+# ─── Условные рёбра (таблица 4.2) ─────────────────────────────────────
+
+
+def _route_after_analyze(state: QAGraphState, config=None) -> str:
+    """Conditional-функция после analyze_query (таблица 4.2).
+
+        | analyze_query | is_concrete == True  | search            |
+        | analyze_query | is_concrete == False | ask_clarification |
+
+    Если query_analysis отсутствует или is_concrete не равен False —
+    маршрут в search (fallback из раздела 5.1: не-JSON → is_concrete=True).
+    """
+    analysis = state.get("query_analysis") or {}
+    if analysis.get("is_concrete") is False:
+        return "ask_clarification"
+    return "search"
+
+
+def _evaluate_results_node(state: QAGraphState, config=None) -> dict:
+    """Узел evaluate_results (раздел 4.1).
+
+    Сам evaluate_results — чистая функция-роутер (раздел 5.3): она не
+    изменяет состояние, а возвращает строку-маршрут. Поэтому как узел
+    графа она представлена no-op-обёрткой, а маршрутизация выполняется
+    в conditional-рёбрах через evaluate_results() (таблица 4.2).
+    """
+    return {}
+
+
+# ─── Сборка графа (раздел 4) ──────────────────────────────────────────
+
+
+def build_graph(checkpointer=None):
+    """Сборка StateGraph QA-системы (раздел 4.1) и компиляция.
+
+    Узлы: analyze_query, search, evaluate_results, reformulate_query,
+    ask_clarification, generate_answer (разделы 5.1–5.6).
+
+    Рёбра — строго по таблице 4.2:
+
+        START ──▶ analyze_query
+        analyze_query ──(is_concrete)──▶ search | ask_clarification
+        ask_clarification ──▶ search
+        search ──▶ evaluate_results
+        evaluate_results ──(max_score, reformulate_count)──▶
+            generate_answer | reformulate_query | ask_clarification
+        reformulate_query ──▶ search
+        generate_answer ──▶ END
+
+    Компилируется с checkpointer (по умолчанию MemorySaver) — без него
+    interrupt() в узле ask_clarification не работает (раздел 5.5,
+    открытый вопрос 12.3 про персистентный checkpointer).
+    """
+    graph = StateGraph(QAGraphState)
+
+    graph.add_node("analyze_query", analyze_query)
+    graph.add_node("search", search_node)
+    graph.add_node("evaluate_results", _evaluate_results_node)
+    graph.add_node("reformulate_query", reformulate_query)
+    graph.add_node("ask_clarification", ask_clarification)
+    graph.add_node("generate_answer", generate_answer)
+
+    graph.add_edge(START, "analyze_query")
+    graph.add_conditional_edges(
+        "analyze_query",
+        _route_after_analyze,
+        {"search": "search", "ask_clarification": "ask_clarification"},
+    )
+    graph.add_edge("ask_clarification", "search")
+    graph.add_edge("search", "evaluate_results")
+    graph.add_conditional_edges(
+        "evaluate_results",
+        evaluate_results,
+        {
+            "generate_answer": "generate_answer",
+            "reformulate_query": "reformulate_query",
+            "ask_clarification": "ask_clarification",
+        },
+    )
+    graph.add_edge("reformulate_query", "search")
+    graph.add_edge("generate_answer", END)
+
+    return graph.compile(checkpointer=checkpointer or MemorySaver())
+
+
+# ─── Класс-обёртка QAGraph (юнит 3) ───────────────────────────────────
+
+
+class QAGraph:
+    """Класс-обёртка над скомпилированным QA-графом.
+
+    Инициализация (раздел 2.2): один QdrantClient, один sparse-эмбеддер
+    и API-ключ SiliconFlow (embedding/rerank) — всё разделяется между
+    вызовами графа. LLM-чат конфигурируется через llm_config.yaml
+    (путь/провайдер/модель/ключ — в QAGraphConfig.llm_*), ключ
+    провайдера резолвится лениво в llm_chat()/get_api_key(). Граф
+    компилируется с MemorySaver-checkpointer для interrupt/resume.
+
+    Использование:
+        qa = QAGraph(QAGraphConfig(siliconflow_api_key=...))
+        result = qa.run("вопрос")
+        if "__interrupt__" in result:      # запрошено уточнение
+            result = qa.resume("ответ пользователя")
+    """
+
+    def __init__(self, config: QAGraphConfig | None = None, checkpointer=None):
+        self.config = config or QAGraphConfig()
+        # Разрешение API-ключа SiliconFlow один раз (раздел 6.4:
+        # аргумент → env → .env); ValueError если ключ не найден
+        # (решение юнита 1 — без sys.exit). Ключ LLM-провайдера НЕ
+        # резолвится здесь — он читается из llm_config.yaml через
+        # get_api_key() при первом вызове llm_chat.
+        self.api_key = self.config.siliconflow_api_key or resolve_api_key()
+        # Клиенты — ленивые синглтоны модуля (раздел 2.2): один экземпляр
+        # на путь, разделяемый между вызовами графа.
+        self.client = _get_qdrant_client(self.config.qdrant_path)
+        self.sparse_model = _get_sparse_model()
+        self.checkpointer = checkpointer or MemorySaver()
+        self.graph = build_graph(checkpointer=self.checkpointer)
+        # thread_id текущего прогона — для resume() после interrupt()
+        self._thread_id: str | None = None
+
+    def _initial_state(self, query: str) -> dict:
+        """Начальное состояние графа (раздел 3): query + пустые поля."""
+        return {
+            "query": query,
+            "messages": [],
+            "search_results": [],
+            "reformulate_count": 0,
+            "query_analysis": None,
+            "active_query": query,
+            "final_answer": None,
+            "needs_clarification": None,
+            "error": None,
+        }
+
+    def _thread_config(self) -> dict:
+        """RunnableConfig: qa_config для узлов + thread_id для checkpointer."""
+        return {
+            "configurable": {
+                "qa_config": self.config,
+                "thread_id": self._thread_id,
+            }
+        }
+
+    def run(self, query: str) -> dict:
+        """graph.invoke() с начальным состоянием.
+
+        Возвращает финальное состояние графа. Если граф остановился на
+        interrupt() (запрошено уточнение), в результате присутствует ключ
+        `__interrupt__` (список Interrupt), а final_answer отсутствует —
+        тогда продолжайте через resume().
+        """
+        self._thread_id = uuid.uuid4().hex
+        return self.graph.invoke(
+            self._initial_state(query),
+            config=self._thread_config(),
+        )
+
+    def stream(self, query: str):
+        """Streaming-режим для отслеживания прогресса.
+
+        stream_mode="updates": каждый чанк — словарь {имя_узла: обновление}.
+        На interrupt() чанк будет {"__interrupt__": (Interrupt, ...)}.
+        Возвращает генератор; thread_id фиксируется сразу (до итерации),
+        чтобы resume() можно было вызвать и после частичного чтения.
+        """
+        self._thread_id = uuid.uuid4().hex
+        return self._stream_impl(query)
+
+    def _stream_impl(self, query: str):
+        yield from self.graph.stream(
+            self._initial_state(query),
+            config=self._thread_config(),
+            stream_mode="updates",
+        )
+
+    def resume(self, user_response: str) -> dict:
+        """Возобновление после interrupt() (раздел 5.5).
+
+        Отправляет ответ пользователя через Command(resume=...) в тот же
+        поток (thread_id), где остановился run()/stream(). Граф проходит
+        ask_clarification → search → evaluate_results → ... до END.
+        """
+        if self._thread_id is None:
+            raise RuntimeError(
+                "resume() можно вызывать только после run()/stream(), "
+                "который остановился на interrupt()."
+            )
+        return self.graph.invoke(
+            Command(resume=user_response),
+            config=self._thread_config(),
+        )
+
+    def resume_stream(self, user_response: str):
+        """Streaming-возобновление после interrupt() (юнит 4, CLI).
+
+        Аналог resume(), но через graph.stream(Command(resume=...)) —
+        позволяет CLI логировать промежуточные узлы и после уточнения.
+        Возвращает генератор чанков {имя_узла: обновление}, как stream().
+        """
+        return self.graph.stream(
+            Command(resume=user_response),
+            config=self._thread_config(),
+            stream_mode="updates",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Юнит 4: CLI (раздел 10 архитектуры)
+# ══════════════════════════════════════════════════════════════════════
+
+CLI_PROMPT = "Вы: "
+CLI_ANSWER_PROMPT = "Ваш ответ: "
+CLI_EXIT_COMMANDS = {"exit", "quit", "выход", "q"}
+
+
+def _log_node_step(node: str, update, verbose: bool, print_fn) -> None:
+    """Вывод одного шага графа (логирование узлов, раздел 10).
+
+    update — словарь-обновление состояния от узла (stream updates).
+    В не-verbose режиме печатается только имя узла и счётчики;
+    в verbose — детали (анализ запроса, результаты поиска).
+    """
+    if node == "analyze_query":
+        analysis = (update or {}).get("query_analysis") or {}
+        print_fn(f"  [analyze_query] is_concrete={analysis.get('is_concrete')}")
+    elif node == "search":
+        results = (update or {}).get("search_results") or []
+        print_fn(f"  [search] результатов: {len(results)}")
+        if verbose:
+            for r in results:
+                print_fn(
+                    f"      {r.get('rank')}. {r.get('title')} "
+                    f"| score={r.get('score', 0.0):.3f}"
+                )
+    elif node == "evaluate_results":
+        print_fn("  [evaluate_results] оценка результатов")
+    elif node == "reformulate_query":
+        if update:
+            print_fn(f"  [reformulate_query] активный запрос: {update.get('active_query')}")
+    elif node == "ask_clarification":
+        print_fn("  [ask_clarification] уточнение")
+    elif node == "generate_answer":
+        print_fn("  [generate_answer] ответ сформирован")
+    else:
+        print_fn(f"  [{node}]")
+
+
+def _print_interrupt_value(interrupts, print_fn) -> str | None:
+    """Извлечь текст уточняющего вопроса из __interrupt__-чанка.
+
+    Возвращает текст вопроса (str) или None, если чанк пустой.
+    """
+    if not interrupts:
+        return None
+    intr = interrupts[0]
+    return getattr(intr, "value", str(intr))
+
+
+def run_single_query(qa, query: str, verbose: bool = False,
+                     input_fn=input, print_fn=print) -> str | None:
+    """Прогнать один запрос через граф с логированием шагов.
+
+    Цикл «запрос → ответ/уточнение → ответ пользователя → …» (раздел 10):
+      1. qa.stream(query) — логирование узлов по мере выполнения;
+      2. на __interrupt__ — печать уточняющих вопросов, ввод ответа
+         пользователя (input_fn), продолжение через qa.resume_stream();
+      3. до получения final_answer (или явного завершения потока).
+
+    Возвращает итоговый ответ (str) или None.
+    """
+    print_fn(f"Запрос: {query}")
+    final_answer: str | None = None
+    first_pass = True
+
+    while True:
+        if first_pass:
+            chunks = qa.stream(query)
+            first_pass = False
+        else:
+            answer = input_fn(CLI_ANSWER_PROMPT).strip()
+            chunks = qa.resume_stream(answer)
+
+        interrupted = False
+        for chunk in chunks:
+            node = next(iter(chunk))
+            if node == "__interrupt__":
+                value = _print_interrupt_value(chunk[node], print_fn)
+                print_fn(f"\n[УТОЧНЕНИЕ] {value}")
+                interrupted = True
+                break
+            _log_node_step(node, chunk[node], verbose, print_fn)
+            if node == "generate_answer":
+                final_answer = (chunk[node] or {}).get("final_answer")
+
+        if not interrupted:
+            break
+
+    if final_answer:
+        print_fn(f"\nОтвет:\n{final_answer}")
+    else:
+        print_fn("\nОтвет не получен.")
+    return final_answer
+
+
+def run_interactive(qa, verbose: bool = False,
+                    input_fn=input, print_fn=print) -> None:
+    """Диалоговый режим CLI (раздел 10).
+
+    Цикл «запрос → ответ/уточнение → …». Выход по команде exit/quit/
+    выход/q, Ctrl+C или EOF (Ctrl+D).
+    """
+    print_fn("Интерактивный режим QA-ассистента по нормативным документам.")
+    print_fn("Введите запрос или 'exit' для выхода.\n")
+
+    while True:
+        try:
+            query = input_fn(CLI_PROMPT).strip()
+        except (EOFError, KeyboardInterrupt):
+            print_fn("\nДо свидания!")
+            return
+        if not query:
+            continue
+        if query.lower() in CLI_EXIT_COMMANDS:
+            print_fn("До свидания!")
+            return
+        try:
+            run_single_query(qa, query, verbose=verbose,
+                             input_fn=input_fn, print_fn=print_fn)
+        except KeyboardInterrupt:
+            print_fn("\nПрервано (Ctrl+C). До свидания!")
+            return
+        print_fn()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Парсер аргументов CLI (раздел 10)."""
+    ap = argparse.ArgumentParser(
+        prog="qa_graph.py",
+        description="QA-система по нормативным документам "
+                    "(ГОСТ, СП, СНиП): LangGraph + Qdrant + SiliconFlow "
+                    "(embedding/rerank) + конфигурируемый LLM-чат "
+                    "(llm_config.yaml).",
+    )
+    ap.add_argument("--query", help="Один запрос (без --interactive)")
+    ap.add_argument("--interactive", action="store_true",
+                    help="Диалоговый режим: цикл запрос → ответ/уточнение → …")
+    ap.add_argument("--qdrant-path", default="./qdrant_data",
+                    help="Путь к локальному хранилищу Qdrant "
+                         "(по умолчанию ./qdrant_data)")
+    ap.add_argument("--llm-config", default=DEFAULT_LLM_CONFIG_PATH,
+                    help="Путь к конфигурации LLM-провайдеров "
+                         "(по умолчанию firmware/src/llm_config.yaml)")
+    ap.add_argument("--llm-provider",
+                    help="Переопределить провайдера LLM-чата "
+                         "(например, deepseek, siliconflow)")
+    ap.add_argument("--llm-model",
+                    help="Переопределить модель LLM-чата")
+    ap.add_argument("--api-key",
+                    help="API-ключ: переопределяет ключ LLM-провайдера из "
+                         "конфига (--llm-config) и ключ SiliconFlow для "
+                         "embedding/rerank (или ключи в .env)")
+    ap.add_argument("--verbose", action="store_true",
+                    help="Подробный вывод шагов графа (узлы, результаты)")
+    return ap
+
+
+def main(argv=None, input_fn=input, print_fn=print) -> int:
+    """Точка входа CLI (раздел 10).
+
+    input_fn/print_fn — инъекция ввода/вывода для тестов и интерактивного
+    режима (по умолчанию — input()/print()).
+
+    Коды возврата:
+      0 — успех / корректный выход (exit, Ctrl+C в интерактивном режиме);
+      1 — ошибка выполнения;
+      2 — ошибка конфигурации (нет/некорректен llm_config.yaml, нет
+          API-ключа) / нет аргументов.
+    """
+    ap = build_parser()
+    args = ap.parse_args(argv)
+
+    if not args.query and not args.interactive:
+        ap.print_help()
+        return 0
+
+    try:
+        # Предварительная проверка LLM-конфигурации: плохой путь/структура
+        # YAML и отсутствующий ключ провайдера → код 2 до запуска графа.
+        llm_cfg = load_llm_config(args.llm_config)
+        provider = args.llm_provider or llm_cfg.get("default_provider")
+        if not isinstance(provider, str):
+            raise ValueError("Не удалось определить провайдера LLM (default_provider)")
+        get_api_key(llm_cfg, provider, override=args.api_key)
+
+        cfg = QAGraphConfig(
+            qdrant_path=args.qdrant_path,
+            llm_config_path=args.llm_config,
+            llm_provider=args.llm_provider,
+            llm_model=args.llm_model,
+            llm_api_key=args.api_key,
+            siliconflow_api_key=args.api_key,
+        )
+        qa = QAGraph(cfg)  # проверяет SILICONFLOW_API_KEY (embedding/rerank)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        if args.interactive:
+            run_interactive(qa, verbose=args.verbose,
+                            input_fn=input_fn, print_fn=print_fn)
+        else:
+            run_single_query(qa, args.query, verbose=args.verbose,
+                             input_fn=input_fn, print_fn=print_fn)
+    except KeyboardInterrupt:
+        print("\nПрервано (Ctrl+C). До свидания!", file=sys.stderr)
+        return 130
+    except Exception as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

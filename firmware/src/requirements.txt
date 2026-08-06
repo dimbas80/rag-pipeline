@@ -3,3 +3,5 @@ fastembed
 requests
 python-dotenv
 tqdm
+langgraph>=1.2
+pyyaml
