@@ -75,7 +75,7 @@ pipeline.py
 
 **Стало (v2, ADR-010):**
 ```jsonl
-{"document_id":"СО 153-34.21.122-2003","title":"...","status":"active","chunk_id":"so153/3.2.1","chapter":"3","section":"3.2","clause":"3.2.1","section_path":"3 → 3.2 → 3.2.1","heading_texts":{"chapter":"3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ","section":"3.2. Внешняя молниезащитная система","clause":"3.2.1. Молниеприемники"},"text":"...","source":{"file":"..."},"_source_page":7,"assets":["so153/table/1"],"references":["п. 3.2.1"],"chunk_tokens":1450,"chunking_method":"qwen3"}
+{"document_id":"СО 153-34.21.122-2003","title":"...","status":"active","chunk_id":"so153/3.2.1","chapter":"3","section":"3.2","clause":"3.2.1","section_path":"3 → 3.2 → 3.2.1","heading_texts":{"chapter":"3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ","section":"3.2. Внешняя молниезащитная система","clause":"3.2.1. Молниеприемники"},"text":"...","embedding_text":"Заголовок главы: 3. ...\nЗаголовок раздела: 3.2. ...\nЗаголовок пункта: 3.2.1. ...\n\n...","embedding_tokens":1560,"source":{"file":"..."},"_source_page":7,"assets":["so153/table/1"],"references":["п. 3.2.1"],"chunk_tokens":1450,"chunking_method":"qwen3"}
 ```
 
 **Изменения полей:**
@@ -83,16 +83,37 @@ pipeline.py
 | Поле | v1 | v2 | Примечание |
 |------|-----|-----|------------|
 | `status` | — | `"active" \| "inactive"` | Из rag_config |
-| `chunk_id` | — | `"so153/3.2.1"` | Стабильный ID |
+| `chunk_id` | — | `"so153/3.2.1"` | Стабильный ID; повторы → `.../occurrence_{N}` |
 | `section_path` | — | `"3 → 3.2 → 3.2.1"` | Человекочитаемый путь |
 | `heading_texts` | — | `{chapter, section, clause}` | Названия (не номера) |
+| `embedding_text` | — | `"Заголовок главы: ...\n...\n\n{text}"` | Заголовки + text для embedding-модели |
+| `embedding_tokens` | — | `1560` | Токены фактического `embedding_text` |
 | `source.page` | `7` | **Удалено** | Заменено на `_source_page` |
 | `_source_page` | — | `7` | Приватное, для отладки |
 | `assets` | — | `["so153/table/1"]` | Ссылки на активы |
-| `chunk_tokens` | — | `1450` | Фактическое кол-во токенов |
+| `chunk_tokens` | — | `1450` | Токены только `text` (не `embedding_text`) |
 | `chunking_method` | — | `"qwen3" \| "degraded_chars_per_token"` | Метод подсчёта токенов |
 | `max_chunk_chars` (конфиг) | `1500` | **Удалено** | Заменено на `max_chunk_tokens` |
 | `max_chunk_tokens` (конфиг) | — | `7000` | Новый лимит |
+
+**`embedding_text` — контракт:**
+- Поле добавляется в каждую запись v2, публичное поле `text` не изменяется.
+- Формат детерминированный: непустые заголовки из `heading_texts` в порядке
+  `chapter → section → clause` (префиксы `Заголовок главы/раздела/пункта:`),
+  затем пустая строка и исходный `text`. Пустые/`None` заголовки пропускаются.
+- Для oversized чанков строится отдельно для каждой части `/part_{N}`:
+  те же заголовки + текст конкретной части.
+- `embedding_tokens` — токены `embedding_text` (лимит embedding-модели);
+  `chunk_tokens` остаётся количеством токенов только `text`.
+
+**`chunk_id` — occurrence-суффикс (уникальность):**
+- Базовый ID `{doc_slug}/{clause_number}` (или `/_h{ordinal}`) сохраняется
+  для первого вхождения. Повторный numbered top-level блок (напр. «## 1/2/3»
+  в разделе рекомендаций после «## 1. ВВЕДЕНИЕ») получает суффикс
+  `/occurrence_{N}` (N = 2, 3, …) ДО `/part_{N}` для oversized чанков.
+- ID уникальны в пределах одного результата `build_rag_jsonl_v2()`,
+  детерминированы (зависят только от порядка заголовков в документе),
+  случайные UUID не используются.
 
 ### 2.3 rag_assets.json — контракт
 

@@ -3057,7 +3057,12 @@ def _build_ancestors(
     Ищет ближайшие предшествующие heading нужного уровня:
       - chapter: свой номер для ##, иначе ближайший предыдущий ##
       - section: свой номер для ###, иначе ближайший предыдущий ###
+        (только в пределах текущей главы)
       - clause:  свой номер для ####/#####, иначе ближайший предыдущий ####/#####
+
+    Новый top-level chapter (##) всегда сбрасывает section/clause в None:
+    нельзя наследовать ###/#### из предыдущей главы (регрессия: повторный
+    top-level «## 1/2/3» получал чужой section, напр. «4.7»).
 
     Returns:
         {'chapter': '3', 'section': '3.2', 'clause': '3.2.1'}.
@@ -3069,12 +3074,14 @@ def _build_ancestors(
     chapter = section = clause = None
 
     if level == 2:
-        chapter = current.get("number")
-    else:
-        for j in range(idx - 1, -1, -1):
-            if headings[j].get("level") == 2:
-                chapter = headings[j].get("number")
-                break
+        # Новый top-level chapter: section/clause сбрасываются — предыдущие
+        # ###/#### относятся к старой главе и не могут быть предками.
+        return {"chapter": current.get("number"), "section": None, "clause": None}
+
+    for j in range(idx - 1, -1, -1):
+        if headings[j].get("level") == 2:
+            chapter = headings[j].get("number")
+            break
 
     if level == 3:
         section = current.get("number")
@@ -3082,6 +3089,9 @@ def _build_ancestors(
         for j in range(idx - 1, -1, -1):
             if headings[j].get("level") == 3:
                 section = headings[j].get("number")
+                break
+            # Section берётся только из текущей главы: не выходим за ##
+            if headings[j].get("level") == 2:
                 break
 
     if level >= 4:
@@ -3104,8 +3114,10 @@ def _build_heading_texts(
 
     Аналог _build_ancestors(), но возвращает ТЕКСТЫ заголовков, а не номера:
       - chapter: текст ближайшего ##
-      - section: текст ближайшего ###
+      - section: текст ближайшего ### (только в пределах текущей главы)
       - clause:  текст текущего ####/##### (или ближайшего предыдущего)
+
+    Новый top-level chapter (##) всегда сбрасывает section/clause в None.
 
     Returns:
         {'chapter': '3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ', ...}.
@@ -3117,12 +3129,13 @@ def _build_heading_texts(
     chapter_text = section_text = clause_text = None
 
     if level == 2:
-        chapter_text = current.get("heading_text")
-    else:
-        for j in range(idx - 1, -1, -1):
-            if headings[j].get("level") == 2:
-                chapter_text = headings[j].get("heading_text")
-                break
+        # Новый top-level chapter: section/clause сбрасываются.
+        return {"chapter": current.get("heading_text"), "section": None, "clause": None}
+
+    for j in range(idx - 1, -1, -1):
+        if headings[j].get("level") == 2:
+            chapter_text = headings[j].get("heading_text")
+            break
 
     if level == 3:
         section_text = current.get("heading_text")
@@ -3130,6 +3143,9 @@ def _build_heading_texts(
         for j in range(idx - 1, -1, -1):
             if headings[j].get("level") == 3:
                 section_text = headings[j].get("heading_text")
+                break
+            # Section берётся только из текущей главы: не выходим за ##
+            if headings[j].get("level") == 2:
                 break
 
     if level >= 4:
@@ -3141,6 +3157,41 @@ def _build_heading_texts(
                     break
 
     return {"chapter": chapter_text, "section": section_text, "clause": clause_text}
+
+
+# Порядок заголовков для embedding_text (детерминированный).
+_EMBEDDING_HEADING_LABELS = (
+    ("chapter", "Заголовок главы"),
+    ("section", "Заголовок раздела"),
+    ("clause", "Заголовок пункта"),
+)
+
+
+def _build_embedding_text(
+    heading_texts: dict[str, str | None] | None,
+    text: str,
+) -> str:
+    """Построить embedding_text: заголовки chapter/section/clause + исходный текст.
+
+    Формат (детерминированный и читаемый):
+        Заголовок главы: {chapter}
+        Заголовок раздела: {section}
+        Заголовок пункта: {clause}
+
+        {text}
+
+    Пустые/None заголовки не добавляются; если заголовков нет — возвращается
+    только исходный текст. Публичное поле text не изменяется.
+    """
+    parts: list[str] = []
+    if heading_texts:
+        for key, label in _EMBEDDING_HEADING_LABELS:
+            value = heading_texts.get(key)
+            if value:
+                parts.append(f"{label}: {value}")
+    if not parts:
+        return text
+    return "\n".join(parts) + "\n\n" + text
 
 
 def _build_section_path(ancestors: dict[str, str | None]) -> str | None:
@@ -3600,8 +3651,11 @@ def build_rag_jsonl_v2(
       - Лимит чанка — в токенах (max_chunk_tokens, по умолчанию 7000)
       - source.page удалён из публичной схемы; остаётся _source_page
       - Поля status / status_reason / replaced_by_document_id
-      - Стабильный chunk_id без страниц: {doc_slug}/{clause_number}[/part_{N}]
+      - Стабильный chunk_id без страниц: {doc_slug}/{clause_number}[/part_{N}];
+        повторные numbered top-level блоки получают /occurrence_{N}
       - section_path, heading_texts, chunk_tokens, chunking_method
+      - embedding_text / embedding_tokens: заголовки (chapter/section/clause)
+        + исходный text для embedding-модели (text не изменяется)
       - assets: пустой список (заполняется _link_assets_to_chunks)
 
     Алгоритм:
@@ -3673,6 +3727,10 @@ def build_rag_jsonl_v2(
     source_file = doc_meta.get("source_file")
     json_lines: list[str] = []
 
+    # Счётчик повторов базового chunk_id: повторные numbered top-level блоки
+    # (напр. «## 1/2/3» в разделе рекомендаций) получают /occurrence_{N}.
+    occurrence_counts: dict[str, int] = {}
+
     for i, clause in enumerate(active_clauses):
         text = extract_clause_text(md_text, clause["line_num"], clause["next_line_num"])
         if not text:
@@ -3684,8 +3742,20 @@ def build_rag_jsonl_v2(
         page = _get_page_for_heading(clause.get("number"), json_headings)
         refs = extract_references(text, patterns) if patterns else []
 
-        base_chunk_id = _make_chunk_id(doc_key, active_clauses, i)
+        # Уникальность chunk_id в пределах результата: первый вхождения
+        # сохраняет базовый ID, повторы получают детерминированный
+        # occurrence-суффикс ДО /part_{N} для oversized чанков.
+        raw_chunk_id = _make_chunk_id(doc_key, active_clauses, i)
+        count = occurrence_counts.get(raw_chunk_id, 0)
+        if count == 0:
+            base_chunk_id = raw_chunk_id
+        else:
+            base_chunk_id = f"{raw_chunk_id}/occurrence_{count + 1}"
+        occurrence_counts[raw_chunk_id] = count + 1
+
         chunk_tokens = tokenize(text)
+        embedding_text = _build_embedding_text(heading_texts, text)
+        embedding_tokens = tokenize(embedding_text)
 
         base = {
             "document_id": doc_meta.get("document_id"),
@@ -3706,6 +3776,8 @@ def build_rag_jsonl_v2(
             "section_path": section_path,
             "heading_texts": heading_texts,
             "text": text,
+            "embedding_text": embedding_text,
+            "embedding_tokens": embedding_tokens,
             "source": {"file": source_file},
             "_source_page": page,
             "assets": [],
@@ -3723,6 +3795,8 @@ def build_rag_jsonl_v2(
                 rec["text"] = part
                 rec["chunk_id"] = f"{base_chunk_id}/part_{n}"
                 rec["chunk_tokens"] = tokenize(part)
+                rec["embedding_text"] = _build_embedding_text(heading_texts, part)
+                rec["embedding_tokens"] = tokenize(rec["embedding_text"])
                 if ancestors["clause"]:
                     rec["clause"] = f"{ancestors['clause']} (ч. {n})"
                 json_lines.append(json.dumps(rec, ensure_ascii=False))
