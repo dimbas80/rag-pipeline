@@ -1476,20 +1476,31 @@ def _crop_and_save_image(
 def _insert_images_into_md(
     md_text: str,
     extracted: list[dict],
+    pictures: list[dict] | None = None,
     pages: list[dict] = None,
     page_boundaries: list[tuple[int, int]] | None = None,
 ) -> str:
     """Вставить ссылки на извлечённые изображения в Markdown, заменяя @@IMAGE_N@@ плейсхолдеры.
 
     Плейсхолдеры @@IMAGE_0@@, @@IMAGE_1@@, ... создаются в parse_yandex_json_to_md()
-    в Y-отсортированном порядке. Извлечённые изображения (extracted) сортируются
-    по (page, Y) и заменяют соответствующие плейсхолдеры.
+    в порядке pictures (по Y на странице).
 
-    Если изображение не удалось извлечь — плейсхолдер остаётся как есть.
+    Сопоставление идёт ПО ПОЗИЦИИ В pictures (индекс N = плейсхолдер N):
+    для каждого picture ищется extracted-изображение по page + bbox.vertices.
+    Это важно, когда extract_images_from_pdf() не смог вырезать часть картинок:
+    номера fig_N остаются привязанными к своим местам, а не сдвигаются к
+    началу списка извлечённых (старое поведение по индексу в sorted_imgs).
+
+    Если для picture нет matching extracted (вырезка провалилась) — плейсхолдер
+    очищается (заменяется пустой строкой), чтобы в финальном MD не оставалось
+    служебных токенов @@IMAGE_N@@.
 
     Args:
         md_text: Markdown-текст с плейсхолдерами @@IMAGE_N@@.
         extracted: Список от extract_images_from_pdf().
+        pictures: Список картинок от parse_yandex_json_to_md() — позиция
+            элемента = номер плейсхолдера. Если None — используется старый
+            порядок (сортировка extracted по page/Y) для совместимости.
         pages: Не используется (оставлено для совместимости).
         page_boundaries: Не используется (оставлено для совместимости).
 
@@ -1508,15 +1519,50 @@ def _insert_images_into_md(
             return sum(ys) / len(ys)
         return 0
 
-    # Сортируем по странице и Y — тот же порядок, что и плейсхолдеры
-    sorted_imgs = sorted(extracted, key=lambda x: (x["page"], _get_y_center(x)))
+    def _bbox_key(bbox) -> tuple | None:
+        """Сравнимый ключ bbox: кортеж округлённых вершин (x, y)."""
+        vertices = (bbox or {}).get("vertices", [])
+        if not vertices:
+            return None
+        return tuple(
+            (round(float(v.get("x", 0)), 2), round(float(v.get("y", 0)), 2))
+            for v in vertices
+        )
 
-    # Заменяем @@IMAGE_N@@ на ![fig_N](image/fig_N.ext)
-    for idx, img in enumerate(sorted_imgs):
-        placeholder = f"@@IMAGE_{idx}@@"
-        replacement = f"![fig_{img['fig_num']}](image/{img['filename']})"
-        if placeholder in md_text:
-            md_text = md_text.replace(placeholder, replacement, 1)
+    def _matches(pic: dict, img: dict) -> bool:
+        """Совпадает ли extracted-изображение с picture (page + bbox)."""
+        if pic.get("page") != img.get("page"):
+            return False
+        pk = _bbox_key(pic.get("bbox", {}))
+        ik = _bbox_key(img.get("bbox", {}))
+        return pk is not None and pk == ik
+
+    if pictures is not None:
+        # Сопоставление по позиции в pictures: pictures[N] -> @@IMAGE_N@@
+        for idx, pic in enumerate(pictures):
+            placeholder = f"@@IMAGE_{idx}@@"
+            if placeholder not in md_text:
+                continue
+            match = next((im for im in extracted if _matches(pic, im)), None)
+            if match is not None:
+                replacement = f"![fig_{match['fig_num']}](image/{match['filename']})"
+                md_text = md_text.replace(placeholder, replacement, 1)
+            else:
+                # Вырезка не удалась — убираем плейсхолдер, чтобы в MD
+                # не оставалось незаменённых @@IMAGE_N@@.
+                md_text = md_text.replace(placeholder, "", 1)
+        # Защита: плейсхолдеров не должно быть больше, чем pictures
+        # (они создаются 1:1), но если вдруг остались — очищаем.
+        md_text = re.sub(r"@@IMAGE_\d+@@", "", md_text)
+    else:
+        # Старый порядок (совместимость): сортируем extracted по (page, Y)
+        # и заменяем плейсхолдеры по индексу в отсортированном списке.
+        sorted_imgs = sorted(extracted, key=lambda x: (x["page"], _get_y_center(x)))
+        for idx, img in enumerate(sorted_imgs):
+            placeholder = f"@@IMAGE_{idx}@@"
+            replacement = f"![fig_{img['fig_num']}](image/{img['filename']})"
+            if placeholder in md_text:
+                md_text = md_text.replace(placeholder, replacement, 1)
 
     return md_text
 
@@ -2226,11 +2272,24 @@ def rename_images(md_text: str, img_dir: str | Path) -> tuple[str, int]:
         md_text = md_text.replace(f"](image/{old_name})", f"](image/{new_name})")
         fig_num_match = re.search(r'fig_(\d+)', new_name)
         fig_num = fig_num_match.group(1) if fig_num_match else "?"
+        # Обновляем alt-текст для ЛЮБОГО значения в [...], а не только
+        # литерального "image": _insert_images_into_md пишет ![fig_N](...),
+        # HTML-таблицы дают ![image](...) — оба должны стать ![Рисунок N].
         md_text = re.sub(
-            rf'!\[image\]\(image/{re.escape(new_name)}\)',
+            rf'!\[[^\]]*\]\(image/{re.escape(new_name)}\)',
             f"![Рисунок {fig_num}](image/{new_name})",
             md_text,
         )
+
+    # Нормализация alt-текста для НЕпереименованных fig_N (имя файла уже
+    # совпадало с целевым, rename_map их не содержит): ![fig_N](image/fig_N.ext)
+    # → ![Рисунок N](image/fig_N.ext). Иначе в MD остаётся смесь ![fig_N] и
+    # ![Рисунок N] (приёмка: все ссылки вида ![Рисунок N](image/fig_N.png)).
+    md_text = re.sub(
+        r"!\[fig_(\d+)\]\(image/fig_\1(\.[a-zA-Z0-9]+)\)",
+        r"![Рисунок \1](image/fig_\1\2)",
+        md_text,
+    )
 
     return md_text, len(rename_map)
 
@@ -4491,7 +4550,10 @@ def process_file(
                 pdf_path, pictures, img_dir, pages=pages,
             )
             # Вставляем ссылки на изображения в текст по координатам
-            md_text = _insert_images_into_md(md_text, extracted, pages=pages, page_boundaries=page_boundaries)
+            md_text = _insert_images_into_md(
+                md_text, extracted,
+                pictures=pictures, pages=pages, page_boundaries=page_boundaries,
+            )
             log.info(f"  Извлечено изображений: {len(extracted)}")
         else:
             log.info("  Нет pictures для извлечения")
