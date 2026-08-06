@@ -1419,6 +1419,10 @@ def extract_images_from_pdf(
             bbox = pic.get("bbox", {})
             vertices = bbox.get("vertices", [])
             if len(vertices) < 4:
+                log.warning(
+                    f"  ({page_idx}): картинка без bbox.vertices (<4) — "
+                    "ПРОПУЩЕНА, fig_N не присвоен"
+                )
                 continue
 
             fig_counter += 1
@@ -1440,17 +1444,54 @@ def extract_images_from_pdf(
             filename = f"fig_{fig_counter}{ext}"
             output_path = output_img_dir / filename
 
-            success = _crop_and_save_image(page, fitz_rect, output_path, 2.0)
-            if success:
+            pix = _crop_and_save_image(page, fitz_rect, output_path, 2.0)
+            if pix is not None:
+                # Реальные размеры сохранённого pixmap
+                log.info(
+                    f"  fig_{fig_counter} (стр.{page_idx}): извлечено "
+                    f"({pix.width}x{pix.height})"
+                )
                 saved_images.append({
                     "fig_num": fig_counter,
                     "page": page_idx,
                     "filename": filename,
                     "bbox": bbox,
                 })
+            else:
+                # Проверяем, rect ли за границей страницы
+                if not page_rect.intersects(fitz_rect):
+                    log.warning(
+                        f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
+                        "rect за границей страницы"
+                    )
+                else:
+                    log.warning(
+                        f"  fig_{fig_counter} (стр.{page_idx}): ПРОПУЩЕНО — "
+                        "ошибка вырезки"
+                    )
 
     doc.close()
-    log.info(f"  Сохранено изображений: {len(saved_images)}")
+    # Итоговый summary
+    # total = fig_counter, т.к. картинки без bbox.vertices (<4) не получают fig_N,
+    # и тогда len(pictures) дал бы «фантомные» номера в списке пропущенных.
+    total = fig_counter
+    saved = len(saved_images)
+    skipped = total - saved
+    figs_ok = [str(im["fig_num"]) for im in saved_images]
+    figs_skip = [
+        str(n)
+        for n in range(1, total + 1)
+        if n not in {im["fig_num"] for im in saved_images}
+    ]
+
+    if skipped:
+        if saved:
+            log.info(f"  Извлечено: {saved}/{total} (fig_{', fig_'.join(figs_ok)})")
+        else:
+            log.info(f"  Извлечено: {saved}/{total}")
+        log.warning(f"  Пропущено: {skipped} (fig_{', fig_'.join(figs_skip)})")
+    else:
+        log.info(f"  Извлечено: {saved}/{total}")
     return saved_images
 
 
@@ -1459,18 +1500,26 @@ def _crop_and_save_image(
     rect: "fitz.Rect",
     output_path: Path,
     dpi_scale: float = 2.0,
-) -> bool:
-    """Вырезать область страницы по rect и сохранить как изображение."""
+) -> "fitz.Pixmap | None":
+    """Вырезать область страницы по rect и сохранить как изображение.
+
+    Returns:
+        Сохранённый pixmap при успехе (нужен для реальных размеров
+        width/height), None при ошибке вырезки.
+    """
     import fitz
     try:
+        log.debug(f"    crop rect={rect} -> {output_path}")
         # Создаём матрицу для увеличения DPI
         matrix = fitz.Matrix(dpi_scale, dpi_scale)
         pix = page.get_pixmap(matrix=matrix, clip=rect)
         pix.save(str(output_path))
-        return True
+        return pix
     except Exception as e:
         log.warning(f"  Не удалось вырезать изображение: {e}")
-        return False
+        # pix.save() мог успеть создать пустой файл — убираем «фантом»
+        output_path.unlink(missing_ok=True)
+        return None
 
 
 def _insert_images_into_md(
