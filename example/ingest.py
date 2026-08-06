@@ -1,48 +1,30 @@
-#!/usr/bin/env python3
 """
 Индексация JSONL-чанков (+assets.json) в Qdrant с гибридным поиском.
 
-Dense-эмбеддинги — SiliconFlow API (Qwen/Qwen3-Embedding-8B),
-sparse — локальный fastembed (Qdrant/bm25).
-
 Установка:
-    pip install -r requirements.txt
+    pip install qdrant-client sentence-transformers fastembed
 
 Перед запуском:
-    - Qdrant работает в локальном режиме: сам управляет файлами в ./qdrant_data
-      (или --qdrant-path), сервер поднимать не нужно
-    - задать SILICONFLOW_API_KEY (в .env рядом с запуском или --api-key)
+    - поднять Qdrant: docker run -p 6333:6333 qdrant/qdrant
+    - убедиться, что есть доступ к HuggingFace для загрузки Qwen3-Embedding
+      (если веса уже скачаны локально — укажи путь вместо repo id)
 
 Запуск:
-    python create_index.py --chunks path/to/chunks.jsonl --assets path/to/assets.json \
-        --collection technical_standard
+    python ingest.py --chunks path/to/chunks.jsonl --assets path/to/assets.json \
+        --collection so153_molniezashita
 """
 import argparse
 import json
-import os
 import sys
-import time
 import uuid
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
-from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models
-from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from fastembed import SparseTextEmbedding
 
-EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
+EMBED_MODEL = "Qwen/Qwen3-Embedding-4B"   # или -0.6B / -8B в зависимости от твоего железа
 SPARSE_MODEL = "Qdrant/bm25"
-DEFAULT_COLLECTION = "technical_standard"
-
-# Базовый URL SiliconFlow. По умолчанию — публичный API; переопределяется
-# через SILICONFLOW_BASE_URL (например, для прокси или тестового стенда).
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.com")
-EMBED_API_URL = f"{SILICONFLOW_BASE_URL}/v1/embeddings"
-
-EMBED_TIMEOUT = 120
-EMBED_RETRIES = 3
-EMBED_RETRY_BACKOFF = 2.0
 
 
 def load_assets(assets_path: Path) -> tuple[dict, dict]:
@@ -176,90 +158,19 @@ def stable_point_id(chunk: dict, row_index: int) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{chunk['chunk_id']}::{row_index}"))
 
 
-def resolve_api_key(cli_key: str | None) -> str:
-    """Порядок: --api-key > переменная окружения > .env (через python-dotenv)."""
-    load_dotenv()
-    key = cli_key or os.environ.get("SILICONFLOW_API_KEY")
-    if not key:
-        print(
-            "[ERROR] SILICONFLOW_API_KEY не задан. Укажи --api-key или "
-            "положи ключ в .env (SILICONFLOW_API_KEY=...).",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    return key
-
-
-def embed_texts_siliconflow(texts: list[str], api_key: str, model: str = EMBED_MODEL) -> list[list[float]]:
-    """
-    Dense-эмбеддинг батча текстов через SiliconFlow API.
-
-    POST https://api.siliconflow.cn/v1/embeddings
-    {"model": "Qwen/Qwen3-Embedding-8B", "input": [...], "encoding_format": "float"}
-
-    Возвращает список векторов в том же порядке, что и texts.
-    """
-    payload = {"model": model, "input": texts, "encoding_format": "float"}
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    last_exc: Exception | None = None
-    for attempt in range(1, EMBED_RETRIES + 1):
-        try:
-            resp = requests.post(EMBED_API_URL, json=payload, headers=headers, timeout=EMBED_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            items = sorted(data["data"], key=lambda it: it.get("index", 0))
-            return [it["embedding"] for it in items]
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            last_exc = exc
-            if attempt < EMBED_RETRIES:
-                time.sleep(EMBED_RETRY_BACKOFF * attempt)
-    raise RuntimeError(f"SiliconFlow embedding failed after {EMBED_RETRIES} attempts: {last_exc}")
-
-
-def build_payload(chunk: dict, doc_meta: dict, assets_by_id: dict, row_index: int) -> dict:
-    """Payload точки в Qdrant — структура как в example/ingest.py."""
-    resolved_assets = [
-        assets_by_id[a] for a in chunk.get("assets", []) if a in assets_by_id
-    ]
-    return {
-        "chunk_id": chunk["chunk_id"],
-        "document_id": chunk["document_id"],
-        "document_type": doc_meta.get("document_type"),
-        "domain": doc_meta.get("domain"),
-        "title": chunk.get("title"),
-        "status": chunk.get("status"),
-        "chapter": chunk.get("chapter"),
-        "section": chunk.get("section"),
-        "clause": chunk.get("clause"),
-        "section_path": chunk.get("section_path"),
-        "heading_texts": chunk.get("heading_texts"),
-        "text": chunk["text"],
-        "references": chunk.get("references", []),
-        "assets": resolved_assets,
-        "chunk_tokens": chunk.get("chunk_tokens"),
-        "row_index": row_index,
-    }
-
-
 def main():
-    ap = argparse.ArgumentParser(description="Индексация чанков в Qdrant (dense: SiliconFlow, sparse: fastembed).")
-    ap.add_argument("--chunks", required=True, type=Path, help="JSONL с чанками документа")
-    ap.add_argument("--assets", required=True, type=Path, help="JSON с assets.json документа")
-    ap.add_argument("--collection", default=DEFAULT_COLLECTION,
-                    help=f"Имя коллекции Qdrant (по умолчанию {DEFAULT_COLLECTION})")
-    ap.add_argument("--qdrant-path", default="./qdrant_data",
-                    help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chunks", required=True, type=Path)
+    ap.add_argument("--assets", required=True, type=Path)
+    ap.add_argument("--collection", required=True)
+    ap.add_argument("--qdrant-url", default="http://localhost:6333")
     ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--api-key", help="API-ключ SiliconFlow (или SILICONFLOW_API_KEY в .env)")
     ap.add_argument(
         "--strict",
         action="store_true",
         help="Прервать индексацию, если валидация нашла ошибки (по умолчанию только предупреждает).",
     )
     args = ap.parse_args()
-
-    api_key = resolve_api_key(args.api_key)
 
     assets_by_id, doc_meta = load_assets(args.assets)
 
@@ -277,18 +188,14 @@ def main():
     else:
         print("[VALIDATION] OK, проблем не найдено.")
 
-    print(f"Загружаю sparse-эмбеддер {SPARSE_MODEL} ...")
+    print(f"Загружаю эмбеддер {EMBED_MODEL} ...")
+    dense_model = SentenceTransformer(EMBED_MODEL)
     sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL)
 
-    client = QdrantClient(path=args.qdrant_path)
+    client = QdrantClient(url=args.qdrant_url)
 
-    embed_texts = [build_embed_text(c, assets_by_id, doc_meta) for c in chunks]
-
-    # Узнаём размерность dense-вектора по первому эмбеддингу и создаём
-    # коллекцию с dense (COSINE) + sparse векторами, как в example/ingest.py.
+    dense_dim = dense_model.get_sentence_embedding_dimension()
     if not client.collection_exists(args.collection):
-        probe = embed_texts_siliconflow(embed_texts[:1], api_key)
-        dense_dim = len(probe[0])
         client.create_collection(
             collection_name=args.collection,
             vectors_config={
@@ -298,38 +205,59 @@ def main():
                 "sparse": models.SparseVectorParams(),
             },
         )
-        print(f"Коллекция {args.collection} создана (dense dim={dense_dim}).")
-    else:
-        print(f"Коллекция {args.collection} уже существует, добавляю точки.")
+        print(f"Коллекция {args.collection} создана (dim={dense_dim}).")
 
-    batches = range(0, len(chunks), args.batch_size)
-    for start in tqdm(batches, desc="Индексация", unit="batch"):
+    embed_texts = [build_embed_text(c, assets_by_id, doc_meta) for c in chunks]
+
+    for start in range(0, len(chunks), args.batch_size):
         batch_chunks = chunks[start:start + args.batch_size]
         batch_texts = embed_texts[start:start + args.batch_size]
 
-        dense_vecs = embed_texts_siliconflow(batch_texts, api_key)
+        dense_vecs = dense_model.encode(batch_texts, normalize_embeddings=True)
         sparse_vecs = list(sparse_model.embed(batch_texts))
 
         points = []
         for j, (chunk, dense_vec, sparse_vec) in enumerate(zip(batch_chunks, dense_vecs, sparse_vecs)):
             row_index = start + j
+            resolved_assets = [
+                assets_by_id[a] for a in chunk.get("assets", []) if a in assets_by_id
+            ]
+            payload = {
+                "chunk_id": chunk["chunk_id"],
+                "document_id": chunk["document_id"],
+                "document_type": doc_meta.get("document_type"),
+                "domain": doc_meta.get("domain"),
+                "title": chunk.get("title"),
+                "status": chunk.get("status"),
+                "chapter": chunk.get("chapter"),
+                "section": chunk.get("section"),
+                "clause": chunk.get("clause"),
+                "section_path": chunk.get("section_path"),
+                "heading_texts": chunk.get("heading_texts"),
+                "text": chunk["text"],
+                "references": chunk.get("references", []),
+                "assets": resolved_assets,
+                "chunk_tokens": chunk.get("chunk_tokens"),
+                "row_index": row_index,
+            }
             points.append(
                 models.PointStruct(
                     id=stable_point_id(chunk, row_index),
                     vector={
-                        "dense": dense_vec,
+                        "dense": dense_vec.tolist(),
                         "sparse": models.SparseVector(
                             indices=sparse_vec.indices.tolist(),
                             values=sparse_vec.values.tolist(),
                         ),
                     },
-                    payload=build_payload(chunk, doc_meta, assets_by_id, row_index),
+                    payload=payload,
                 )
             )
 
         client.upsert(collection_name=args.collection, points=points)
+        print(f"  proindexed {start + len(batch_chunks)}/{len(chunks)}")
 
-    print(f"Готово: {len(chunks)} чанков в коллекции {args.collection}.")
+    print("Готово.")
 
 
 if __name__ == "__main__":

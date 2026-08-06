@@ -36,7 +36,7 @@ DEFAULT_COLLECTION = "technical_standard"
 
 # Базовый URL SiliconFlow. По умолчанию — публичный API; переопределяется
 # через SILICONFLOW_BASE_URL (например, для прокси или тестового стенда).
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn")
+SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.com")
 EMBED_API_URL = f"{SILICONFLOW_BASE_URL}/v1/embeddings"
 RERANK_API_URL = f"{SILICONFLOW_BASE_URL}/v1/rerank"
 
