@@ -1,24 +1,22 @@
-# Engineering Project
+# Build_Search_index
 
-This project is coordinated by Hermes Orchestrator.
+Построение поискового индекса. Проект под управлением Hermes Orchestrator.
 
 ## Workflow
 
 Discovery
-→ Hardware Design
+→ Specification
 → Software Architecture
 → Implementation
 → Review
 → Integration
+→ Merge
 
 ## Source of Truth
 
 - Requirements: `docs/requirements/`
-- Hardware: `docs/hardware/`
-- BOM: `hardware/bom/`
 - Software architecture: `docs/software/`
-- Firmware: `firmware/src/`
+- Source code: `firmware/src/`
 - Review: `docs/review/`
 
-Do not implement firmware before the required hardware design
-and software architecture are approved.
+Не внедрять реализацию до утверждения архитектуры.

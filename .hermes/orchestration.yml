@@ -29,8 +29,8 @@ version: 1
 # ============================================================
 
 project:
-name: my-software-project
-board: my-software-project
+name: Build_Search_index
+board: Build_Search_index
 
 # ============================================================
 
