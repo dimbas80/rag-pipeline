@@ -4077,59 +4077,104 @@ def _init_tokenizer(config: dict) -> tuple[Callable[[str], int], str]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _TABLE_CAPTION_RE = re.compile(
-    r"^(?:\*\s*)?(?:Т\s*а\s*б\s*л\s*и\s*ц\s*а|Таблиц[аы])\s*(\d+(?:\.\d+)*)",
+    r"^(?:\*\s*)?(?:Т\s*а\s*б\s*л\s*и\s*ц\s*а|Таблиц[аы])\s*((?:[А-ЯA-Z]\.)?\d+(?:\.\d+)*|(?:[IVXLCDM]+))",
     re.IGNORECASE,
 )
 
 
-def _extract_tables_from_md(md_text: str) -> list[dict]:
+def _extract_tables_from_md(
+    md_text: str,
+    table_image_map: dict[str, str] | None = None,
+) -> list[dict]:
     """Найти все Markdown-таблицы в тексте.
 
     Алгоритм (ADR-010 §4.1):
       1. Разбить md_text на строки
       2. Детектить таблицы: строка содержит '|', следующая строка — '|---|'
       3. Для каждой таблицы:
-         - caption: подпись до или после таблицы («Таблица N» или «Таблица N.M — ...»)
+         - caption: подпись до или после таблицы («Таблица N» или «Таблица N.M — ...»),
+           без переиспользования подписей, привязанных к другой таблице
          - md_lines: [start_line, end_line)
-         - image_path: "image/table_{N}.png" (N — порядковый номер)
+         - image_path: берётся из карты id → path по ID-маркеру <!-- t_pN_M -->,
+           если маркер перед таблицей есть и id есть в карте; иначе None
+           (привязка по содержимому выполняется позже, в _build_asset_registry).
+           Позиционный счётчик как источник image_path не используется:
+           неверная картинка хуже отсутствующей.
+
+    Args:
+        md_text: Markdown-текст.
+        table_image_map: Карта id → "table_N.png" из table_images.json
+            (tmp/<file_stem>/table_images.json), создаётся extract_table_images().
 
     Returns:
         [{asset_id, asset_type, caption, md_lines, image_path, row_count,
-          chunk_ids, _md_block}, ...]
-        asset_id заполняется позже (doc_slug); _md_block — приватное поле
-        для связывания с чанками (удаляется при записи).
+          chunk_ids, _md_block, _image_source}, ...]
+        asset_id заполняется позже (doc_slug); _md_block и _image_source —
+        приватные поля (удаляются при записи).
     """
     lines = md_text.splitlines()
-    tables: list[dict] = []
+    # Проход 1: детект таблиц (пары start/end строк)
+    spans: list[tuple[int, int]] = []
     i = 0
-    n = 0  # счётчик таблиц
     while i < len(lines):
         stripped = lines[i].strip()
-        # Детектим начало таблицы: строка с '|' И следующая с '|---'
         if stripped.startswith("|") and i + 1 < len(lines):
             next_line = lines[i + 1].strip()
             if re.match(r"^\|[\s\-:|]+\|$", next_line):
-                n += 1
                 start = i
-                # Ищем конец таблицы (строки с '|')
                 while i < len(lines) and lines[i].strip().startswith("|"):
                     i += 1
-                end = i
-                caption = _find_table_caption_md(lines, start, end, n)
-                md_block = "\n".join(lines[start:end])
-                tables.append({
-                    "asset_id": None,  # doc_slug добавляется позже
-                    "asset_type": "table",
-                    "caption": caption,
-                    "md_lines": [start, end],
-                    "image_path": f"image/table_{n}.png",
-                    "row_count": max(0, (end - start) - 2),  # минус заголовок и разделитель
-                    "chunk_ids": [],
-                    "_md_block": md_block,
-                })
+                spans.append((start, i))
                 continue
         i += 1
+
+    used_caption_lines: set[int] = set()
+    tables: list[dict] = []
+    for n, (start, end) in enumerate(spans, 1):
+        caption = _find_table_caption_md(lines, start, end, n, used_caption_lines)
+        marker_id = _find_table_marker_md(lines, start)
+        image_path: str | None = None
+        image_source: str | None = None
+        if marker_id:
+            if table_image_map and marker_id in table_image_map:
+                image_path = f"image/{table_image_map[marker_id]}"
+                image_source = "marker"
+            else:
+                log.warning(
+                    f"  Таблица {n}: маркер {marker_id} есть, но id нет в карте "
+                    f"таблиц — привязка по содержимому"
+                )
+        md_block = "\n".join(lines[start:end])
+        tables.append({
+            "asset_id": None,  # doc_slug добавляется позже
+            "asset_type": "table",
+            "caption": caption,
+            "md_lines": [start, end],
+            "image_path": image_path,
+            "row_count": max(0, (end - start) - 2),  # минус заголовок и разделитель
+            "chunk_ids": [],
+            "_md_block": md_block,
+            "_image_source": image_source,
+        })
     return tables
+
+
+def _find_table_marker_md(lines: list[str], start: int) -> str | None:
+    """Найти ID-маркер <!-- t_pN_M --> перед таблицей.
+
+    Ищет вверх до 3 непустых строк (маркер вставляется перед строкой-названием,
+    между ним и таблицей может быть подпись/пустые строки).
+    """
+    j = start - 1
+    scanned = 0
+    while j >= 0 and scanned < 3:
+        if lines[j].strip():
+            scanned += 1
+            m = re.match(r"<!--\s*(t_p\d+_\d+)\s*-->", lines[j].strip())
+            if m:
+                return m.group(1)
+        j -= 1
+    return None
 
 
 def _find_table_caption_md(
@@ -4137,13 +4182,24 @@ def _find_table_caption_md(
     start: int,
     end: int,
     n: int,
+    used_caption_lines: set[int] | None = None,
 ) -> str:
     """Найти подпись таблицы в строках Markdown.
 
-    Ищет «Таблица N» / «Таблица N.M» до таблицы (пропуская пустые строки
-    и курсивные маркеры '*') и после неё. Возвращает нормализованную
-    подпись или пустую строку.
+    Ищет «Таблица N» / «Таблица N.M» / «Таблица А.1» / «Таблица I» до таблицы
+    (до 3 непустых строк выше) и сразу под ней (только пустые строки между
+    концом таблицы и подписью). Возвращает нормализованную подпись или пустую строку.
+
+    Ограничения (дедуп подписей):
+      - подпись, уже привязанная к другой таблице (used_caption_lines), не
+        переиспользуется;
+      - подпись ниже строки начала таблицы НЕ подтягивается, если между концом
+        таблицы и подписью есть непустые строки (она принадлежит следующей таблице);
+      - если подписи нет — возвращается "".
     """
+    if used_caption_lines is None:
+        used_caption_lines = set()
+
     def _match(line: str) -> str | None:
         m = _TABLE_CAPTION_RE.match(line.strip().strip("*"))
         if m:
@@ -4156,21 +4212,25 @@ def _find_table_caption_md(
     while j >= 0 and scanned < 3:
         if lines[j].strip():
             scanned += 1
+            if j in used_caption_lines:
+                j -= 1
+                continue
             cap = _match(lines[j])
             if cap:
+                used_caption_lines.add(j)
                 return cap
         j -= 1
 
-    # После таблицы: до 3 непустых строк ниже
+    # После таблицы: только если подпись сразу под таблицей (между ними лишь
+    # пустые строки). Иначе подпись относится к следующей таблице.
     j = end
-    scanned = 0
-    while j < len(lines) and scanned < 3:
-        if lines[j].strip():
-            scanned += 1
-            cap = _match(lines[j])
-            if cap:
-                return cap
+    while j < len(lines) and not lines[j].strip():
         j += 1
+    if j < len(lines) and j not in used_caption_lines:
+        cap = _match(lines[j])
+        if cap:
+            used_caption_lines.add(j)
+            return cap
 
     return ""
 
@@ -4194,6 +4254,156 @@ def _extract_images_from_md(md_text: str) -> list[dict]:
     return images
 
 
+def _normalize_table_cells(text: str) -> set[str]:
+    """Нормализованные ячейки Markdown-таблицы как set строк.
+
+    Нормализация (ТЗ: привязка по содержимому):
+      - сжать пробелы, снять `*_$\\`, регистр в lower;
+      - отбросить ячейки длиной <=1 и ячейки-разделители (---, :---:).
+    """
+    cells: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        for part in stripped.strip("|").split("|"):
+            cell = re.sub(r"\s+", " ", part).strip()
+            cell = re.sub(r"[*_$\\]", "", cell)
+            if re.fullmatch(r":?-{2,}:?", cell):
+                continue
+            cell = cell.lower()
+            if len(cell) > 1:
+                cells.add(cell)
+    return cells
+
+
+# Порог уверенной привязки по содержимому (Jaccard). Подобран на СП 89:
+# правильные пары дают 0.13–1.00 (слияния таблиц снижают оценку), чужие — < 0.10.
+_TABLE_CONTENT_MATCH_THRESHOLD = 0.10
+
+
+def _match_table_by_content(
+    md_block: str,
+    crop_texts: dict[str, set[str]],
+    exclude: set[str] | None = None,
+) -> tuple[str | None, float, float]:
+    """Подобрать OCR-вырезку для Markdown-таблицы по содержимому ячеек.
+
+    Метрика — Jaccard над нормализованными наборами ячеек (см.
+    _normalize_table_cells). Берётся вырезка с максимальным пересечением;
+    привязка считается уверенной при score >= _TABLE_CONTENT_MATCH_THRESHOLD.
+
+    Args:
+        md_block: Markdown-блок таблицы.
+        crop_texts: {filename: set(ячеек)} — OCR-вырезки tmp/table_N.md.
+        exclude: Имена вырезок, уже привязанных к другим таблицам.
+
+    Returns:
+        (filename | None, best_score, second_score)
+    """
+    md_cells = _normalize_table_cells(md_block)
+    if not md_cells:
+        return None, 0.0, 0.0
+    exclude = exclude or set()
+    best_name: str | None = None
+    best_score = 0.0
+    second_score = 0.0
+    for name, crop_cells in crop_texts.items():
+        if name in exclude:
+            continue
+        if not crop_cells:
+            continue
+        inter = len(md_cells.intersection(crop_cells))
+        union = len(md_cells.union(crop_cells))
+        score = inter / union if union else 0.0
+        if score > best_score:
+            second_score = best_score
+            best_score = score
+            best_name = name
+        elif score > second_score:
+            second_score = score
+    if best_name is not None and best_score >= _TABLE_CONTENT_MATCH_THRESHOLD:
+        return best_name, best_score, second_score
+    return None, best_score, second_score
+
+
+def _load_table_image_map(tmp_dir: str | Path | None) -> dict[str, str]:
+    """Загрузить карту id → path из tmp/<file_stem>/table_images.json.
+
+    Карта создаётся extract_table_images() и персистится в process_file(),
+    чтобы --rag работал и при повторном запуске без OCR.
+    """
+    if not tmp_dir:
+        return {}
+    p = Path(tmp_dir) / "table_images.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {
+                item["id"]: item["path"]
+                for item in data
+                if item.get("id") and item.get("path")
+            }
+    except Exception as e:
+        log.warning(f"  Не удалось прочитать карту таблиц {p}: {e}")
+    return {}
+
+
+def _load_table_crop_texts(tmp_dir: str | Path | None) -> dict[str, set[str]]:
+    """Загрузить OCR-вырезки tmp/table_N.md как {filename: set(ячеек)}.
+
+    Первая строка ID-маркера (<!-- t_pN_M -->) отбрасывается; имя файла
+    table_N.md → table_N.png — то самое имя, что в карте extract_table_images().
+    """
+    result: dict[str, set[str]] = {}
+    if not tmp_dir:
+        return result
+    tmp_dir_path = Path(tmp_dir)
+    if not tmp_dir_path.is_dir():
+        return result
+    for f in sorted(tmp_dir_path.glob("table_*.md")):
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        text = re.sub(r"^<!--\s*t_p\d+_\d+\s*-->\s*\n?", "", text)
+        cells = _normalize_table_cells(text)
+        if cells:
+            result[f.name[:-3] + ".png"] = cells
+    return result
+
+
+def _bind_tables_by_content(tables: list[dict], crop_texts: dict[str, set[str]]) -> None:
+    """Привязать таблицы без маркера к OCR-вырезкам по содержимому (in-place).
+
+    Мутирует tables: заполняет image_path и _image_source ("content").
+    Каждая вырезка привязывается максимум к одной таблице.
+    """
+    used = {Path(t["image_path"]).name for t in tables if t.get("image_path")}
+    for table in tables:
+        if table.get("image_path"):
+            continue
+        block = table.get("_md_block", "")
+        name, score, second = _match_table_by_content(block, crop_texts, used)
+        if name is not None:
+            table["image_path"] = f"image/{name}"
+            table["_image_source"] = "content"
+            used.add(name)
+            if score - second < 0.05:
+                log.warning(
+                    f"  Слабая уверенность привязки {table['asset_id']} "
+                    f"«{table.get('caption') or ''}» → {name} "
+                    f"(Jaccard {score:.2f}, второй кандидат {second:.2f})"
+                )
+        else:
+            log.warning(
+                f"  Без image_path: {table['asset_id']} "
+                f"«{table.get('caption') or ''}» (Jaccard {score:.2f})"
+            )
+
+
 def _build_asset_registry(
     md_text: str,
     doc_slug: str,
@@ -4201,16 +4411,25 @@ def _build_asset_registry(
     document_id: str | None = None,
     document_type: str | None = None,
     domain: str | None = None,
+    tmp_dir: str | Path | None = None,
 ) -> dict:
     """Построить реестр активов rag_assets.json.
 
     Регистрирует таблицы и изображения из итогового Markdown.
     Пути image_path — относительные к директории .md (image/).
 
+    Привязка таблиц к картинкам (ADR-010d + ТЗ t_0ace7f4f):
+      1. По ID-маркеру <!-- t_pN_M --> перед таблицей и карте id → path
+         (tmp/<file_stem>/table_images.json);
+      2. Иначе по содержимому ячеек с OCR-вырезками tmp/table_N.md (Jaccard);
+      3. Иначе image_path: null + log.warning (неверная картинка хуже отсутствующей).
+
     Если img_dir передан и файл изображения не существует — актив
     пропускается с log.warning (архитектура §9 error handling).
     """
-    tables = _extract_tables_from_md(md_text)
+    table_image_map = _load_table_image_map(tmp_dir) if tmp_dir else {}
+    crop_texts = _load_table_crop_texts(tmp_dir) if tmp_dir else {}
+    tables = _extract_tables_from_md(md_text, table_image_map=table_image_map)
     images = _extract_images_from_md(md_text)
 
     for i, table in enumerate(tables, 1):
@@ -4233,14 +4452,48 @@ def _build_asset_registry(
             "assets": {"tables": [], "images": []},
         }
 
+    # Привязка по содержимому для таблиц без маркера (AI мог снять маркер
+    # или таблица появилась при слиянии)
+    _bind_tables_by_content(tables, crop_texts)
+
+    # Валидация: сводка привязок + дубликаты подписей
+    n_marker = sum(1 for t in tables if t.get("_image_source") == "marker")
+    n_content = sum(1 for t in tables if t.get("_image_source") == "content")
+    n_unbound = sum(1 for t in tables if not t.get("image_path"))
+    log.info(
+        f"  Таблицы: MD={len(tables)}, OCR-вырезок={len(crop_texts)}, "
+        f"привязано по маркеру={n_marker}, по содержимому={n_content}, "
+        f"без привязки={n_unbound}"
+    )
+    if len(tables) != len(crop_texts):
+        log.warning(
+            f"  Число MD-таблиц ({len(tables)}) ≠ OCR-вырезок ({len(crop_texts)}) "
+            f"— при слиянии таблиц это норма"
+        )
+    seen_captions: dict[str, str] = {}
+    for table in tables:
+        cap = (table.get("caption") or "").strip()
+        if cap:
+            if cap in seen_captions:
+                log.warning(
+                    f"  Дубликат подписи «{cap}»: "
+                    f"{seen_captions[cap]} и {table['asset_id']}"
+                )
+            else:
+                seen_captions[cap] = table["asset_id"]
+
     kept_tables = []
     for table in tables:
-        if (img_dir_path / Path(table["image_path"]).name).exists():
+        ip = table.get("image_path")
+        if ip is None:
+            # Валидный актив без картинки (неверная картинка хуже отсутствующей)
+            kept_tables.append(table)
+        elif (img_dir_path / Path(ip).name).exists():
             kept_tables.append(table)
         else:
             log.warning(
                 f"  Пропускаю asset {table['asset_id']}: "
-                f"{table['image_path']} не существует"
+                f"{ip} не существует"
             )
     tables = kept_tables
 
@@ -4308,8 +4561,23 @@ def write_rag_assets(assets: dict, output_path: str | Path) -> None:
     out = json.loads(json.dumps(assets, ensure_ascii=False))  # глубокое копирование
     for table in out["assets"]["tables"]:
         table.pop("_md_block", None)
+        table.pop("_image_source", None)
     content = json.dumps(out, ensure_ascii=False, indent=2)
     safe_write(output_path, content)
+
+
+def _derive_tmp_dir(out_dir: str | Path, file_stem: str) -> Path | None:
+    """Вывести tmp/<file_stem> из out_dir вида <source>/Markdown/<file_stem>.
+
+    Используется для загрузки карты таблиц (table_images.json) и OCR-вырезок
+    (table_N.md) при сборке реестра активов — в т.ч. в режиме --rag без OCR.
+    """
+    out = Path(out_dir)
+    try:
+        return out.parents[1] / "tmp" / file_stem
+    except IndexError:
+        return None
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4419,9 +4687,11 @@ def run_rag_pipeline(
     document_id = doc_cfg.get("document_id")
     document_type = doc_cfg.get("document_type")
     domain = doc_cfg.get("domain")
+    tmp_dir = _derive_tmp_dir(out_dir, file_stem)
     assets = _build_asset_registry(
         md_text, doc_key, img_dir,
         document_id=document_id, document_type=document_type, domain=domain,
+        tmp_dir=tmp_dir,
     )
     _link_assets_to_chunks(assets, chunks)
 
@@ -4634,6 +4904,22 @@ def process_file(
             log.info("Вырезание таблиц из PDF:")
             table_images = extract_table_images(pdf_path, pages, img_dir)
             log.info(f"  Вырезано таблиц: {len(table_images)}")
+
+            # Персистим карту id → path (tmp/<file_stem>/table_images.json),
+            # чтобы --rag привязывал image_path и при повторном запуске без OCR
+            try:
+                map_payload = [
+                    {"id": ti.get("id"), "path": ti.get("path"),
+                     "page": ti.get("page"), "table_idx": ti.get("table_idx")}
+                    for ti in table_images
+                    if ti.get("id") and ti.get("path")
+                ]
+                safe_write(
+                    file_tmp_dir / "table_images.json",
+                    json.dumps(map_payload, ensure_ascii=False, indent=2),
+                )
+            except Exception as e:
+                log.warning(f"  Не удалось сохранить карту таблиц: {e}")
 
             # Vision/AI-распознавание таблиц — только с --ai
             if use_ai and table_images:

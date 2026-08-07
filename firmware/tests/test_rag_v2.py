@@ -585,7 +585,9 @@ class TestAssetRegistry:
         assert "Таблица 3.1" in t["caption"]
         assert t["md_lines"] == [8, 12]  # start..end (0-индексированные строки)
         assert t["row_count"] == 2
-        assert t["image_path"] == "image/table_1.png"
+        # Позиционный счётчик больше НЕ источник image_path: без маркера/карты — None
+        assert t["image_path"] is None
+        assert t["_image_source"] is None
         assert t["_md_block"].startswith("| Параметр")
 
     def test_extract_tables_from_md_no_caption(self):
@@ -593,6 +595,194 @@ class TestAssetRegistry:
         tables = pipeline._extract_tables_from_md(md)
         assert len(tables) == 1
         assert tables[0]["caption"] == ""
+
+    def test_extract_tables_from_md_marker_binding(self):
+        """ID-маркер перед таблицей + карта id→path → image_path из карты."""
+        md = (
+            "Текст до.\n\n"
+            "<!-- t_p1_0 -->\n"
+            "*Таблица 1*\n\n"
+            "| A | B |\n"
+            "|---|---|\n"
+            "| 1 | 2 |\n"
+        )
+        tables = pipeline._extract_tables_from_md(
+            md, table_image_map={"t_p1_0": "table_3.png"},
+        )
+        assert len(tables) == 1
+        assert tables[0]["image_path"] == "image/table_3.png"
+        assert tables[0]["_image_source"] == "marker"
+
+    def test_extract_tables_from_md_marker_unknown_id(self):
+        """Маркер есть, но id нет в карте → image_path None (фолбэк по содержимому)."""
+        md = (
+            "<!-- t_p9_7 -->\n"
+            "| A |\n"
+            "|---|\n"
+            "| 1 |\n"
+        )
+        tables = pipeline._extract_tables_from_md(
+            md, table_image_map={"t_p1_0": "table_3.png"},
+        )
+        assert len(tables) == 1
+        assert tables[0]["image_path"] is None
+
+    def test_find_caption_refuses_foreign_below_caption(self):
+        """Подпись ниже начала таблицы (принадлежит следующей) не переиспользуется.
+
+        Регрессия СП89: table/5 без подписи получала «Таблица Г.2» — подпись
+        table/6, расположенную ниже строки начала table/5.
+        """
+        md = (
+            "| Условный диаметр паропровода | 100 - 125 |\n"
+            "|---|---|\n"
+            "| Условный диаметр кармана | 50 |\n"
+            "\n"
+            "В миллиметрах\n"
+            "\n"
+            "*Таблица Г.2*\n"
+            "\n"
+            "| Условный диаметр паропровода | До 70 включ. |\n"
+            "|---|---|\n"
+            "| Условный диаметр штуцера | 25 |\n"
+        )
+        tables = pipeline._extract_tables_from_md(md)
+        assert len(tables) == 2
+        # Первая таблица подписи не имеет и чужую не подтягивает
+        assert tables[0]["caption"] == ""
+        # Вторая таблица получает свою подпись
+        assert tables[1]["caption"] == "Таблица Г.2"
+
+    def test_find_caption_does_not_reuse_claimed_caption(self):
+        """Подпись, привязанная к одной таблице, не привязывается к другой."""
+        md = (
+            "| A |\n"
+            "|---|\n"
+            "| 1 |\n"
+            "\n"
+            "*Таблица 1*\n"
+            "\n"
+            "| B |\n"
+            "|---|\n"
+            "| 2 |\n"
+        )
+        tables = pipeline._extract_tables_from_md(md)
+        assert len(tables) == 2
+        # Подпись сразу под первой таблицей — её; вторая остаётся без подписи
+        assert tables[0]["caption"] == "Таблица 1"
+        assert tables[1]["caption"] == ""
+
+    def test_normalize_table_cells(self):
+        text = (
+            "| A  B | x |\n"
+            "|---|---|\n"
+            "| *T*_1$ | --- |\n"
+            "| а |\n"
+        )
+        cells = pipeline._normalize_table_cells(text)
+        assert "a b" in cells  # пробелы сжаты, регистр lower
+        assert "t1" in cells   # сняты *_$
+        assert "---" not in cells  # разделители отброшены
+        assert "а" not in cells    # длина <=1 отброшена
+
+    def test_match_table_by_content(self):
+        md_block = "| X | Y |\n|---|---|\n| Alpha | 1 |\n| Beta | 2 |\n"
+        crops = {
+            "table_4.png": pipeline._normalize_table_cells(
+                "| Alpha | 1 |\n| Beta | 2 |\n"
+            ),
+            "table_5.png": pipeline._normalize_table_cells(
+                "| Gamma | 9 |\n"
+            ),
+        }
+        name, score, _ = pipeline._match_table_by_content(md_block, crops)
+        assert name == "table_4.png"
+        assert score >= pipeline._TABLE_CONTENT_MATCH_THRESHOLD
+
+    def test_match_table_by_content_no_match(self):
+        md_block = "| X | Y |\n|---|---|\n| Alpha | 1 |\n"
+        crops = {"table_5.png": pipeline._normalize_table_cells("| Gamma | 9 |\n")}
+        name, _, _ = pipeline._match_table_by_content(md_block, crops)
+        assert name is None
+
+    def test_build_asset_registry_content_binding(self, tmp_path):
+        """--rag без маркеров в MD: привязка по содержимому через tmp_dir.
+
+        tmp/<stem>/table_images.json + table_N.md — карта и OCR-вырезки.
+        """
+        img_dir = tmp_path / "Markdown" / "doc" / "image"
+        img_dir.mkdir(parents=True)
+        for n in ("table_3", "table_5"):
+            (img_dir / f"{n}.png").write_bytes(b"png")
+        tmp_dir = tmp_path / "tmp" / "doc"
+        tmp_dir.mkdir(parents=True)
+        (tmp_dir / "table_images.json").write_text(
+            json.dumps([
+                {"id": "t_p1_0", "path": "table_3.png", "page": 0, "table_idx": 3},
+                {"id": "t_p1_1", "path": "table_5.png", "page": 0, "table_idx": 5},
+            ]),
+            encoding="utf-8",
+        )
+        # OCR-вырезки: первая строка — ID-маркер (как в recognize_tables_vision)
+        (tmp_dir / "table_3.md").write_text(
+            "<!-- t_p1_0 -->\n| Alpha | 1 |\n| Beta | 2 |\n", encoding="utf-8")
+        (tmp_dir / "table_5.md").write_text(
+            "<!-- t_p1_1 -->\n| Gamma | 9 |\n", encoding="utf-8")
+
+        md = (
+            "## 3. ЗАЩИТА\n"
+            "\n"
+            "Текст.\n"
+            "\n"
+            "| X | Y |\n"
+            "|---|---|\n"
+            "| Alpha | 1 |\n"
+            "| Beta | 2 |\n"
+        )
+        assets = pipeline._build_asset_registry(
+            md, "doc", img_dir, tmp_dir=tmp_dir,
+        )
+        tables = assets["assets"]["tables"]
+        assert len(tables) == 1
+        assert tables[0]["image_path"] == "image/table_3.png"
+        assert tables[0]["_image_source"] == "content"
+
+    def test_build_asset_registry_marker_preferred_over_content(self, tmp_path):
+        """Маркер в MD имеет приоритет над привязкой по содержимому."""
+        img_dir = tmp_path / "Markdown" / "doc" / "image"
+        img_dir.mkdir(parents=True)
+        (img_dir / "table_3.png").write_bytes(b"png")
+        (img_dir / "table_5.png").write_bytes(b"png")
+        tmp_dir = tmp_path / "tmp" / "doc"
+        tmp_dir.mkdir(parents=True)
+        (tmp_dir / "table_images.json").write_text(
+            json.dumps([
+                {"id": "t_p1_0", "path": "table_3.png", "page": 0, "table_idx": 3},
+                {"id": "t_p1_1", "path": "table_5.png", "page": 0, "table_idx": 5},
+            ]),
+            encoding="utf-8",
+        )
+        (tmp_dir / "table_3.md").write_text(
+            "<!-- t_p1_0 -->\n| Alpha | 1 |\n", encoding="utf-8")
+        (tmp_dir / "table_5.md").write_text(
+            "<!-- t_p1_1 -->\n| Gamma | 9 |\n", encoding="utf-8")
+
+        md = (
+            "<!-- t_p1_1 -->\n"
+            "*Таблица 1*\n\n"
+            "| X | Y |\n"
+            "|---|---|\n"
+            "| Alpha | 1 |\n"
+        )
+        assets = pipeline._build_asset_registry(
+            md, "doc", img_dir, tmp_dir=tmp_dir,
+        )
+        tables = assets["assets"]["tables"]
+        assert len(tables) == 1
+        # Маркер t_p1_1 → table_5.png, несмотря на содержимое (table_3 ближе)
+        assert tables[0]["image_path"] == "image/table_5.png"
+        assert tables[0]["_image_source"] == "marker"
+
 
     def test_extract_images_from_md(self):
         images = pipeline._extract_images_from_md(ASSET_MD)
@@ -661,6 +851,7 @@ class TestAssetRegistry:
         pipeline.write_rag_assets(assets, out)
         data = json.loads(out.read_text(encoding="utf-8"))
         assert "_md_block" not in data["assets"]["tables"][0]
+        assert "_image_source" not in data["assets"]["tables"][0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -869,6 +1060,41 @@ class TestProcessFileTableExtraction:
         eti.assert_called_once()
         # Vision НЕ запускалась без --ai
         rtv.assert_not_called()
+
+    def test_pdf_persists_table_image_map(self, tmp_path):
+        """После вырезки таблиц карта id→path сохраняется в tmp/<stem>/."""
+        pdf = tmp_path / "СО153-34_21_122-2003 Молниезащита.pdf"
+        pdf.write_bytes(b"%PDF-1.4 fake")
+        md = "## 3. ЗАЩИТА\nТекст.\n"
+        table_images = [
+            {"page": 0, "table_idx": 3, "path": "table_3.png", "id": "t_p1_0"},
+            {"page": 0, "table_idx": 5, "path": "table_5.png", "id": "t_p1_1"},
+        ]
+        with patch("pipeline.send_to_yandex_ocr", return_value=self._pages()), \
+             patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
+             patch("pipeline.extract_images_from_pdf", return_value=[]), \
+             patch("pipeline.extract_table_images", return_value=table_images), \
+             patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+            ok = pipeline.process_file(
+                str(pdf), use_ai=False, config={},
+                api_key="key", folder_id="folder",
+                output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
+            )
+        assert ok is True
+        map_path = tmp_path / "tmp" / "СО153-34_21_122-2003 Молниезащита" / "table_images.json"
+        assert map_path.exists()
+        data = json.loads(map_path.read_text(encoding="utf-8"))
+        assert data == table_images
+
+    def test_derive_tmp_dir(self):
+        assert pipeline._derive_tmp_dir(
+            "/x/Markdown/doc", "doc",
+        ) == Path("/x/tmp/doc")
+        assert pipeline._derive_tmp_dir(
+            Path("/x/Markdown/doc"), "doc",
+        ) == Path("/x/tmp/doc")
+        # Короткий путь без двух уровней родителей — None
+        assert pipeline._derive_tmp_dir(Path("/x"), "doc") is None
 
     def test_pdf_with_ai_triggers_vision_additionally(self, tmp_path):
         """PDF с --ai: вырезка таблиц + vision-распознавание."""
