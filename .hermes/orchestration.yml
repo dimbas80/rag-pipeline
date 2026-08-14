@@ -1,585 +1,307 @@
 # Project-level orchestration policy for software projects.
-
 #
-
-# IMPORTANT:
-
-# This file is project-level orchestration metadata.
-
-# It is NOT a replacement for Hermes ~/.hermes/config.yaml.
-
-#
-
-# The Hermes Kanban dispatcher does not use this file as a direct
-
-# profile-routing configuration.
-
-#
-
-# The Orchestrator reads this file and creates Kanban tasks with
-
-# explicit profile assignments.
+# This file is project-level orchestration metadata, read by the
+# Orchestrator. It is NOT a replacement for Hermes ~/.hermes/config.yaml,
+# and the Kanban dispatcher does not use it as direct profile-routing
+# configuration. The Orchestrator reads this file and creates Kanban
+# tasks with explicit profile assignments.
 
 version: 1
 
 # ============================================================
-
 # Project
-
 # ============================================================
-
 project:
-name: Create_Markdown_YA
-board: Create_Markdown_YA
+  name: Create_Markdown_YA
+  board: create_markdown_ya
 
 # ============================================================
+# Kanban board policy
+# ============================================================
+kanban:
+  board:
+    rule: >
+      Before creating any task, the Orchestrator MUST resolve the
+      project's Kanban board as follows:
 
+      1. Derive the board slug from the project name: lowercase, replace
+         spaces and hyphens with underscores.
+
+      2. List existing boards (`hermes kanban boards list`). Check the
+         COUNTS column to distinguish the real board from empty
+         hyphenated lookalikes.
+
+      3. If a board with that slug exists and is non-empty (or is the
+         project's canonical board) — switch to it and create ALL tasks
+         there.
+
+      4. If it does not exist — create a board with that slug, then
+         switch to it and create ALL tasks there.
+
+      5. NEVER create project tasks on the `default` board.
+
+      Every kanban_create / kanban_show / kanban_list call must pass
+      board=<slug> explicitly.
+    examples:
+      - create_markdown_ya
+      - build_search_index
+
+# ============================================================
 # Workflow
-
 # ============================================================
-
 workflow:
-
-# User communicates primarily with the Orchestrator.
-
-entry_profile: orchestrator
-
-stages:
-- discovery
-- specification
-- architecture
-- implementation
-- review
-- integration
-- merge
+  entry_profile: orchestrator
+  stages:
+    - discovery
+    - specification
+    - architecture
+    - implementation
+    - review
+    - integration
+    - merge
 
 # ============================================================
-
 # Profiles
-
 # ============================================================
-
 profiles:
-
-orchestrator:
-role: system_engineer
-
-architect:
-role: software_architect
-
-coder:
-role: software_developer
-
-reviewer:
-role: independent_software_reviewer
+  orchestrator:
+    role: system_engineer
+  architect:
+    role: software_architect
+  coder:
+    role: software_developer
+  reviewer:
+    role: independent_software_reviewer
 
 # ============================================================
-
 # Profile routing policy
-
-#
-
-# This section describes the intended workflow.
-
-# Actual Kanban task assignment is performed by the Orchestrator.
-
 # ============================================================
-
 routing:
-
-DISCOVERY: orchestrator
-
-SPECIFICATION: orchestrator
-
-ARCHITECTURE: architect
-
-IMPLEMENTATION: coder
-
-REVIEW: reviewer
-
-REVIEW_DECISION: orchestrator
-
-INTEGRATION: orchestrator
-
-MERGE: orchestrator
+  DISCOVERY: orchestrator
+  SPECIFICATION: orchestrator
+  ARCHITECTURE: architect
+  IMPLEMENTATION: coder
+  REVIEW: reviewer
+  REVIEW_DECISION: orchestrator
+  INTEGRATION: orchestrator
+  MERGE: orchestrator
 
 # ============================================================
-
 # Workflow policy
-
 # ============================================================
-
 policy:
-
-# Maximum number of rework cycles after review.
-
-max_rework_iterations: 3
-
-# Never merge automatically.
-
-auto_merge: false
-
-# Never push changes automatically.
-
-auto_push: false
-
-# Architecture must be approved before implementation.
-
-architecture_before_implementation: true
-
-# Review is mandatory before release.
-
-review_before_release: true
-
-# Coder must implement the approved architecture.
-
-coder_must_use_approved_architecture: true
-
-# Reviewer must perform an independent review.
-
-reviewer_must_review_independently: true
+  max_rework_iterations: 3
+  auto_merge: false
+  auto_push: false
+  architecture_before_implementation: true
+  review_before_release: true
+  coder_must_use_approved_architecture: true
+  reviewer_must_review_independently: true
 
 # ============================================================
-
 # Repository structure policy
-
 # ============================================================
-
 repository:
+  working_root: repository_root
 
-# Project repository root is the working directory.
+  source_code:
+    rule: place_all_production_files_in_firmware_src
+    description: >
+      All production files created for this project MUST be placed in
+      firmware/src/ — regardless of file type (HTML, source code,
+      configuration, etc.). Do not place production files in the
+      repository root. The Coder must follow this rule when creating any
+      new file.
+    path: firmware/src/
 
-working_root: repository_root
+  tests:
+    rule: follow_existing_project_structure
+    examples:
+      - tests/
+      - test/
+      - spec/
 
-# ----------------------------------------------------------
+  workflows:
+    purpose: orchestration_artifacts_only
+    allowed:
+      - task.md
+      - state.md
+      - implementation-report.md
+      - review.md
+    forbidden:
+      - production_source_code
+      - application_code
+      - production_tests
+      - application_configuration
+    rule: >
+      The workflows/ directory is reserved for task-specific
+      orchestration artifacts. Coder MUST NOT place production code or
+      application tests in workflows/.
 
-# Production source code
+  new_directories:
+    rule: >
+      Before creating a new source directory, inspect the existing
+      repository structure and follow established project conventions.
 
-# ----------------------------------------------------------
-
-source_code:
-
-```
-rule: place_all_production_files_in_firmware_src
-
-description: >
-  All production files created for this project MUST be placed in
-  firmware/src/ — regardless of file type (HTML, source code,
-  configuration, etc.).
-
-  Do not place production files in the repository root.
-
-  The Coder must follow this rule when creating any new file.
-
-path: firmware/src/
-```
-
-# ----------------------------------------------------------
-
-# Tests
-
-# ----------------------------------------------------------
-
-tests:
-
-```
-rule: follow_existing_project_structure
-
-examples:
-  - tests/
-  - test/
-  - spec/
-```
-
-# ----------------------------------------------------------
-
-# Workflows
-
-# ----------------------------------------------------------
-
-workflows:
-
-```
-purpose: orchestration_artifacts_only
-
-allowed:
-  - task.md
-  - state.md
-  - implementation-report.md
-  - review.md
-
-forbidden:
-  - production_source_code
-  - application_code
-  - production_tests
-  - application_configuration
-
-rule: >
-  The workflows/ directory is reserved for task-specific
-  orchestration artifacts.
-
-  Coder MUST NOT place production code or application tests
-  in workflows/.
-```
-
-# ----------------------------------------------------------
-
-# New directories
-
-# ----------------------------------------------------------
-
-new_directories:
-
-```
-rule: >
-  Before creating a new source directory, inspect the existing
-  repository structure and follow established project conventions.
-```
-
-src_directory:
-
-```
-required: false
-
-rule: >
-  Do not create src/ merely because it appears in an example.
-  Use src/ only when the project already uses it or when the
-  approved architecture explicitly defines it.
-```
+  src_directory:
+    required: false
+    rule: >
+      Do not create src/ merely because it appears in an example.
+      Use src/ only when the project already uses it or when the
+      approved architecture explicitly defines it.
 
 # ============================================================
-
 # Context policy
-
 # ============================================================
-
 context:
+  orchestrator:
+    required:
+      - project_requirements
+      - project_structure
+    optional:
+      - docs/product/product-spec.md
+      - docs/product/requirements.md
+      - docs/product/user-stories.md
+      - docs/product/decision-log.md
+      - docs/architecture/
+      - workflows/{task_id}/
 
-# ----------------------------------------------------------
+  architecture:
+    required:
+      - docs/product/requirements.md
+    optional:
+      - docs/product/product-spec.md
+      - docs/product/user-stories.md
+      - docs/product/decision-log.md
+      - existing_source_code
+      - existing_tests
 
-# Orchestrator
+  implementation:
+    required:
+      - docs/product/requirements.md
+      - docs/architecture/architecture.md
+      - docs/architecture/implementation-plan.md
+    optional:
+      - repository_source
+      - repository_tests
+      - workflows/{task_id}/task.md
+      - workflows/{task_id}/state.md
 
-# ----------------------------------------------------------
-
-orchestrator:
-
-```
-required:
-  - project_requirements
-  - project_structure
-
-optional:
-  - docs/product/product-spec.md
-  - docs/product/requirements.md
-  - docs/product/user-stories.md
-  - docs/product/decision-log.md
-  - docs/architecture/
-  - workflows/{task_id}/
-```
-
-# ----------------------------------------------------------
-
-# Architect
-
-# ----------------------------------------------------------
-
-architecture:
-
-```
-required:
-  - docs/product/requirements.md
-
-optional:
-  - docs/product/product-spec.md
-  - docs/product/user-stories.md
-  - docs/product/decision-log.md
-  - existing_source_code
-  - existing_tests
-```
-
-# ----------------------------------------------------------
-
-# Coder
-
-# ----------------------------------------------------------
-
-implementation:
-
-```
-required:
-  - docs/product/requirements.md
-  - docs/architecture/architecture.md
-  - docs/architecture/implementation-plan.md
-
-optional:
-  - repository_source
-  - repository_tests
-  - workflows/{task_id}/task.md
-  - workflows/{task_id}/state.md
-```
-
-# ----------------------------------------------------------
-
-# Reviewer
-
-# ----------------------------------------------------------
-
-review:
-
-```
-required:
-  - repository_diff
-  - repository_tests
-  - docs/product/requirements.md
-  - docs/architecture/architecture.md
-
-optional:
-  - docs/architecture/implementation-plan.md
-  - workflows/{task_id}/implementation-report.md
-```
+  review:
+    required:
+      - repository_diff
+      - repository_tests
+      - docs/product/requirements.md
+      - docs/architecture/architecture.md
+    optional:
+      - docs/architecture/implementation-plan.md
+      - workflows/{task_id}/implementation-report.md
 
 # ============================================================
-
 # Artifact policy
-
 # ============================================================
-
 artifacts:
+  product:
+    root: docs/product
+    files:
+      - product-spec.md
+      - requirements.md
+      - user-stories.md
+      - decision-log.md
 
-# ----------------------------------------------------------
+  architecture:
+    root: docs/architecture
+    files:
+      - architecture.md
+      - implementation-plan.md
+    optional:
+      - adr/
 
-# Product and requirements
-
-# ----------------------------------------------------------
-
-product:
-
-```
-root: docs/product
-
-files:
-  - product-spec.md
-  - requirements.md
-  - user-stories.md
-  - decision-log.md
-```
-
-# ----------------------------------------------------------
-
-# Software architecture
-
-# ----------------------------------------------------------
-
-architecture:
-
-```
-root: docs/architecture
-
-files:
-  - architecture.md
-  - implementation-plan.md
-
-optional:
-  - adr/
-```
-
-# ----------------------------------------------------------
-
-# Workflow artifacts
-
-# ----------------------------------------------------------
-
-workflow:
-
-```
-root: workflows/{task_id}
-
-files:
-  - task.md
-  - state.md
-  - implementation-report.md
-  - review.md
-
-rule: >
-  Workflow artifacts describe the execution of a task.
-
-  They are not a substitute for source code, tests,
-  application configuration, or other project files.
-```
+  workflow:
+    root: workflows/{task_id}
+    files:
+      - task.md
+      - state.md
+      - implementation-report.md
+      - review.md
+    rule: >
+      Workflow artifacts describe the execution of a task. They are not a
+      substitute for source code, tests, application configuration, or
+      other project files.
 
 # ============================================================
-
 # Handoff policy
-
 # ============================================================
-
 handoffs:
+  orchestrator_to_architect:
+    required:
+      - docs/product/product-spec.md
+      - docs/product/requirements.md
+      - docs/product/user-stories.md
+    optional:
+      - docs/product/decision-log.md
 
-# ----------------------------------------------------------
+  architect_to_coder:
+    required:
+      - docs/product/requirements.md
+      - docs/architecture/architecture.md
+      - docs/architecture/implementation-plan.md
 
-# Orchestrator → Architect
+  coder_to_reviewer:
+    required:
+      - workflows/{task_id}/implementation-report.md
+      - repository_diff
+      - repository_tests
 
-# ----------------------------------------------------------
-
-orchestrator_to_architect:
-
-```
-required:
-  - docs/product/product-spec.md
-  - docs/product/requirements.md
-  - docs/product/user-stories.md
-
-optional:
-  - docs/product/decision-log.md
-```
-
-# ----------------------------------------------------------
-
-# Architect → Coder
-
-# ----------------------------------------------------------
-
-architect_to_coder:
-
-```
-required:
-  - docs/product/requirements.md
-  - docs/architecture/architecture.md
-  - docs/architecture/implementation-plan.md
-```
-
-# ----------------------------------------------------------
-
-# Coder → Reviewer
-
-# ----------------------------------------------------------
-
-coder_to_reviewer:
-
-```
-required:
-  - workflows/{task_id}/implementation-report.md
-  - repository_diff
-  - repository_tests
-```
-
-# ----------------------------------------------------------
-
-# Reviewer → Orchestrator
-
-# ----------------------------------------------------------
-
-reviewer_to_orchestrator:
-
-```
-required:
-  - workflows/{task_id}/review.md
-```
+  reviewer_to_orchestrator:
+    required:
+      - workflows/{task_id}/review.md
 
 # ============================================================
-
 # Rework policy
-
 # ============================================================
-
 rework:
+  max_iterations: 3
 
-max_iterations: 3
+  on_changes_requested:
+    default_assign_to: coder
+    required_context:
+      - workflows/{task_id}/review.md
+      - repository_diff
+      - relevant_source_files
+      - relevant_tests
 
-# ----------------------------------------------------------
+  architecture_changes_requested:
+    assign_to: architect
+    required_context:
+      - workflows/{task_id}/review.md
+      - docs/architecture/architecture.md
+      - docs/architecture/implementation-plan.md
 
-# General implementation changes
+  requirement_changes_requested:
+    assign_to: orchestrator
+    required_context:
+      - workflows/{task_id}/review.md
+      - docs/product/requirements.md
+      - docs/product/decision-log.md
 
-# ----------------------------------------------------------
-
-on_changes_requested:
-
-```
-default_assign_to: coder
-
-required_context:
-  - workflows/{task_id}/review.md
-  - repository_diff
-  - relevant_source_files
-  - relevant_tests
-```
-
-# ----------------------------------------------------------
-
-# Architecture changes
-
-# ----------------------------------------------------------
-
-architecture_changes_requested:
-
-```
-assign_to: architect
-
-required_context:
-  - workflows/{task_id}/review.md
-  - docs/architecture/architecture.md
-  - docs/architecture/implementation-plan.md
-```
-
-# ----------------------------------------------------------
-
-# Requirements changes
-
-# ----------------------------------------------------------
-
-requirement_changes_requested:
-
-```
-assign_to: orchestrator
-
-required_context:
-  - workflows/{task_id}/review.md
-  - docs/product/requirements.md
-  - docs/product/decision-log.md
-```
-
-# ----------------------------------------------------------
-
-# Maximum iterations
-
-# ----------------------------------------------------------
-
-on_max_iterations:
-
-```
-transition_to: BLOCKED
-
-require_human_intervention: true
-```
+  on_max_iterations:
+    transition_to: BLOCKED
+    require_human_intervention: true
 
 # ============================================================
-
 # Safety policy
-
 # ============================================================
-
 safety:
+  auto_merge: false
+  auto_push: false
 
-# Never merge without explicit Orchestrator approval.
+  architecture_changes:
+    require_architect_review: true
 
-auto_merge: false
+  requirement_changes:
+    require_orchestrator_review: true
 
-# Never push without explicit approval.
-
-auto_push: false
-
-# Architecture changes require Architect review.
-
-architecture_changes:
-require_architect_review: true
-
-# Requirement changes require Orchestrator review.
-
-requirement_changes:
-require_orchestrator_review: true
-
-# Release requires successful independent review.
-
-release:
-require_reviewer_pass: true
-require_orchestrator_approval: true
+  release:
+    require_reviewer_pass: true
+    require_orchestrator_approval: true
