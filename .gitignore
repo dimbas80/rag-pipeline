@@ -1,4 +1,10 @@
 .worktrees/
 __pycache__/
+*.pyc
+*.log
+*.log.*
+bot.log*
 .env
+.pytest_cache/
+workflows/
 firmware/src/qdrant_data/
