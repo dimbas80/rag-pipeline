@@ -302,6 +302,18 @@ def main():
     else:
         print(f"Коллекция {args.collection} уже существует, добавляю точки.")
 
+    # Удаляем старые точки документа перед переиндексацией —
+    # upsert перезаписывает только при совпадении UUID, а он зависит от row_index,
+    # который может измениться при пересборке чанков.
+    doc_id = doc_meta.get("document_id")
+    if doc_id:
+        del_filter = models.Filter(
+            must=[models.FieldCondition(key="document_id", match=models.MatchValue(value=doc_id))]
+        )
+        del_result = client.delete(collection_name=args.collection, points_selector=del_filter)
+        if del_result.status == models.UpdateStatus.COMPLETED:
+            print(f"Старые точки документа {doc_id} удалены перед индексацией.")
+
     batches = range(0, len(chunks), args.batch_size)
     for start in tqdm(batches, desc="Индексация", unit="batch"):
         batch_chunks = chunks[start:start + args.batch_size]

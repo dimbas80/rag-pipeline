@@ -81,6 +81,16 @@ CITATION_PATTERN = re.compile(
     r"\[([А-ЯЁа-яёA-Za-z0-9\s.,/\-]+?)\s*[,;]\s*(?:п\.|пп\.|табл\.|таблица|ст\.|разд\.|прил\.)\s*[\d.]+\]"
 )
 
+# Гибкий вариант для матчинга цитат в _match_citations_to_chunks
+# (LLM не всегда ставит квадратные скобки, но формат «Документ, п. X.X.X» сохраняет)
+# Группа 1: document_id, группа 2: тип (п./табл./ст.), группа 3: номер
+# Номер: цифры + опционально кириллическая буква приложения (А-Я) + .цифры
+CITATION_MATCH_PATTERN = re.compile(
+    r"\[?([А-ЯЁа-яёA-Za-z0-9\s.,/\-]{3,}?)\s*[,;]\s*"
+    r"(п\.|пп\.|табл\.|таблица|таблицей|ст\.|разд\.|прил\.)\s*"
+    r"([А-ЯA-Z]?\.?\d+(?:\.\d+)*)\]?"
+)
+
 
 # ─── Состояние графа (раздел 3 архитектуры) ───────────────────────────
 
@@ -125,6 +135,11 @@ class QAGraphState(TypedDict):
     needs_clarification: str | None
     """Если не None — текст уточняющего вопроса для пользователя.
     Устанавливается узлом ask_clarification, очищается после ответа."""
+
+    cited_chunk_ids: list[str]
+    """Chunk ID, реально процитированные LLM в final_answer.
+    Вычисляются матчингом CITATION_PATTERN с search_results.
+    Используется bot.py для показа ТОЛЬКО релевантных картинок."""
 
     # ── Обработка ошибок ──
     error: str | None
@@ -448,20 +463,121 @@ def _format_search_results(results: list[dict]) -> str:
         score = r.get("score", 0.0)
         title = r.get("title") or doc_id
         text = str(r.get("text") or "").strip()
+        chunk_id = r.get("chunk_id", "")
 
         header = f"[{i}] {doc_id}"
         if section_path:
             header += f" | {section_path}"
         header += f" | score: {score}"
+
         lines = [header]
         heading = _heading_to_str(r.get("heading_texts"))
         if heading:
             lines.append(f"   {heading}")
         if text:
             lines.append(f"   {text}")
+
         lines.append(f"   (источник: {title})")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+# ─── Кэш ассетов для изображений ───────────────────────────────────────
+
+_assets_cache: dict[str, dict] = {}
+_doc_dirs: dict[str, str] = {}
+
+BASE_MARKDOWN = "/mnt/sdb/!База_ГОСТ/Markdown"
+
+
+def _load_assets(doc_id: str) -> dict | None:
+    """Загружает _assets.json для документа (с кэшированием)."""
+    if doc_id in _assets_cache:
+        return _assets_cache[doc_id]
+    for entry in os.listdir(BASE_MARKDOWN):
+        doc_dir = os.path.join(BASE_MARKDOWN, entry)
+        assets_path = os.path.join(doc_dir, f"{entry}_assets.json")
+        if not os.path.exists(assets_path):
+            continue
+        try:
+            with open(assets_path) as f:
+                assets = json.load(f)
+        except Exception:
+            continue
+        if assets.get("document_id") == doc_id:
+            _assets_cache[doc_id] = assets
+            _doc_dirs[doc_id] = doc_dir
+            return assets
+    _assets_cache[doc_id] = None
+    return None
+
+
+def _enrich_results_with_dirs(results: list[dict]) -> list[dict]:
+    """Добавляет поле doc_dir в каждый результат через кэш _load_assets.
+
+    doc_dir нужен для резолва относительных image_path из поля assets
+    в абсолютные пути файлов. Модифицирует список на месте.
+    """
+    for r in (results or []):
+        doc_id = r.get("document_id", "")
+        if not doc_id:
+            continue
+        _load_assets(doc_id)  # прогревает кэш
+        r["doc_dir"] = _doc_dirs.get(doc_id, "")
+    return results
+
+
+def _match_citations_to_chunks(answer: str, search_results: list[dict]) -> list[str]:
+    """Извлекает цитаты из ответа LLM и матчит с search_results.
+
+    Для «п./ст./разд.» — матчинг по document_id + номеру пункта.
+    Для «табл./таблица» — поиск чанка, содержащего таблицу с таким номером
+    (caption «Таблица X.Y» в _assets.json), а не матчинг по section_path.
+    Использует CITATION_MATCH_PATTERN — гибкий (скобки опциональны).
+    """
+    if not answer or not search_results:
+        return []
+
+    cited: set[str] = set()
+
+    for m in CITATION_MATCH_PATTERN.finditer(answer):
+        doc_ref = m.group(1).strip()   # "СО 153-34.21.122-2003"
+        ref_type = m.group(2)          # "п." или "табл." или "ст."
+        ref_num = m.group(3)           # "3.3.2.2" или "3.1"
+
+        # ── Таблицы: ищем чанк по caption в _assets.json ──
+        if ref_type.startswith("табл"):
+            assets = _load_assets(doc_ref)  # попробуем doc_ref как doc_id
+            if not assets:
+                # doc_ref мог быть не точным document_id — ищем по search_results
+                for r in search_results:
+                    if doc_ref.lower() in (r.get("document_id") or "").lower():
+                        assets = _load_assets(r["document_id"])
+                        break
+            if assets:
+                table_caption = f"Таблица {ref_num}"
+                for item in assets.get("assets", {}).get("tables", []):
+                    if item.get("caption") == table_caption:
+                        for cid in item.get("chunk_ids", []):
+                            cited.add(cid)
+                        break
+            continue
+
+        # ── Пункты/статьи/разделы: матчинг по section_path ──
+        for r in search_results:
+            r_doc_id = (r.get("document_id") or "").strip()
+            if doc_ref.lower() not in r_doc_id.lower() and r_doc_id.lower() not in doc_ref.lower():
+                continue
+            if ref_num:
+                r_clause = r.get("clause") or ""
+                r_section_path = r.get("section_path") or ""
+                if ref_num == r_clause or r_section_path.rstrip().endswith(ref_num):
+                    cited.add(r.get("chunk_id", ""))
+                    break
+            else:
+                cited.add(r.get("chunk_id", ""))
+                break
+
+    return [c for c in cited if c]
 
 
 # ─── Парсинг JSON из ответа LLM ───────────────────────────────────────
@@ -1016,19 +1132,24 @@ GENERATE_ANSWER_PROMPT = """Ты — эксперт по нормативным 
 
 ПРАВИЛА:
 1. Отвечай на русском языке.
-2. ВСЕГДА указывай источник в формате:
-   [Документ, пункт/таблица]
+2. ВСЕГДА указывай источник в КВАДРАТНЫХ СКОБКАХ в формате:
+   [Документ, п. НОМЕР] или [Документ, табл. НОМЕР]
    Примеры: [СП 89.13330.2016, п. 16.1], [ГОСТ 31996-2012, табл. 19]
-3. Если информация из нескольких документов — укажи каждый:
-   "Согласно СП 89 п. 16.1 ... по ГОСТ 31996 табл. 19 ..."
+   НЕ пиши «таблицей», «согласно пункту», «в соответствии с» — только [Документ, п./табл. N].
+3. Каждое утверждение должно заканчиваться ссылкой в скобках.
+   Правильно: «...расстояние не менее 100 мм [СП 89.13330.2016, п. 10.1.11].»
+   Неправильно: «...согласно СП 89.13330.2016, таблицей Д.1 установлено...»
 4. Если в результатах поиска нет ответа — честно скажи об этом
    и предложи переформулировать запрос.
 5. Не выдумывай информацию, которой нет в предоставленных фрагментах.
-7. Если для ответа нужен расчёт по формуле — напиши Python-код
-   в блоке ```python ... ```. Используй только стандартную библиотеку.
-   Вместо запятой в числах пиши точку: 1.2 а не 1,2.
-   Я исполню код и покажу результат пользователю.
-6. Будь краток, но точен.
+6. НЕ используй LaTeX-разметку ($...$, $$...$$, \\text, \\frac и т.д.).
+   Пиши формулы обычным текстом: h = r₀ / 1.2, мм², ≥, √.
+   Для индексов используй Unicode: x₁, r₀, U₀, h₀.
+   Для единиц: 30 Н/мм², а не $30\\text{ Н}/\\text{мм}^2$.
+7. Будь краток, но точен.
+8. НЕ добавляй в ответ теги [image: ...] — изображения прикрепляются
+   автоматически. Ты можешь сослаться на рисунок в тексте:
+   «...как показано на рис. 3.2», но путь к файлу не указывай.
 
 ВОПРОС: {query}
 
@@ -1062,6 +1183,7 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
       ```python-блоки исполняются, результат вставляется после блока кода.
     - Затем проверяется наличие цитат (has_citations); при отсутствии —
       однократная перегенерация с доп. инструкцией (max 1 доп. попытка).
+    - После успешной генерации: enrich doc_dir + матчинг цитат→cited_chunk_ids.
     - LLM недоступен → fallback-ответ + error (раздел 7.1).
     """
     cfg = _get_qa_config(config)
@@ -1070,7 +1192,10 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
 
     # Обработка пустых результатов (раздел 5.6): LLM не вызывается
     if not results:
-        return {"final_answer": FALLBACK_EMPTY_RESULTS}
+        return {"final_answer": FALLBACK_EMPTY_RESULTS, "cited_chunk_ids": []}
+
+    # Обогащаем doc_dir до вызова LLM (кэш прогревается один раз)
+    _enrich_results_with_dirs(results)
 
     prompt = _fill_template(
         GENERATE_ANSWER_PROMPT,
@@ -1091,11 +1216,8 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
         except RuntimeError as exc:
             last_exc = exc
             break
-        # Расчёты по формулам (ТЗ): если ответ содержит ```python-блок —
-        # исполняем его и вставляем результат после блока кода.
-        answer = execute_calculation(answer)
         if has_citations(answer):
-            return {"final_answer": answer}
+            break
         if attempt == 0:
             prompt += f"\n\n{CITATION_REGEN_INSTRUCTION}"
 
@@ -1103,9 +1225,13 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
         return {
             "final_answer": FALLBACK_LLM_ERROR,
             "error": f"LLM API недоступен: {last_exc}",
+            "cited_chunk_ids": [],
         }
-    # Вторая попытка тоже без цитат — возвращаем как есть
-    return {"final_answer": answer}
+
+    # Матчинг цитат → конкретные чанки
+    cited = _match_citations_to_chunks(answer, results)
+
+    return {"final_answer": answer, "cited_chunk_ids": cited}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1245,6 +1371,7 @@ class QAGraph:
             "active_query": query,
             "final_answer": None,
             "needs_clarification": None,
+            "cited_chunk_ids": [],
             "error": None,
         }
 
