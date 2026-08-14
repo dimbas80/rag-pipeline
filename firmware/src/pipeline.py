@@ -775,7 +775,10 @@ def _find_table_caption_for(
     best_caption: str = ""
     best_y_diff: float = float("inf")
 
-    caption_pattern = re.compile(r"Т\s+а\s+б\s+л\s+и\s+ц\s+а", re.IGNORECASE)
+    # OCR может расставлять произвольное число пробелов между буквами.
+    # Не ограничиваем поиск фиксированным отступом: заголовок часто имеет
+    # отдельный блок и находится заметно выше boundingBox таблицы.
+    caption_pattern = re.compile(r"Т\s*а\s*б\s*л\s*и\s*ц\s*а", re.IGNORECASE)
 
     for by, block in blocks_with_y:
         if by >= table_y:
@@ -814,6 +817,31 @@ def _find_table_caption_for(
                     best_caption = block_text
 
     return best_caption
+
+
+def _extract_table_num_from_text(text: str) -> str | None:
+    """Извлечь номер таблицы, включая буквенные номера (например, Б.1).
+
+    Используется для связывания OCR-вырезок, относящихся к одной таблице на
+    нескольких страницах. Номер берётся только после слова «таблица» или
+    явного маркера продолжения, чтобы не связывать случайные числа в тексте.
+    """
+    normalized = _normalize_spaced_text(text)
+    match = re.search(
+        r"(?:Окончани[ея]|Продолжени[ея]|Продолж\.?)\s+"
+        r"(?:таблиц[аы]|табл\.?|table)\s+"
+        r"([А-ЯA-Z]?\.?\d+(?:\.\d+)*)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(
+            r"(?:Таблиц[аы]|табл\.?|table)\s+"
+            r"([А-ЯA-Z]?\.?\d+(?:\.\d+)*)",
+            normalized,
+            re.IGNORECASE,
+        )
+    return match.group(1).upper().replace(".", ".") if match else None
 
 
 def _table_to_md(table: dict) -> tuple[str, str]:
@@ -1659,48 +1687,110 @@ def extract_table_images(
 
     with fitz.open(str(pdf_path)) as doc:
         table_images: list[dict] = []
+        # Геометрия хранится отдельно, чтобы не менять публичный формат
+        # table_images.json и не добавлять служебные поля в результат.
+        table_geometry: dict[int, tuple[int, int, float, float]] = {}
         table_counter = 0  # сквозной счётчик по всем страницам
-    
+
         for pi, page_data in enumerate(pages):
             ta = page_data.get("result", {}).get("textAnnotation", {})
             tables = ta.get("tables", [])
-    
+
             if not tables:
                 continue
-    
+
             page = doc[pi]
             ya_w = float(ta.get("width", 1))
             ya_h = float(ta.get("height", 1))
             sx = page.rect.width / ya_w if ya_w > 0 else 1.0
             sy = page.rect.height / ya_h if ya_h > 0 else 1.0
-    
+
             for ti, table in enumerate(tables):
                 bbox = table.get("boundingBox", {}).get("vertices", [])
                 if len(bbox) < 4:
                     log.warning(f"  Таблица стр.{pi+1}#{ti+1}: нет boundingBox")
                     continue
-    
+
                 xs = [float(v.get("x", 0)) for v in bbox]
                 ys = [float(v.get("y", 0)) for v in bbox]
                 x0 = min(xs) * sx - 2
                 y0 = max(0, min(ys) * sy - 32)  # +30px вверх для заголовка
                 x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
-    
+
                 rect = fitz.Rect(x0, y0, x1, y1)
                 pix = page.get_pixmap(clip=rect, dpi=200)
-    
+
                 table_counter += 1
                 fname = f"table_{table_counter}.png"
                 pix.save(str(img_dir / fname))
-    
-                table_images.append({
+                caption = _find_table_caption_for(
+                    ta.get("blocks", []), table, tables
+                )
+
+                table_num = _extract_table_num_from_text(caption)
+                item = {
                     "page": pi,
                     "table_idx": table_counter,
                     "path": fname,
                     "id": f"t_p{pi + 1}_{ti}",
-                })
+                }
+                if caption:
+                    item["caption"] = caption
+                if table_num:
+                    item["table_num"] = table_num
+                table_images.append(item)
+                table_geometry[id(item)] = (pi, ti, max(ys) * sy, page.rect.height)
                 log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
-    
+
+    # Сначала сохраняем старое связывание по номеру таблицы.
+    groups: dict[str, list[dict]] = {}
+    for item in table_images:
+        if item.get("table_num"):
+            groups.setdefault(item["table_num"], []).append(item)
+    for group in groups.values():
+        if len(group) > 1:
+            paths = [part["path"] for part in group]
+            for part in group:
+                part["component_images"] = paths
+
+    # На продолжении Yandex OCR часто не выдаёт ни caption, ни table_num.
+    tables_by_page: dict[int, list[dict]] = {}
+    for item in table_images:
+        tables_by_page.setdefault(item["page"], []).append(item)
+
+    current_group: dict | None = None
+    current_group_members: list[dict] = []
+    for pi in sorted(tables_by_page):
+        page_tables = tables_by_page[pi]
+        for ti, item in enumerate(page_tables):
+            has_caption = bool(item.get("caption") or item.get("table_num"))
+            if has_caption:
+                current_group = item
+                current_group_members = [item]
+                continue
+            if ti != 0 or pi <= 0 or current_group is None:
+                continue
+
+            previous_tables = tables_by_page.get(pi - 1, [])
+            if not previous_tables or previous_tables[-1] is not current_group_members[-1]:
+                continue
+            previous = previous_tables[-1]
+            _, _, bottom, page_height = table_geometry[id(previous)]
+            if bottom < page_height * 0.9:
+                continue
+
+            paths = list(current_group.get("component_images") or [current_group["path"]])
+            if item["path"] not in paths:
+                paths.append(item["path"])
+            for member in current_group_members:
+                member["component_images"] = paths
+                if current_group.get("caption"):
+                    member["caption"] = current_group["caption"]
+            current_group_members.append(item)
+            item["component_images"] = paths
+            if current_group.get("caption"):
+                item["caption"] = current_group["caption"]
+
     return table_images
 
 
@@ -2699,6 +2789,102 @@ def _table_id_sort_key(tid: str) -> tuple[int, int]:
     return (0, 0)
 
 
+def _merge_by_component_images(md_text: str, table_images: list[dict] | None) -> str:
+    """Склеить части многостраничных таблиц по ``component_images``.
+
+    ID-маркеры ставятся непосредственно перед подписью таблицы, поэтому их
+    можно использовать как устойчивые якоря даже если продолжение начинается
+    с обычной строки данных и не содержит строки-разделителя Markdown.
+    Таблицы с одной (или отсутствующей) компонентой намеренно не меняются.
+    """
+    if not md_text or not table_images:
+        return md_text
+
+    components_by_id = {
+        item.get("id"): tuple(item.get("component_images") or ())
+        for item in table_images
+        if item.get("id")
+    }
+    components_by_id = {
+        marker_id: components
+        for marker_id, components in components_by_id.items()
+        if len(components) >= 2
+    }
+    if not components_by_id:
+        return md_text
+
+    lines = md_text.split("\n")
+    marker_re = re.compile(r"^\s*<!--\s*(t_p\d+_\d+)\s*-->\s*$")
+
+    def is_row(line: str) -> bool:
+        stripped = line.strip()
+        return stripped.startswith("|") and "|" in stripped[1:]
+
+    blocks: list[tuple[str, int, int, int]] = []
+    for index, line in enumerate(lines):
+        match = marker_re.match(line)
+        if not match or match.group(1) not in components_by_id:
+            continue
+        row_start = index + 1
+        # The caption/name is between the marker and the first table row.
+        while row_start < len(lines) and not lines[row_start].strip():
+            row_start += 1
+        if row_start < len(lines) and not is_row(lines[row_start]):
+            row_start += 1
+            while row_start < len(lines) and not lines[row_start].strip():
+                row_start += 1
+        if row_start >= len(lines) or not is_row(lines[row_start]):
+            continue
+        row_end = row_start
+        while row_end < len(lines) and is_row(lines[row_end]):
+            row_end += 1
+        blocks.append((match.group(1), index, row_start, row_end))
+
+    groups: dict[tuple[str, ...], list[tuple[str, int, int, int]]] = {}
+    for block in blocks:
+        groups.setdefault(components_by_id[block[0]], []).append(block)
+    merge_groups = [parts for parts in groups.values() if len(parts) >= 2]
+    if not merge_groups:
+        return md_text
+
+    replacements: list[tuple[int, int, list[str]]] = []
+    for parts in merge_groups:
+        parts.sort(key=lambda part: part[1])
+        first_id, first_marker, first_row, first_end = parts[0]
+        first_lines = lines[first_marker:first_end]
+        separator_index = next(
+            (i for i, line in enumerate(first_lines)
+             if ":--" in line or "---" in line),
+            None,
+        )
+        if separator_index is None:
+            continue
+        merged = list(first_lines)
+        seen = {line.strip() for line in merged[separator_index + 1:] if line.strip()}
+        for _, _, row_start, row_end in parts[1:]:
+            continuation_rows = lines[row_start:row_end]
+            continuation_separator = next(
+                (i for i, row in enumerate(continuation_rows)
+                 if ":--" in row or "---" in row),
+                None,
+            )
+            if continuation_separator is not None:
+                continuation_rows = continuation_rows[continuation_separator + 1:]
+            for row in continuation_rows:
+                if row.strip() and row.strip() not in seen:
+                    merged.append(row)
+                    seen.add(row.strip())
+        replacements.append((first_marker, first_end, merged))
+        for _, marker, _, end in parts[1:]:
+            replacements.append((marker, end, []))
+
+    if not replacements:
+        return md_text
+    for start, end, replacement in sorted(replacements, reverse=True):
+        lines[start:end] = replacement
+    return "\n".join(lines)
+
+
 def run_script_postprocess(
     md_text: str,
     img_dir: str | Path,
@@ -2740,6 +2926,8 @@ def run_script_postprocess(
     if page_boundaries and table_images:
         md_text = _inject_table_ids(md_text, page_boundaries, table_images)
         log.info("  2b. Таблицы: ID-маркеры вставлены")
+        md_text = _merge_by_component_images(md_text, table_images)
+        log.info("  2c. Таблицы: склейка по component_images")
 
     md_text = cleanup_latex(md_text)
     log.info("  3. LaTeX: очищен")
@@ -4085,6 +4273,7 @@ _TABLE_CAPTION_RE = re.compile(
 def _extract_tables_from_md(
     md_text: str,
     table_image_map: dict[str, str] | None = None,
+    table_components: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """Найти все Markdown-таблицы в тексте.
 
@@ -4113,6 +4302,7 @@ def _extract_tables_from_md(
         приватные поля (удаляются при записи).
     """
     lines = md_text.splitlines()
+    table_components = table_components or {}
     # Проход 1: детект таблиц (пары start/end строк)
     spans: list[tuple[int, int]] = []
     i = 0
@@ -4144,6 +4334,7 @@ def _extract_tables_from_md(
                     f"  Таблица {n}: маркер {marker_id} есть, но id нет в карте "
                     f"таблиц — привязка по содержимому"
                 )
+        component_paths = table_components.get(marker_id, []) if marker_id else []
         md_block = "\n".join(lines[start:end])
         tables.append({
             "asset_id": None,  # doc_slug добавляется позже
@@ -4151,6 +4342,7 @@ def _extract_tables_from_md(
             "caption": caption,
             "md_lines": [start, end],
             "image_path": image_path,
+            "image_paths": [f"image/{p}" for p in component_paths],
             "row_count": max(0, (end - start) - 2),  # минус заголовок и разделитель
             "chunk_ids": [],
             "_md_block": md_block,
@@ -4351,6 +4543,44 @@ def _load_table_image_map(tmp_dir: str | Path | None) -> dict[str, str]:
     return {}
 
 
+def _load_table_components(tmp_dir: str | Path | None) -> dict[str, list[str]]:
+    """Загрузить компоненты таблиц по ID и имени изображения.
+
+    Для таблиц, объединённых на нескольких страницах, ``component_images``
+    содержит полный список вырезок в порядке страниц.  AI-постобработка может
+    удалить ID-маркеры из Markdown, поэтому тот же список индексируется по
+    имени каждой входящей картинки: это позволяет восстановить компоненты
+    после привязки итоговой таблицы по содержимому.
+    """
+    if not tmp_dir:
+        return {}
+    path = Path(tmp_dir) / "table_images.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return {}
+
+        components_by_key: dict[str, list[str]] = {}
+        for item in data:
+            item_id = item.get("id")
+            item_path = item.get("path")
+            if not item_id or not item_path:
+                continue
+            components = list(item.get("component_images") or [item_path])
+            components_by_key[item_id] = components
+            # Ключи — именно имена файлов: image/table_N.png и table_N.png
+            # должны работать одинаково при чтении старых карт.
+            for component in components:
+                component_name = Path(component).name
+                components_by_key[component_name] = components
+        return components_by_key
+    except (OSError, TypeError, ValueError, KeyError) as e:
+        log.warning(f"  Не удалось прочитать компоненты таблиц {path}: {e}")
+        return {}
+
+
 def _load_table_crop_texts(tmp_dir: str | Path | None) -> dict[str, set[str]]:
     """Загрузить OCR-вырезки tmp/table_N.md как {filename: set(ячеек)}.
 
@@ -4428,14 +4658,36 @@ def _build_asset_registry(
     пропускается с log.warning (архитектура §9 error handling).
     """
     table_image_map = _load_table_image_map(tmp_dir) if tmp_dir else {}
+    table_components = _load_table_components(tmp_dir) if tmp_dir else {}
     crop_texts = _load_table_crop_texts(tmp_dir) if tmp_dir else {}
-    tables = _extract_tables_from_md(md_text, table_image_map=table_image_map)
+    tables = _extract_tables_from_md(
+        md_text,
+        table_image_map=table_image_map,
+        table_components=table_components,
+    )
     images = _extract_images_from_md(md_text)
 
     for i, table in enumerate(tables, 1):
         table["asset_id"] = f"{doc_slug}/table/{i}"
     for i, img in enumerate(images, 1):
         img["asset_id"] = f"{doc_slug}/fig/{i}"
+
+    # Если OCR не дал подпись, используем подпись из vision-результата.
+    for table in tables:
+        if table.get("caption") or not table.get("image_path") or not tmp_dir:
+            continue
+        vision_file = Path(tmp_dir) / (Path(table["image_path"]).stem + ".md")
+        if vision_file.exists():
+            try:
+                vision_text = vision_file.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            match = re.search(
+                r"(?im)^\s*[*_]?\s*((?:Таблиц[аы]|табл\.?)\s+[^\n*_]+)",
+                vision_text,
+            )
+            if match:
+                table["caption"] = re.sub(r"\s+", " ", match.group(1).strip())
 
     # Если image/ не найден — реестр активов пуст (архитектура §9):
     # без директории изображений активы не имеют смысла.
@@ -4455,6 +4707,21 @@ def _build_asset_registry(
     # Привязка по содержимому для таблиц без маркера (AI мог снять маркер
     # или таблица появилась при слиянии)
     _bind_tables_by_content(tables, crop_texts)
+
+    # AI может удалить ID-маркеры и объединить несколько OCR-вырезок в одну
+    # Markdown-таблицу. После content binding известна исходная картинка,
+    # поэтому восстанавливаем полный список компонентов по имени файла.
+    # Для marker binding это также служит защитой от неполной image_paths.
+    for table in tables:
+        image_path = table.get("image_path")
+        if not image_path:
+            continue
+        image_name = Path(image_path).name
+        components = table_components.get(image_name)
+        if components:
+            table["image_paths"] = [f"image/{Path(path).name}" for path in components]
+        else:
+            table["image_paths"] = [image_path]
 
     # Валидация: сводка привязок + дубликаты подписей
     n_marker = sum(1 for t in tables if t.get("_image_source") == "marker")
@@ -4908,12 +5175,18 @@ def process_file(
             # Персистим карту id → path (tmp/<file_stem>/table_images.json),
             # чтобы --rag привязывал image_path и при повторном запуске без OCR
             try:
-                map_payload = [
-                    {"id": ti.get("id"), "path": ti.get("path"),
-                     "page": ti.get("page"), "table_idx": ti.get("table_idx")}
-                    for ti in table_images
-                    if ti.get("id") and ti.get("path")
-                ]
+                map_payload = []
+                for ti in table_images:
+                    if not (ti.get("id") and ti.get("path")):
+                        continue
+                    entry = {
+                        "id": ti.get("id"), "path": ti.get("path"),
+                        "page": ti.get("page"), "table_idx": ti.get("table_idx"),
+                    }
+                    for key in ("caption", "table_num", "component_images"):
+                        if key in ti:
+                            entry[key] = ti[key]
+                    map_payload.append(entry)
                 safe_write(
                     file_tmp_dir / "table_images.json",
                     json.dumps(map_payload, ensure_ascii=False, indent=2),

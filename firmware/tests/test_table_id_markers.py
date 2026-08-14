@@ -8,6 +8,7 @@ import pytest
 
 from pipeline import (
     _inject_table_ids,
+    _merge_by_component_images,
     _table_id_sort_key,
     run_script_postprocess,
 )
@@ -16,6 +17,58 @@ from pipeline import (
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: _table_id_sort_key
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_component_image_stitch_merges_continuations_and_keeps_first_marker():
+    """Tables sharing a multi-image component group become one table."""
+    md = (
+        "<!-- t_p1_0 -->\n*Таблица Б.1*\n"
+        "| Header A | Header B |\n| --- | --- |\n| first | row |\n\n"
+        "<!-- t_p2_0 -->\n*Продолжение таблицы Б.1*\n"
+        "| second | row |\n| first | row |\n"
+    )
+    table_images = [
+        {"id": "t_p1_0", "component_images": ["table_1.png", "table_2.png"]},
+        {"id": "t_p2_0", "component_images": ["table_1.png", "table_2.png"]},
+    ]
+
+    out = _merge_by_component_images(md, table_images)
+
+    assert out.count("| Header A | Header B |") == 1
+    assert out.count("| first | row |") == 1
+    assert "| second | row |" in out
+    assert out.count("<!-- t_p") == 1
+    assert "<!-- t_p1_0 -->" in out
+
+
+def test_component_image_stitch_does_not_merge_single_image_tables():
+    """Single-image groups remain separate for backward compatibility."""
+    md = (
+        "<!-- t_p1_0 -->\n*Таблица 1*\n| A |\n| --- |\n| one |\n\n"
+        "<!-- t_p2_0 -->\n*Таблица 2*\n| A |\n| --- |\n| two |\n"
+    )
+    table_images = [
+        {"id": "t_p1_0", "component_images": ["table_1.png"]},
+        {"id": "t_p2_0", "component_images": ["table_2.png"]},
+    ]
+
+    assert _merge_by_component_images(md, table_images) == md
+
+
+def test_run_script_postprocess_calls_component_stitch_after_id_injection(tmp_path):
+    """The production postprocess path must execute component-image stitching."""
+    md = "*Таблица 1*\n| A |\n| --- |\n| one |\n"
+    boundaries = [(0, len(md.split("\n")))]
+    table_images = [{"id": "t_p1_0", "component_images": ["table_1.png", "table_2.png"]}]
+
+    with patch("pipeline._inject_table_ids", return_value=md) as inject, patch(
+            "pipeline._merge_by_component_images",
+            side_effect=lambda text, images: text,
+    ) as stitch:
+        run_script_postprocess(md, tmp_path, boundaries, table_images)
+
+    inject.assert_called_once_with(md, boundaries, table_images)
+    stitch.assert_called_once_with(md, table_images)
 
 
 def test_table_id_sort_key_orders_by_page_then_index():
@@ -194,6 +247,26 @@ def test_run_script_postprocess_injects_ids(tmp_path):
     )
     assert "<!-- t_p1_0 -->" in out
     assert "<!-- t_p1_0 -->\n*Таблица 1*" in out
+
+
+def test_run_script_postprocess_stitches_component_images(tmp_path):
+    """Интеграционно выполняется шаг 2c после ID-маркировки."""
+    md = (
+        "*Таблица Б.1*\n| Header A | Header B |\n| --- | --- |\n| first | row |\n\n"
+        "*Продолжение таблицы Б.1*\n| Header A | Header B |\n| --- | --- |\n| second | row |\n"
+    )
+    total = len(md.split("\n"))
+    out = run_script_postprocess(
+        md, tmp_path, page_boundaries=[(0, 4), (4, total)],
+        table_images=[
+            {"id": "t_p1_0", "component_images": ["table_1.png", "table_2.png"]},
+            {"id": "t_p2_0", "component_images": ["table_1.png", "table_2.png"]},
+        ],
+    )
+    assert out.count("| Header A | Header B |") == 1
+    assert out.count("| --- | --- |") == 1
+    assert "| second | row |" in out
+    assert out.count("<!-- t_p") == 1
 
 
 def test_run_script_postprocess_without_ids_backward_compatible(tmp_path):
