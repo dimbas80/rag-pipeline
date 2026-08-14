@@ -10,7 +10,15 @@
 
 ## Known issues
 - 4 предсуществующих падения в `firmware/tests/` (test_qa_graph.py) — не связаны с фиксом бота (подтверждено git stash); связаны с незакоммиченными правками qa_graph.py/create_index.py.
-- Карточка t_290d5d7c (blocked) — устарела: работа выполнена в t_de873a2d, ревью PASS t_b3608b01. Ребёнка t_3ca67835 не диспатчить (дубликат ревью). Можно архивировать.
+- Карточка t_290d5d7c (blocked) — устарела (архивирована пользователем 2026-08-14): работа выполнена в t_de873a2d, ревью PASS t_b3608b01.
+- Бот держит эксклюзивную блокировку Qdrant после ответа (qa_graph._get_qdrant_client — синглтон без close). → фикс в t_0baaab2e.
+- «Покажи таблицу Х» шлёт 2 изображения (нужное + соседнее, Е.1+Д.1): cited-ветка _send_images шлёт все asset'ы чанка. → фикс в t_0baaab2e.
+- «Покажи таблицу Б1 СП 89.13330» → «Не удалось сформировать ответ» (qa.run без final_answer, вероятно interrupt ask_clarification; таблица Б.1 в источнике есть). → фикс в t_0baaab2e.
+
+## In progress / Planned
+- t_508d475b (coder, ready): коммит накопленных изменений (бот-фикс caption, QA, README).
+- t_0baaab2e (coder, todo): фиксы бота 3.1-3.3 (освобождение Qdrant, 1 изображение по явной ссылке, ответ на таблицу Б.1).
+- t_9030aa12 (reviewer, todo): ревью t_0baaab2e.
 
 ## Recent decisions
 - 2026-08-06: чат-LLM — DeepSeek API через `llm_config.yaml` (configurable), не SiliconFlow.
