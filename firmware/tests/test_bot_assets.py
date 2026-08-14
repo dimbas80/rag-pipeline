@@ -7,6 +7,8 @@
   - отсутствие номера → картинки не отправляются
   - неоднозначная ссылка (несколько разных путей) → warning, пачка не отправляется
   - cited_chunk_ids не пуст → старое поведение сохраняется
+  - многостраничные таблицы: image_paths из N путей в одном документе →
+    отправляются все N страниц; query с номером документа сужает выбор
 
 Запуск (из корня репозитория):
     python -m pytest firmware/tests/test_bot_assets.py -v
@@ -239,9 +241,9 @@ class FakeUpdate:
         self.message = FakeMessage()
 
 
-def _write_assets(tmp_path, files):
-    """Создаёт файлы вида {'image/table_22.png': b'...'} в tmp_path/doc."""
-    doc = tmp_path / "doc"
+def _write_assets(tmp_path, files, name="doc"):
+    """Создаёт файлы вида {'image/table_22.png': b'...'} в tmp_path/<name>."""
+    doc = tmp_path / name
     for rel, content in files.items():
         p = doc / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -300,9 +302,286 @@ def test_send_images_cited_keeps_old_behavior(tmp_path):
         ], chunk_id="c2"),
     ]
     upd = FakeUpdate()
-    # процитирован только c2, запрос про рисунок → отправляется fig_1.png
     asyncio.run(bot._send_images(
         upd, results, "покажи рисунок",
         cited_chunk_ids=["c2"], answer="см. рисунок.",
     ))
     assert [c for _, c in upd.message.sent] == ["fig_1.png"]
+
+
+# ─── Фикс 3.2: приоритет явной ссылки в QUERY над cited_chunk_ids ─────
+
+def _mk_sp89_chunk(doc_dir, chunk_id="sp89_kotelnye/_h62"):
+    """Чанк СП 89 с двумя соседними таблицами (Е.1 и Д.1) — как в _h62."""
+    return _mk_result(doc_dir, [
+        {"asset_type": "table", "caption": "Таблица Д.1", "image_path": "image/table_11.png"},
+        {"asset_type": "table", "caption": "Таблица Е.1", "image_path": "image/table_12.png"},
+    ], chunk_id=chunk_id)
+
+
+def test_query_ref_priority_over_cited_sends_only_one(tmp_path):
+    """«покажи таблицу Е.1» при cited_chunk_ids=[_h62] (в чанке Е.1 И Д.1)
+    → отправляется ТОЛЬКО Е.1 (table_12.png), соседняя Д.1 — нет."""
+    doc = _write_assets(tmp_path, {
+        "image/table_11.png": b"PNGD1",
+        "image/table_12.png": b"PNGE1",
+    })
+    results = [_mk_sp89_chunk(str(doc))]
+    upd = FakeUpdate()
+    asyncio.run(bot._send_images(
+        upd, results, "покажи таблицу Е.1 СП 89.13330",
+        cited_chunk_ids=["sp89_kotelnye/_h62"], answer="Вот таблица.",
+    ))
+    assert [c for _, c in upd.message.sent] == ["table_12.png"]
+
+
+def test_query_ref_priority_d1_sends_only_d1(tmp_path):
+    """«покажи таблицу Д.1» из того же чанка → только Д.1 (table_11.png)."""
+    doc = _write_assets(tmp_path, {
+        "image/table_11.png": b"PNGD1",
+        "image/table_12.png": b"PNGE1",
+    })
+    results = [_mk_sp89_chunk(str(doc))]
+    upd = FakeUpdate()
+    asyncio.run(bot._send_images(
+        upd, results, "покажи таблицу Д.1 СП 89",
+        cited_chunk_ids=["sp89_kotelnye/_h62"], answer="Вот таблица.",
+    ))
+    assert [c for _, c in upd.message.sent] == ["table_11.png"]
+
+
+def test_query_ref_ambiguous_fail_closed(tmp_path):
+    """Один номер → ассеты из РАЗНЫХ документов: картинки НЕ отправляются
+    (fail closed), даже когда cited_chunk_ids не пуст."""
+    doc1 = _write_assets(tmp_path, {"image/table_19.png": b"PNG19"}, name="doc1")
+    doc2 = _write_assets(tmp_path, {"image/table_19b.png": b"PNG19B"}, name="doc2")
+    results = [
+        _mk_result(str(doc1), [
+            {"asset_type": "table", "caption": "Таблица 19 — ГОСТ", "image_path": "image/table_19.png"},
+        ], chunk_id="c1"),
+        _mk_result(str(doc2), [
+            {"asset_type": "table", "caption": "Таблица 19 — СП", "image_path": "image/table_19b.png"},
+        ], chunk_id="c2"),
+    ]
+    upd = FakeUpdate()
+    asyncio.run(bot._send_images(
+        upd, results, "покажи таблицу 19",
+        cited_chunk_ids=["c1", "c2"], answer="Данные в таблице 19.",
+    ))
+    assert upd.message.sent == []
+
+
+def test_query_ref_not_found_fail_closed(tmp_path):
+    """Ссылка с номером, которого нет среди ассетов → картинки НЕ отправляются."""
+    doc = _write_assets(tmp_path, {"image/table_11.png": b"PNGD1"})
+    results = [_mk_sp89_chunk(str(doc))]
+    upd = FakeUpdate()
+    asyncio.run(bot._send_images(
+        upd, results, "покажи таблицу Ж.5 СП 89",
+        cited_chunk_ids=["sp89_kotelnye/_h62"], answer="Вот таблица.",
+    ))
+    assert upd.message.sent == []
+
+
+def test_no_refs_keeps_cited_behavior(tmp_path):
+    """Явных ссылок нет ни в query, ни в answer → старое cited-поведение
+    (все asset'ы процитированных чанков по интенту)."""
+    doc = _write_assets(tmp_path, {
+        "image/table_11.png": b"PNGD1",
+        "image/table_12.png": b"PNGE1",
+    })
+    results = [_mk_sp89_chunk(str(doc))]
+    upd = FakeUpdate()
+    # «таблица» в запросе есть, но БЕЗ номера → явная ссылка не извлекается
+    asyncio.run(bot._send_images(
+        upd, results, "какие таблицы в приложении Д и Е?",
+        cited_chunk_ids=["sp89_kotelnye/_h62"], answer="См. приложение.",
+    ))
+    assert [c for _, c in upd.message.sent] == ["table_11.png", "table_12.png"]
+
+
+# ─── Фикс 3.3: обработка __interrupt__ (уточняющий вопрос) ────────────
+
+class _FakeInterrupt:
+    def __init__(self, value):
+        self.value = value
+
+
+def test_interrupt_reply_text_returns_question():
+    result = {"__interrupt__": [_FakeInterrupt("Уточните номер документа")]}
+    assert bot._interrupt_reply_text(result) == "Уточните номер документа"
+
+
+def test_interrupt_reply_text_none_without_interrupt():
+    assert bot._interrupt_reply_text({"final_answer": "ответ"}) is None
+    assert bot._interrupt_reply_text({}) is None
+    assert bot._interrupt_reply_text(None) is None
+    assert bot._interrupt_reply_text({"__interrupt__": []}) is None
+
+
+def test_interrupt_reply_text_falls_back_to_str():
+    class Weird:
+        def __str__(self):
+            return "текст вопроса"
+
+    assert bot._interrupt_reply_text({"__interrupt__": [Weird()]}) == "текст вопроса"
+
+
+def test_resolve_prefer_query_uses_query_refs_first():
+    """prefer='query': ссылка из query приоритетнее ссылки из answer."""
+    sp_doc = "/mnt/docs/СП 89"
+    results = [
+        _mk_result(sp_doc, [
+            {"asset_type": "table", "caption": "Таблица Д.1", "image_path": "image/table_11.png"},
+            {"asset_type": "table", "caption": "Таблица Е.1", "image_path": "image/table_12.png"},
+        ]),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        results,
+        answer="В таблице Д.1 приведены данные.",
+        query="покажи таблицу Е.1",
+        prefer="query",
+    )
+    assert warnings == []
+    assert paths == [f"{sp_doc}/image/table_12.png"]
+
+
+# ─── Фикс 3.4: многостраничные таблицы (image_paths) ───────────────────
+
+def test_multipage_table_b1_sends_all_pages():
+    """«Таблица Б.1» с image_paths из 3 png → все 3 страницы, НЕ ambiguous."""
+    sp_results = [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица Б.1",
+             "image_path": "image/table_5.png",
+             "image_paths": ["image/table_3.png", "image/table_4.png", "image/table_5.png"]},
+        ]),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        sp_results, "Параметры приведены в таблице Б.1."
+    )
+    assert warnings == []
+    assert paths == [
+        f"{SP_DOC}/image/table_3.png",
+        f"{SP_DOC}/image/table_4.png",
+        f"{SP_DOC}/image/table_5.png",
+    ]
+
+
+def test_single_page_table_e1_sends_one():
+    """«Таблица Е.1» (image_paths из 1 png) → ровно 1 путь."""
+    sp_results = [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица Е.1",
+             "image_path": "image/table_12.png",
+             "image_paths": ["image/table_12.png"]},
+        ]),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        sp_results, "Данные в таблице Е.1."
+    )
+    assert warnings == []
+    assert paths == [f"{SP_DOC}/image/table_12.png"]
+
+
+def test_multipage_table_missing_image_paths_fallback():
+    """Нет image_paths (старые чанки/тесты) → fallback на image_path."""
+    sp_results = [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица Д.1",
+             "image_path": "image/table_11.png"},
+        ]),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        sp_results, "Данные в таблице Д.1."
+    )
+    assert warnings == []
+    assert paths == [f"{SP_DOC}/image/table_11.png"]
+
+
+def test_ambiguous_same_number_different_docs_fail_closed():
+    """Один номер «Таблица 19» в РАЗНЫХ документах → warning, пачка НЕ
+    отправляется, даже если у одного из документов несколько страниц."""
+    mixed_results = GOST_RESULTS + [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица 19 — Другие данные",
+             "image_path": "image/table_9.png",
+             "image_paths": ["image/table_9.png", "image/table_10.png"]},
+        ], chunk_id="c2"),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        mixed_results, "По ГОСТ и СП данные в таблице 19."
+    )
+    assert paths == []
+    assert len(warnings) == 1
+    assert "Неоднозначная ссылка" in warnings[0]
+
+
+def test_query_doc_narrows_ambiguous_choice():
+    """«…таблицу 19 ГОСТ 31996» при совпадениях в двух документах →
+    сужение по doc_dir до ГОСТ, отправляется только путь ГОСТ."""
+    mixed_results = GOST_RESULTS + [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица 19 — Другие данные",
+             "image_path": "image/table_9.png"},
+        ], chunk_id="c2"),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        mixed_results,
+        answer="Данные в таблице 19.",
+        query="покажи таблицу 19 ГОСТ 31996",
+        prefer="query",
+    )
+    assert warnings == []
+    assert paths == [f"{GOST_DOC}/image/table_22.png"]
+
+
+def test_query_doc_narrows_multipage_b1():
+    """«покажи таблицу Б.1 СП 89.13330» при совпадении в двух документах →
+    сужение по doc_dir до СП → все 3 страницы таблицы Б.1."""
+    other_doc = "/mnt/docs/Другой документ"
+    mixed = [
+        _mk_result(SP_DOC, [
+            {"asset_type": "table", "caption": "Таблица Б.1",
+             "image_path": "image/table_5.png",
+             "image_paths": ["image/table_3.png", "image/table_4.png", "image/table_5.png"]},
+        ], chunk_id="sp"),
+        _mk_result(other_doc, [
+            {"asset_type": "table", "caption": "Таблица Б.1",
+             "image_path": "image/table_1.png"},
+        ], chunk_id="other"),
+    ]
+    paths, warnings = helpers.resolve_images_to_send(
+        mixed, answer="Вот таблица.",
+        query="покажи таблицу Б.1 СП 89.13330",
+        prefer="query",
+    )
+    assert warnings == []
+    assert paths == [
+        f"{SP_DOC}/image/table_3.png",
+        f"{SP_DOC}/image/table_4.png",
+        f"{SP_DOC}/image/table_5.png",
+    ]
+
+
+def test_send_images_multipage_table_sends_all_pages(tmp_path):
+    """bot._send_images: «покажи таблицу Б.1 СП 89.13330» →
+    отправляются все 3 страницы (table_3/4/5.png)."""
+    doc = _write_assets(tmp_path, {
+        "image/table_3.png": b"PNGT3",
+        "image/table_4.png": b"PNGT4",
+        "image/table_5.png": b"PNGT5",
+    })
+    results = [
+        _mk_result(str(doc), [
+            {"asset_type": "table", "caption": "Таблица Б.1",
+             "image_path": "image/table_5.png",
+             "image_paths": ["image/table_3.png", "image/table_4.png", "image/table_5.png"]},
+        ]),
+    ]
+    upd = FakeUpdate()
+    asyncio.run(bot._send_images(
+        upd, results, "покажи таблицу Б.1 СП 89.13330",
+        cited_chunk_ids=[], answer="Вот таблица.",
+    ))
+    assert [c for _, c in upd.message.sent] == ["table_3.png", "table_4.png", "table_5.png"]

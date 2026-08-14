@@ -36,12 +36,14 @@ QAGraph (run/stream/resume, разделы 2.2, 6.4).
 """
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,7 +58,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Command, interrupt
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 # Прямой импорт функций поиска (раздел 2.2 архитектуры — не subprocess):
 # переиспользуются QdrantClient и SparseTextEmbedding между вызовами графа.
 from search import (
@@ -66,6 +68,13 @@ from search import (
     rerank_siliconflow,
     result_to_dict,
 )
+# Чистые helper'ы для явных ссылок «Таблица N»/«Рисунок N» (раздел 3.3):
+# extract_asset_references — ссылки из текста запроса/ответа,
+# asset_caption_number — номер из подписи ассета. Модуль зависит только
+# от stdlib, поэтому безопасен для импорта из core-графа.
+from telegram_bot.asset_helpers import asset_caption_number, extract_asset_references
+
+logger = logging.getLogger("qa_graph")
 
 # ─── Константы LLM-чата ───────────────────────────────────────────────
 # Провайдеры, модели и параметры узлов — в llm_config.yaml (раздел 6
@@ -726,20 +735,50 @@ def _fill_template(template: str, **kwargs) -> str:
     return out
 
 
-# ─── Ленивые синглтоны клиентов (раздел 2.2) ──────────────────────────
+# ─── Клиенты Qdrant (раздел 2.2, фикс 3.1) ────────────────────────────
+# Локальный Qdrant держит ЭКСКЛЮЗИВНЫЙ файловый замок на папку базы,
+# пока клиент открыт. Поэтому клиент создаётся на время ОДНОГО запроса
+# (search_node) и закрывается в finally через _close_qdrant_client() —
+# между запросами открытый клиент не держится, и create_index.py может
+# открыть базу при работающем боте без pkill. Sparse-эмбеддер (fastembed)
+# НЕ держит замок базы — он остаётся закэшированным.
 
 _qdrant_clients: dict[str, QdrantClient] = {}
 _sparse_model: SparseTextEmbedding | None = None
 
 
 def _get_qdrant_client(path: str) -> QdrantClient:
-    """Ленивый синглтон QdrantClient — один экземпляр на путь, разделяемый
-    между вызовами графа (раздел 2.2)."""
+    """Возвращает QdrantClient для *path* (создаёт при первом обращении).
+
+    Клиент кэшируется в модуле до конца запроса; после использования
+    ОБЯЗАТЕЛЬНО закрывается через _close_qdrant_client(path, client) —
+    иначе локальная база остаётся заблокированной для других процессов.
+    """
     client = _qdrant_clients.get(path)
     if client is None:
         client = QdrantClient(path=path)
         _qdrant_clients[path] = client
     return client
+
+
+def _close_qdrant_client(path: str, client: QdrantClient | None = None) -> None:
+    """Закрывает и забывает локальный QdrantClient (идемпотентно).
+
+    Локальный Qdrant использует файловый замок: если держать клиент в
+    модульном кэше после запроса, другой процесс (например, create_index.py)
+    не сможет открыть базу. ``client`` опционален — можно закрыть объект,
+    созданный вне кэша. ``close`` определяется feature-detected, чтобы
+    тестовые дубли и старые версии клиента без этого метода не падали.
+    Повторный вызов с тем же путём безопасен: кэш уже пуст, а close()
+    у QdrantClient тоже идемпотентен.
+    """
+    cached = _qdrant_clients.pop(path, None)
+    target = client or cached
+    if target is None:
+        return
+    close = getattr(target, "close", None)
+    if callable(close):
+        close()
 
 
 def _get_sparse_model() -> SparseTextEmbedding:
@@ -821,12 +860,195 @@ def analyze_query(state: QAGraphState, config=None) -> dict:
     }
 
 
+# ─── Целенаправленный поиск таблиц/рисунков (фикс 3.3) ───────────────
+# Для явных запросов вида «покажи таблицу Б.1 СП 89.13330» обычный
+# семантический топ может не найти нужный чанк (или найти соседний).
+# Поэтому при явной ссылке «Таблица N»/«Рисунок N» ищем чанк по caption
+# в _assets.json документов и вычитываем его из Qdrant по payload.chunk_id.
+
+
+def _iter_all_assets():
+    """Итератор по (doc_dir, document_id, assets) для всех документов базы.
+
+    Читает {entry}_assets.json из BASE_MARKDOWN, заполняет _assets_cache/
+    _doc_dirs (общий кэш с _load_assets) — повторные вызовы не читают JSON.
+    """
+    seen: set[str] = set()
+    for entry in os.listdir(BASE_MARKDOWN):
+        doc_dir = os.path.join(BASE_MARKDOWN, entry)
+        assets_path = os.path.join(doc_dir, f"{entry}_assets.json")
+        if not os.path.exists(assets_path):
+            continue
+        try:
+            with open(assets_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        doc_id = data.get("document_id")
+        if not doc_id or doc_id in seen:
+            continue
+        seen.add(doc_id)
+        _assets_cache[doc_id] = data
+        _doc_dirs[doc_id] = doc_dir
+        yield doc_dir, doc_id, data
+
+
+# Номер документа в запросе: «ГОСТ 31996», «СП 89.13330», «СНиП 2.04.05»,
+# «СанПиН 2.1», «СО 153-34.21.122» (для уточнения документа при поиске).
+_DOC_NUM_RE = re.compile(
+    r"(?:гост|сп|снип|санпин|со)\s*[\d.\-]+", re.IGNORECASE
+)
+
+
+def _query_matches_document(query: str, doc_id: str) -> bool:
+    """Совпадает ли имя документа из запроса с document_id.
+
+    «СП 89.13330» матчится с document_id «СП 89.13330.2016» (префикс/подстрока
+    номера), «ГОСТ 31996» — с «ГОСТ 31996-2012», «СП 89» — с «СП 89.13330.2016».
+    Сравнение без учёта регистра; номер документа извлекается из запроса
+    регуляркой (ГОСТ/СП/СНиП/СанПиН/СО + номер).
+    """
+
+    q = (query or "").lower()
+    doc = (doc_id or "").lower()
+    if not q or not doc:
+        return False
+    # 1. document_id целиком содержится в запросе или наоборот
+    if doc in q or q in doc:
+        return True
+    # 2. номер документа из запроса — подстрока document_id (без пробелов)
+    for m in _DOC_NUM_RE.finditer(q):
+        hint = re.sub(r"\s+", "", m.group(0))
+        if hint and hint in re.sub(r"\s+", "", doc):
+            return True
+    return False
+
+
+def _find_asset_chunks_by_caption(
+    asset_type: str, ref_num: str
+) -> list[tuple[str, str]]:
+    """Ищет (document_id, chunk_id) для ассетов с номером подписи ref_num.
+
+    Проходит по _assets.json всех документов базы (с кэшированием) и
+    возвращает пары (document_id, chunk_id) для caption, номер которой
+    совпадает с ref_num. Таблицы — caption «Таблица Б.1», рисунки —
+    «fig_1»/«Рисунок 3 — ...» (см. asset_caption_number в asset_helpers).
+    """
+    matches: list[tuple[str, str]] = []
+    group = "tables" if asset_type == "table" else "images"
+    for _doc_dir, doc_id, data in _iter_all_assets():
+        for item in data.get("assets", {}).get(group, []):
+            caption = item.get("caption") or ""
+            if asset_caption_number(asset_type, caption) != ref_num:
+                continue
+            for cid in item.get("chunk_ids") or []:
+                matches.append((doc_id, cid))
+    return matches
+
+
+def _scroll_chunks_by_ids(client, collection: str, chunk_ids: list[str]) -> list:
+    """Вычитывает точки Qdrant по payload.chunk_id (scroll с фильтром).
+
+    scroll() возвращает Record без score-поля — оборачиваем в объект,
+    похожий на ScoredPoint (payload + score), чтобы переиспользовать
+    result_to_dict() без изменений.
+    """
+    ids = list(dict.fromkeys(chunk_ids))
+    flt = models.Filter(
+        must=[
+            models.FieldCondition(
+                key="chunk_id", match=models.MatchAny(any=ids)
+            )
+        ]
+    )
+    points: list = []
+    offset = None
+    while True:
+        page, next_offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=flt,
+            limit=100,
+            offset=offset,
+        )
+        for rec in page:
+            points.append(
+                types.SimpleNamespace(payload=rec.payload, score=1.0)
+            )
+        if next_offset is None:
+            break
+        offset = next_offset
+    return points
+
+
+def _targeted_search_results(
+    query: str, client, cfg: QAGraphConfig
+) -> list[dict] | None:
+    """Целенаправленный поиск чанка с явно запрошенной таблицей/рисунком.
+
+    Если в запросе есть явная ссылка «Таблица N»/«Рисунок N» — ищем чанк
+    по caption в _assets.json (не полагаясь на семантический топ) и
+    вычитываем его из Qdrant по payload.chunk_id. Возвращает список
+    result-словарей со score=1.0 (→ evaluate_results направит в
+    generate_answer), либо None, если явной ссылки нет, чанк не найден,
+    документ неоднозначен или возникла ошибка (вызывающий продолжает
+    обычный семантический поиск).
+    """
+    try:
+        refs = extract_asset_references(query)
+        if not refs:
+            return None
+        asset_type, ref_num = refs[0]
+
+        found = _find_asset_chunks_by_caption(asset_type, ref_num)
+        if not found:
+            return None
+
+        # Если запрос называет документ — оставляем только его чанки.
+        doc_ids = {doc_id for doc_id, _ in found}
+        if len(doc_ids) > 1:
+            named = [d for d in doc_ids if _query_matches_document(query, d)]
+            if named:
+                named_set = set(named)
+                found = [(d, c) for d, c in found if d in named_set]
+                doc_ids = {d for d, _ in found}
+
+        if not found:
+            return None
+        if len(doc_ids) > 1:
+            logger.warning(
+                f"Целенаправленный поиск {asset_type} {ref_num}: "
+                f"неоднозначный документ ({sorted(doc_ids)}) — "
+                f"продолжаю семантический поиск"
+            )
+            return None
+
+        chunk_ids = [cid for _, cid in found]
+        points = _scroll_chunks_by_ids(client, cfg.collection, chunk_ids)
+        if not points:
+            return None
+
+        results = [result_to_dict(p, 1.0, i) for i, p in enumerate(points, 1)]
+        _enrich_results_with_dirs(results)
+        logger.info(
+            f"Целенаправленный поиск: {asset_type} {ref_num} → "
+            f"{len(results)} чанк(ов) {chunk_ids[:5]}"
+        )
+        return results
+    except Exception as exc:
+        logger.warning(
+            f"Целенаправленный поиск не удался, продолжаю семантический: {exc}"
+        )
+        return None
+
+
 # ─── Узел 2: search_node (раздел 5.2) ─────────────────────────────────
 
 def search_node(state: QAGraphState, config=None) -> dict:
     """Узел 2: гибридный поиск + RRF-фильтр + реранк (раздел 5.2).
 
     Последовательность:
+      0. (фикс 3.3) если в запросе явная ссылка «Таблица N»/«Рисунок N» —
+         целенаправленный поиск чанка по caption (_targeted_search_results);
       1. hybrid_search(query=active_query, top_k=retrieve_k) — retrieve
       2. filter_by_rrf_score(threshold=rrf_threshold) — отсев кандидатов
       3. rerank_siliconflow(top_n=final_k) — реранк
@@ -836,12 +1058,23 @@ def search_node(state: QAGraphState, config=None) -> dict:
       - hybrid_search не нашёл результатов → search_results = []
       - rerank_siliconflow упал → fallback на RRF-порядок без реранка
       - hybrid_search упал (Qdrant недоступен) → error + пустые результаты
+
+    Жизненный цикл клиента (фикс 3.1): локальный Qdrant держит файловый
+    замок на папку базы — клиент создаётся на время одного вызова и
+    закрывается в finally через _close_qdrant_client().
     """
     cfg = _get_qa_config(config)
     query = (state.get("active_query") or "").strip() or state.get("query", "")
     client = _get_qdrant_client(cfg.qdrant_path)
     sparse_model = _get_sparse_model()
     api_key = cfg.siliconflow_api_key or resolve_api_key()
+
+    # Целенаправленный поиск для явных запросов «покажи таблицу/рисунок N»
+    # (фикс 3.3): ищем чанк по caption, не полагаясь на семантический топ.
+    targeted = _targeted_search_results(query, client, cfg)
+    if targeted is not None:
+        _close_qdrant_client(cfg.qdrant_path, client)
+        return {"search_results": targeted}
 
     try:
         candidates = hybrid_search(
@@ -858,6 +1091,11 @@ def search_node(state: QAGraphState, config=None) -> dict:
             "search_results": [],
             "error": f"Поиск временно недоступен: {exc}",
         }
+    finally:
+        # Замок базы освобождается сразу после retrieve — фильтр/реранк
+        # не используют клиент, а create_index.py может открыть базу при
+        # работающем боте без pkill (фикс 3.1).
+        _close_qdrant_client(cfg.qdrant_path, client)
 
     if not candidates:
         return {"search_results": []}
@@ -1150,6 +1388,13 @@ GENERATE_ANSWER_PROMPT = """Ты — эксперт по нормативным 
 8. НЕ добавляй в ответ теги [image: ...] — изображения прикрепляются
    автоматически. Ты можешь сослаться на рисунок в тексте:
    «...как показано на рис. 3.2», но путь к файлу не указывай.
+9. Если пользователь явно просит показать таблицу или рисунок
+   (например, «покажи таблицу Б.1»), а фрагмент с этой таблицей/рисунком
+   есть среди НАЙДЕННЫХ ФРАГМЕНТОВ — ОБЯЗАТЕЛЬНО подтверди, что она
+   существует: укажи номер и название, приведи её содержимое (строки
+   таблицы) или кратко опиши. НИКОГДА не утверждай, что таблица/рисунок
+   отсутствует, если в предоставленных фрагментах есть таблица с таким
+   номером.
 
 ВОПРОС: {query}
 
@@ -1329,9 +1574,12 @@ def build_graph(checkpointer=None):
 class QAGraph:
     """Класс-обёртка над скомпилированным QA-графом.
 
-    Инициализация (раздел 2.2): один QdrantClient, один sparse-эмбеддер
-    и API-ключ SiliconFlow (embedding/rerank) — всё разделяется между
-    вызовами графа. LLM-чат конфигурируется через llm_config.yaml
+    Инициализация (раздел 2.2, фикс 3.1): QdrantClient при инициализации
+    НЕ открывается — локальный Qdrant держит эксклюзивный файловый замок
+    на папку базы, поэтому клиент создаётся на время каждого поиска в
+    search_node и закрывается в finally. Sparse-эмбеддер (fastembed) и
+    API-ключ SiliconFlow (embedding/rerank) разделяются между вызовами
+    графа. LLM-чат конфигурируется через llm_config.yaml
     (путь/провайдер/модель/ключ — в QAGraphConfig.llm_*), ключ
     провайдера резолвится лениво в llm_chat()/get_api_key(). Граф
     компилируется с MemorySaver-checkpointer для interrupt/resume.
@@ -1351,9 +1599,11 @@ class QAGraph:
         # резолвится здесь — он читается из llm_config.yaml через
         # get_api_key() при первом вызове llm_chat.
         self.api_key = self.config.siliconflow_api_key or resolve_api_key()
-        # Клиенты — ленивые синглтоны модуля (раздел 2.2): один экземпляр
-        # на путь, разделяемый между вызовами графа.
-        self.client = _get_qdrant_client(self.config.qdrant_path)
+        # QdrantClient НЕ открывается при инициализации (фикс 3.1): локальный
+        # Qdrant держит эксклюзивный файловый замок на папку базы, поэтому
+        # клиент создаётся на время каждого поиска в search_node и закрывается
+        # в finally. self.client оставлен как None для совместимости.
+        self.client = None
         self.sparse_model = _get_sparse_model()
         self.checkpointer = checkpointer or MemorySaver()
         self.graph = build_graph(checkpointer=self.checkpointer)

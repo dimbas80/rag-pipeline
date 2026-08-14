@@ -216,7 +216,13 @@ def result_to_dict(point, score: float, rank: int) -> dict:
         "text": p.get("text"),
         "references": p.get("references", []),
         "assets": [
-            {"asset_type": a.get("asset_type"), "caption": a.get("caption"), "image_path": a.get("image_path")}
+            {
+                "asset_type": a.get("asset_type"),
+                "caption": a.get("caption"),
+                "image_path": a.get("image_path"),
+                "image_paths": a.get("image_paths") or [],
+                "asset_id": a.get("asset_id"),
+            }
             for a in (p.get("assets") or [])
         ],
     }

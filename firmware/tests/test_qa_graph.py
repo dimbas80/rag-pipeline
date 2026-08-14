@@ -971,6 +971,142 @@ def test_search_node_uses_query_when_active_missing(monkeypatch):
     assert captured["query"] == "вопрос"
 
 
+# ─── Фикс 3.1: жизненный цикл QdrantClient в search_node ──────────────
+
+class _FakeQdrantClient:
+    """Тестовая замена QdrantClient с подсчётом close()."""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def test_search_node_closes_qdrant_client(monkeypatch):
+    """После поиска клиент закрывается (замок базы освобождается)."""
+    fake = _FakeQdrantClient()
+    monkeypatch.setattr(qa_graph, "_get_qdrant_client", lambda path: fake)
+    monkeypatch.setattr(qa_graph, "_get_sparse_model", lambda: object())
+    monkeypatch.setattr(qa_graph, "hybrid_search", lambda *a, **k: [])
+    monkeypatch.setattr(qa_graph, "filter_by_rrf_score", lambda c, threshold=0.15: c)
+    monkeypatch.setattr(qa_graph, "rerank_siliconflow", lambda q, d, key, top_n: [])
+
+    out = qa_graph.search_node(_state(), _cfg())
+    assert out == {"search_results": []}
+    assert fake.closed == 1
+    assert qa_graph._qdrant_clients == {}  # кэш пуст — клиент забыт
+
+
+def test_search_node_closes_client_on_hybrid_error(monkeypatch):
+    """При падении hybrid_search клиент всё равно закрывается."""
+    fake = _FakeQdrantClient()
+    monkeypatch.setattr(qa_graph, "_get_qdrant_client", lambda path: fake)
+    monkeypatch.setattr(qa_graph, "_get_sparse_model", lambda: object())
+
+    def boom(*a, **k):
+        raise RuntimeError("qdrant down")
+
+    monkeypatch.setattr(qa_graph, "hybrid_search", boom)
+    out = qa_graph.search_node(_state(), _cfg())
+    assert "Поиск временно недоступен" in out["error"]
+    assert fake.closed == 1
+
+
+def test_search_node_closes_client_on_targeted_path(monkeypatch):
+    """Целенаправленный поиск тоже закрывает клиент (3.1)."""
+    fake = _FakeQdrantClient()
+    monkeypatch.setattr(qa_graph, "_get_qdrant_client", lambda path: fake)
+    monkeypatch.setattr(qa_graph, "_get_sparse_model", lambda: object())
+    monkeypatch.setattr(
+        qa_graph, "_targeted_search_results",
+        lambda query, client, cfg: [{"chunk_id": "c1", "score": 1.0}],
+    )
+    monkeypatch.setattr(qa_graph, "hybrid_search", lambda *a, **k: (_ for _ in ()).throw(AssertionError("not called")))
+
+    out = qa_graph.search_node(_state(query="покажи таблицу Б.1"), _cfg())
+    assert out["search_results"] == [{"chunk_id": "c1", "score": 1.0}]
+    assert fake.closed == 1
+
+
+def test_close_qdrant_client_idempotent():
+    """Повторный close не падает и не дублирует эффект (3.1)."""
+    fake = _FakeQdrantClient()
+    qa_graph._close_qdrant_client("/tmp/x", fake)
+    qa_graph._close_qdrant_client("/tmp/x", fake)  # второй раз — безопасно
+    assert fake.closed == 2  # close() у QdrantClient идемпотентен, у нас счётчик
+
+
+# ─── Фикс 3.3: целенаправленный поиск таблиц/рисунков ─────────────────
+
+def test_targeted_search_results_no_refs_returns_none(monkeypatch):
+    """Запрос без явной ссылки «Таблица/Рисунок N» → None (семантический поиск)."""
+    monkeypatch.setattr(
+        qa_graph, "_find_asset_chunks_by_caption",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должен вызываться")),
+    )
+    assert qa_graph._targeted_search_results("Какие токи допустимы?", object(), _cfg()) is None
+
+
+def test_targeted_search_results_finds_chunk_by_caption(monkeypatch):
+    """«покажи таблицу Б.1 СП 89.13330» → чанк из Qdrant со score=1.0."""
+    monkeypatch.setattr(
+        qa_graph, "_find_asset_chunks_by_caption",
+        lambda asset_type, ref_num: [("СП 89.13330.2016", "sp89_kotelnye/_h59")],
+    )
+    monkeypatch.setattr(
+        qa_graph, "_scroll_chunks_by_ids",
+        lambda client, collection, chunk_ids: [_point(chunk_id="sp89_kotelnye/_h59", document_id="СП 89.13330.2016")],
+    )
+    out = qa_graph._targeted_search_results("покажи таблицу Б.1 СП 89.13330", object(), _cfg())
+    assert out is not None
+    assert len(out) == 1
+    assert out[0]["chunk_id"] == "sp89_kotelnye/_h59"
+    assert out[0]["score"] == 1.0  # → evaluate_results направит в generate_answer
+
+
+def test_targeted_search_results_chunk_not_found_returns_none(monkeypatch):
+    """Caption есть в assets, но чанка нет в Qdrant → None (семантический fallback)."""
+    monkeypatch.setattr(
+        qa_graph, "_find_asset_chunks_by_caption",
+        lambda asset_type, ref_num: [("СП 89.13330.2016", "sp89_kotelnye/_h59")],
+    )
+    monkeypatch.setattr(qa_graph, "_scroll_chunks_by_ids", lambda *a, **k: [])
+    assert qa_graph._targeted_search_results("покажи таблицу Б.1", object(), _cfg()) is None
+
+
+def test_targeted_search_results_ambiguous_doc_returns_none(monkeypatch):
+    """Один номер в caption у РАЗНЫХ документов и запрос не называет документ
+    → None: не рискуем отправить LLM чужую таблицу, продолжаем семантический поиск."""
+    monkeypatch.setattr(
+        qa_graph, "_find_asset_chunks_by_caption",
+        lambda asset_type, ref_num: [("Документ А", "a1"), ("Документ Б", "b1")],
+    )
+    monkeypatch.setattr(
+        qa_graph, "_scroll_chunks_by_ids",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("не должен вызываться")),
+    )
+    assert qa_graph._targeted_search_results("покажи таблицу 19", object(), _cfg()) is None
+
+
+def test_targeted_search_results_doc_name_disambiguates(monkeypatch):
+    """Запрос называет документ («СП 89.13330») → берём только его чанк."""
+    monkeypatch.setattr(
+        qa_graph, "_find_asset_chunks_by_caption",
+        lambda asset_type, ref_num: [
+            ("СП 89.13330.2016", "sp89_kotelnye/_h59"),
+            ("Документ Б", "b1"),
+        ],
+    )
+    monkeypatch.setattr(
+        qa_graph, "_scroll_chunks_by_ids",
+        lambda client, collection, chunk_ids: [_point(chunk_id=cid, document_id="СП 89.13330.2016") for cid in chunk_ids],
+    )
+    out = qa_graph._targeted_search_results("покажи таблицу Б.1 СП 89.13330", object(), _cfg())
+    assert out is not None
+    assert [r["chunk_id"] for r in out] == ["sp89_kotelnye/_h59"]
+
+
 # ─── Узел 3: evaluate_results (раздел 5.3) ────────────────────────────
 
 def test_evaluate_results_empty_ask_clarification():
@@ -1526,7 +1662,15 @@ def test_build_graph_default_checkpointer():
 
 # ─── QAGraph.__init__ (разделы 2.2, 6.4) ──────────────────────────────
 
-def test_qagraph_init_initializes_clients_and_key(monkeypatch):
+def test_qagraph_init_does_not_open_qdrant_client(monkeypatch):
+    """Фикс 3.1: QdrantClient при инициализации НЕ открывается.
+
+    Локальный Qdrant держит эксклюзивный файловый замок на папку базы,
+    поэтому клиент создаётся на время каждого поиска в search_node и
+    закрывается в finally — иначе create_index.py нельзя запустить при
+    работающем боте без pkill. Sparse-эмбеддер и API-ключ по-прежнему
+    инициализируются.
+    """
     calls = {}
 
     def fake_client(path):
@@ -1542,8 +1686,8 @@ def test_qagraph_init_initializes_clients_and_key(monkeypatch):
     cfg = _cfg(qdrant_path="/tmp/qdrant-test")
     qa = qa_graph.QAGraph(cfg)
 
-    assert calls["path"] == "/tmp/qdrant-test"
-    assert qa.client == "client"
+    assert calls == {}  # клиент при инициализации не создаётся
+    assert qa.client is None
     assert qa.sparse_model == "sparse"
     assert qa.api_key == "k-sf"  # SiliconFlow: embedding/rerank, из конфига
     # LLM-ключ в QAGraph не резолвится — он читается из llm_config.yaml

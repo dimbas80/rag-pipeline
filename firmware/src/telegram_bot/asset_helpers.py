@@ -7,6 +7,12 @@
 из ответа LLM извлекаются явные ссылки вида «Таблица N» / «Рисунок N»
 и по ним ищется ОДНОЗНАЧНЫЙ asset (по asset_type + номеру подписи).
 
+Многостраничные таблицы (фикс 3.4): у таблицы, разбитой на несколько
+страниц, в базе поле image_paths с несколькими путями. Это ОДНА таблица —
+бот отправляет ВСЕ её страницы. Неоднозначность только когда один и тот же
+номер встречается в РАЗНЫХ документах (разные doc_dir); если в запросе
+указан документ (номер ГОСТ/СП), выбор сужается до него перед проверкой.
+
 Модуль не зависит от Telegram и qa_graph — только от stdlib,
 поэтому все функции тестируются напрямую (firmware/tests/test_bot_assets.py).
 """
@@ -81,14 +87,65 @@ def asset_caption_number(asset_type: str, caption: str) -> str | None:
     return _normalize_ref_num(m.group(1))
 
 
+# Обозначение норматива в запросе: «ГОСТ 31996», «ГОСТ Р 50571»,
+# «СП 89.13330», «СНиП 2.04.07-86», «СанПиН 2.1.4.1074», «ТУ 16-705».
+_NORM_REF_RE = re.compile(
+    r"\b(?:гост\s*р\s*|гост\s*|сп\s*|снип\s*|санпин\s*|ту\s*)\d[\d.\-]*",
+    re.IGNORECASE,
+)
+
+
+def _query_norm_refs(query: str) -> list[str]:
+    """Обозначения нормативов из запроса (нормализованные).
+
+    «СП 89.13330» → ['сп89.13330']; «ГОСТ Р 50571» → ['гостр50571'].
+    Нормализация совпадает с _norm_doc_dir(): без пробелов, lowercase.
+    """
+    if not query:
+        return []
+    refs: list[str] = []
+    for m in _NORM_REF_RE.finditer(query):
+        ref = re.sub(r"\s+", "", m.group(0)).lower()
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _norm_doc_dir(doc_dir: str) -> str:
+    """Нормализация doc_dir для сравнения с обозначением из запроса."""
+    return re.sub(r"\s+", "", doc_dir or "").lower()
+
+
+def _narrow_by_query_doc(matches: list[dict], query: str) -> list[dict]:
+    """Если в query указан документ, оставляет совпадения только из него.
+
+    doc_dir результата (например «/mnt/docs/СП 89.13330.2016 …») сравнивается
+    с обозначением норматива из запроса после нормализации: если в doc_dir
+    встречается «сп89.13330» — результат относится к запрошенному документу.
+
+    Если ни один doc_dir не содержит обозначение (сужение не сработало),
+    возвращает matches без изменений — дальше решает проверка неоднозначности.
+    """
+    norm_refs = _query_norm_refs(query)
+    if not norm_refs:
+        return matches
+    narrowed = [
+        m for m in matches
+        if any(ref in _norm_doc_dir(m["doc_dir"]) for ref in norm_refs)
+    ]
+    return narrowed or matches
+
+
 def find_assets_by_reference(
     search_results: list[dict], asset_type: str, ref_num: str
 ) -> list[dict]:
     """Все ассеты из search_results нужного типа с совпадающим номером подписи.
 
     Каждый элемент результата — словарь вида:
-        {asset_type, caption, image_path, doc_dir, full_path}
-    full_path — резолв относительного image_path через doc_dir результата.
+        {asset_type, caption, image_paths, doc_dir, full_paths}
+    full_paths — резолв ВСЕХ относительных путей ассета через doc_dir:
+    из image_paths (страницы многостраничной таблицы), при отсутствии —
+    из [image_path]. Один ассет (одна таблица) = один элемент списка.
     """
     matches: list[dict] = []
     for r in search_results or []:
@@ -100,42 +157,66 @@ def find_assets_by_reference(
             caption = asset.get("caption") or ""
             if asset_caption_number(asset_type, caption) != ref_num:
                 continue
-            image_path = asset.get("image_path") or ""
-            if not image_path:
+            # Все страницы ассета: image_paths (несколько путей), fallback
+            # на одиночный image_path (старые чанки/тесты).
+            rel_paths = asset.get("image_paths") or []
+            if not rel_paths:
+                single = asset.get("image_path") or ""
+                rel_paths = [single] if single else []
+            if not rel_paths:
                 continue
-            full = os.path.join(doc_dir, image_path) if doc_dir else image_path
+            full_paths = [
+                os.path.join(doc_dir, p) if doc_dir else p
+                for p in rel_paths
+            ]
             matches.append(
                 {
                     "asset_type": a_type,
                     "caption": caption,
-                    "image_path": image_path,
+                    "image_paths": rel_paths,
                     "doc_dir": doc_dir,
-                    "full_path": full,
+                    "full_paths": full_paths,
+                    # Совместимость со старым форматом: первый путь.
+                    "image_path": rel_paths[0],
+                    "full_path": full_paths[0],
                 }
             )
     return matches
 
 
 def resolve_images_to_send(
-    search_results: list[dict], answer: str, query: str = ""
+    search_results: list[dict], answer: str, query: str = "",
+    prefer: str = "answer",
 ) -> tuple[list[str], list[str]]:
     """Решает, какие изображения отправить, когда cited_chunk_ids пуст.
 
-    Для каждой явной ссылки «Таблица N» / «Рисунок N» (сначала из answer,
-    при отсутствии ссылок — из query) ищет однозначный ассет по asset_type
-    и номеру подписи среди search_results.
+    Для каждой явной ссылки «Таблица N» / «Рисунок N» ищет однозначный
+    ассет по asset_type и номеру подписи среди search_results. Источник
+    ссылок выбирается параметром ``prefer``:
+      - prefer='answer' (по умолчанию): сначала ссылки из answer, при их
+        отсутствии — из query (старое поведение);
+      - prefer='query': сначала ссылки из query, при их отсутствии — из
+        answer (фикс 3.2: явная ссылка в запросе приоритетна, даже когда
+        cited_chunk_ids не пуст).
 
     Возвращает (paths_to_send, warnings):
     - ссылок нет или номер не найден → paths пуст (картинки не отправляются);
-    - на один номер нашлись ассеты с РАЗНЫМИ путями (разные документы) →
-      warning, paths пуст (пачка не отправляется);
+    - на один номер нашлись ассеты из РАЗНЫХ документов (разные doc_dir) →
+      warning, paths пуст (пачка не отправляется, fail closed);
+    - несколько путей с одним номером в пределах ОДНОГО документа →
+      страницы одной многостраничной таблицы → paths содержит ВСЕ пути;
+    - если в query указан документ (номер ГОСТ/СП, например «СП 89.13330») —
+      выбор сужается по doc_dir до этого документа перед проверкой;
     - однозначные ссылки → пути файлов для отправки (без дубликатов).
     """
     warnings: list[str] = []
 
-    refs = extract_asset_references(answer)
-    if not refs and query:
-        refs = extract_asset_references(query)
+    answer_refs = extract_asset_references(answer)
+    query_refs = extract_asset_references(query) if query else []
+    if prefer == "query":
+        refs = query_refs or answer_refs
+    else:
+        refs = answer_refs or query_refs
 
     if not refs:
         return [], warnings
@@ -143,16 +224,30 @@ def resolve_images_to_send(
     selected: list[str] = []
     for asset_type, ref_num in refs:
         matches = find_assets_by_reference(search_results, asset_type, ref_num)
-        unique_paths = list(dict.fromkeys(m["full_path"] for m in matches))
-        if not unique_paths:
+        # Если в запросе указан документ (например «СП 89.13330») —
+        # сужаем выбор до этого документа перед проверкой неоднозначности.
+        matches = _narrow_by_query_doc(matches, query)
+        # Плоский список (doc_dir, полный путь) всех страниц ассетов.
+        pairs: list[tuple[str, str]] = []
+        for m in matches:
+            for fp in m["full_paths"]:
+                pairs.append((m["doc_dir"], fp))
+        if not pairs:
             warnings.append(f"Не найден ассет для ссылки: {asset_type} {ref_num}")
             continue
-        if len(unique_paths) > 1:
+        # Один и тот же номер в пределах ОДНОГО документа — страницы одной
+        # таблицы (разные image_paths) → отправляем все пути. Тот же номер
+        # в РАЗНЫХ документах — неоднозначность, пачка не отправляется.
+        doc_dirs = {d for d, _ in pairs}
+        if len(doc_dirs) > 1:
             warnings.append(
-                f"Неоднозначная ссылка {asset_type} {ref_num}: найдено путей "
-                f"{len(unique_paths)} ({unique_paths[:3]}) — пачка не отправлена"
+                f"Неоднозначная ссылка {asset_type} {ref_num}: совпадения в "
+                f"{len(doc_dirs)} документах ({sorted(doc_dirs)[:3]}) — "
+                f"пачка не отправлена"
             )
             return [], warnings
-        selected.append(unique_paths[0])
+        for _, fp in pairs:
+            if fp not in selected:
+                selected.append(fp)
 
     return list(dict.fromkeys(selected)), warnings

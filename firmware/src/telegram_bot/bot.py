@@ -14,6 +14,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import re
 import sys
 
 # Добавляем родительскую директорию для импорта qa_graph
@@ -23,7 +24,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-from asset_helpers import resolve_images_to_send
+from asset_helpers import extract_asset_references, resolve_images_to_send
 
 # Загружаем .env из корня проекта
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
@@ -123,6 +124,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         qa = get_qa()
         result = await asyncio.to_thread(qa.run, full_query)
+
+        # Граф может остановиться на уточняющем вопросе (ask_clarification):
+        # в результате есть ключ __interrupt__ и нет final_answer. Отвечаем
+        # текстом уточняющего вопроса, а НЕ «Не удалось сформировать ответ»
+        # (фикс 3.3).
+        interrupt_text = _interrupt_reply_text(result)
+        if interrupt_text:
+            await status_msg.delete()
+            await update.message.reply_text(f"❓ {interrupt_text}")
+            logger.info(f"Запрошено уточнение: {interrupt_text[:200]}")
+            return
+
         answer = result.get("final_answer", "")
         cited = result.get("cited_chunk_ids", [])
         logger.info(f"cited_chunk_ids from QA: {cited}")
@@ -148,8 +161,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             answer = answer[:4000] + "\n\n…(ответ обрезан)"
 
         await _send_answer(update, answer)
-        # Отправляем изображения: по cited_chunk_ids (старое поведение),
-        # при пустом списке — точечный fallback по явным ссылкам в answer.
+        # Отправляем изображения с приоритетом: явная ссылка в query →
+        # явная ссылка в answer → старое cited-поведение (фикс 3.2).
         await _send_images(
             update,
             result.get("search_results", []),
@@ -169,28 +182,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def _interrupt_reply_text(result: dict) -> str | None:
+    """Текст уточняющего вопроса из результата qa.run() (фикс 3.3).
+
+    Если граф остановился на interrupt (ask_clarification), в result по
+    ключу __interrupt__ лежит список Interrupt-объектов LangGraph; текст
+    вопроса — в .value (как в qa_graph._print_interrupt_value). Возвращает
+    текст вопроса или None, если прерывания не было.
+    """
+    interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+    if not interrupts:
+        return None
+    intr = interrupts[0]
+    value = getattr(intr, "value", None)
+    if value is None:
+        value = str(intr)
+    text = str(value).strip()
+    return text or None
+
+
 async def _send_images(update: Update, search_results: list, query: str,
                       cited_chunk_ids: list[str] | None = None,
                       answer: str = ""):
     """Отправляет изображения таблиц/рисунков к ответу.
 
-    Алгоритм:
-    1. cited_chunk_ids НЕ пуст → старое поведение: берём только
-       процитированные чанки, фильтруем по интенту запроса.
-    2. cited_chunk_ids пуст → точечный fallback: из answer (при отсутствии
-       ссылок — из query) извлекаем явные ссылки «Таблица N»/«Рисунок N»
-       и ищем ОДНОЗНАЧНЫЙ asset по asset_type и caption. Если номер не
-       найден — картинки не отправляются; если несколько разных путей —
-       warning и пачка не отправляется.
+    Приоритет выбора (фикс 3.2):
+    1. Явная ссылка «Таблица N»/«Рисунок N» в QUERY → точечный выбор
+       (однозначный asset по asset_type+caption), даже при непустых
+       cited_chunk_ids.
+    2. Ссылок в query нет, но есть в answer → точечный выбор по answer.
+    3. Явных ссылок нет вовсе → старое cited-поведение: все asset'ы
+       процитированных чанков по интенту запроса.
+    4. Неоднозначность / нет совпадения → картинки НЕ отправляются
+       (fail closed), warning в лог.
     """
-    import re
+    query_refs = extract_asset_references(query)
+    answer_refs = extract_asset_references(answer)
 
-    # ── cited_chunk_ids не пуст: старое поведение ──
-    logger.info(f"_send_images: cited_chunk_ids={cited_chunk_ids}, search_results_count={len(search_results)}")
+    # ── 1-2. Явные ссылки — точечный выбор (query приоритетнее answer) ──
+    if query_refs or answer_refs:
+        prefer = "query" if query_refs else "answer"
+        paths, warnings = resolve_images_to_send(
+            search_results, answer, query, prefer=prefer
+        )
+        for w in warnings:
+            logger.warning(w)
+        if not paths:
+            logger.info(
+                f"_send_images: явная ссылка не найдена/неоднозначна "
+                f"(query_refs={query_refs}, answer_refs={answer_refs}) — "
+                f"картинки не отправляю (fail closed)"
+            )
+            return
+        await _send_photo_paths(update, paths, "явная ссылка")
+        return
+
+    # ── 3. Явных ссылок нет → старое cited-поведение ──
     if cited_chunk_ids:
         cited_set = set(cited_chunk_ids)
         relevant = [r for r in search_results if r.get("chunk_id") in cited_set]
-        logger.info(f"_send_images: cited_set={cited_set}, relevant_chunks={[r.get('chunk_id') for r in relevant]}")
+        logger.info(
+            f"_send_images: cited_set={cited_set}, "
+            f"relevant_chunks={[r.get('chunk_id') for r in relevant]}"
+        )
 
         # ── Определение интента ──
         q = query.lower()
@@ -200,8 +254,7 @@ async def _send_images(update: Update, search_results: list, query: str,
             want_figures = True
             want_tables = True
 
-        sent: set[str] = set()
-
+        paths: list[str] = []
         for r in relevant:
             doc_dir = r.get("doc_dir", "")
             for asset in r.get("assets") or []:
@@ -217,27 +270,18 @@ async def _send_images(update: Update, search_results: list, query: str,
                     continue
 
                 full = os.path.join(doc_dir, image_path) if doc_dir else image_path
-                if full in sent or not os.path.exists(full):
-                    if not os.path.exists(full):
-                        logger.warning(f"Изображение не найдено: {full}")
-                    continue
+                if full not in paths:
+                    paths.append(full)
 
-                try:
-                    with open(full, "rb") as f:
-                        await update.message.reply_photo(f, caption=os.path.basename(full))
-                    sent.add(full)
-                    logger.info(f"Отправлено изображение ({asset_type}): {full}")
-                except Exception as e:
-                    logger.warning(f"Не удалось отправить {full}: {e}")
+        await _send_photo_paths(update, paths, "cited")
         return
 
-    # ── cited_chunk_ids пуст: точечный fallback по caption ──
-    paths, warnings = resolve_images_to_send(search_results, answer, query)
-    for w in warnings:
-        logger.warning(w)
-    if not paths:
-        logger.info("_send_images: fallback — явные ссылки не найдены/неоднозначны, картинки не отправляю")
-        return
+    # ── 4. Ни явных ссылок, ни cited_chunk_ids — картинки не отправляем ──
+    logger.info("_send_images: явных ссылок и cited_chunk_ids нет — картинки не отправляю")
+
+
+async def _send_photo_paths(update: Update, paths: list[str], label: str) -> None:
+    """Отправляет изображения по путям; отсутствующие файлы пропускает."""
     for full in paths:
         if not os.path.exists(full):
             logger.warning(f"Изображение не найдено: {full}")
@@ -245,7 +289,7 @@ async def _send_images(update: Update, search_results: list, query: str,
         try:
             with open(full, "rb") as f:
                 await update.message.reply_photo(f, caption=os.path.basename(full))
-            logger.info(f"Отправлено изображение (fallback по caption): {full}")
+            logger.info(f"Отправлено изображение ({label}): {full}")
         except Exception as e:
             logger.warning(f"Не удалось отправить {full}: {e}")
 
