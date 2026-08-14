@@ -14,8 +14,17 @@ sparse — локальный fastembed (Qdrant/bm25).
     - задать SILICONFLOW_API_KEY (в .env рядом с запуском или --api-key)
 
 Запуск:
+    # Основной способ — путь к папке документа: *_chunks.jsonl и *_assets.json
+    # ищутся автоматически, коллекция выбирается автоматически.
+    python create_index.py "path/to/doc_folder"
+
+    # Прежний способ — явные файлы.
     python create_index.py --chunks path/to/chunks.jsonl --assets path/to/assets.json \
         --collection technical_standard
+
+    # --collection можно не указывать: будет использована единственная
+    # коллекция в базе / создана technical_standard / предложен выбор при
+    # нескольких коллекциях.
 """
 import argparse
 import json
@@ -242,12 +251,166 @@ def build_payload(chunk: dict, doc_meta: dict, assets_by_id: dict, row_index: in
     }
 
 
+def discover_input_files(input_dir) -> tuple[Path, Path]:
+    """
+    Ищет в папке документа ровно один ``*_chunks.jsonl`` и ровно один
+    ``*_assets.json``.
+
+    Возвращает ``(chunks_path, assets_path)``. Если файлов 0 или >1 любого
+    типа — бросает ValueError с перечнем найденных кандидатов и подсказкой
+    указать файлы явно через ``--chunks/--assets``. ``.md``, подпапки
+    (в т.ч. ``image/``) и ``.bak*`` игнорируются.
+    """
+    input_dir = Path(input_dir)
+    if not input_dir.is_dir():
+        raise ValueError(f"Папка не найдена: {input_dir}")
+
+    def _candidates(suffix: str) -> list[Path]:
+        return sorted(
+            p for p in input_dir.glob(f"*{suffix}")
+            if p.is_file() and ".bak" not in p.name
+        )
+
+    chunks_cands = _candidates("_chunks.jsonl")
+    assets_cands = _candidates("_assets.json")
+
+    problems = []
+    if len(chunks_cands) != 1:
+        problems.append(f"chunks (*_chunks.jsonl){_fmt_candidates(chunks_cands)}")
+    if len(assets_cands) != 1:
+        problems.append(f"assets (*_assets.json){_fmt_candidates(assets_cands)}")
+    if problems:
+        raise ValueError(
+            f"Не удалось однозначно определить файлы документа в папке {input_dir}:\n"
+            + "\n".join(f"  - {p}" for p in problems)
+            + "\nУкажи файлы явно через --chunks и --assets."
+        )
+    return chunks_cands[0], assets_cands[0]
+
+
+def _fmt_candidates(paths: list[Path]) -> str:
+    """Формат списка кандидатов для сообщений об ошибках."""
+    if not paths:
+        return " (не найдено)"
+    names = "\n    ".join(str(p.name) for p in paths)
+    return f" (найдено {len(paths)}):\n    {names}"
+
+
+def resolve_input_paths(input_dir, chunks, assets) -> tuple[Path, Path]:
+    """
+    Определяет ``(chunks_path, assets_path)`` по аргументам CLI.
+
+    - ``input_dir`` задан → авто-поиск в папке (флаги при этом запрещены);
+    - иначе нужны ОБА флага ``--chunks`` и ``--assets`` (старый способ).
+
+    Бросает ValueError при неоднозначной комбинации.
+    """
+    if input_dir is not None:
+        if chunks is not None or assets is not None:
+            raise ValueError(
+                "Укажи либо input_dir (папку документа), либо --chunks/--assets — не вместе."
+            )
+        return discover_input_files(input_dir)
+    if chunks is None or assets is None:
+        raise ValueError(
+            "Укажи input_dir (папку документа) либо оба флага --chunks и --assets."
+        )
+    return Path(chunks), Path(assets)
+
+
+def select_collection(client, requested: str | None = None,
+                      input_fn=None, isatty_fn=None, max_attempts: int = 3) -> str:
+    """
+    Определяет имя коллекции Qdrant для записи.
+
+    - ``requested`` задан → возвращается как есть (поведение как раньше);
+    - иначе смотрит ``client.get_collections()``:
+      - 0 коллекций → ``DEFAULT_COLLECTION`` (создаётся позже в main);
+      - 1 коллекция → она;
+      - >1 → нумерованный список + запрос у пользователя (``input_fn``);
+        при неинтерактивном stdin (``isatty_fn() == False``) читается одна
+        строка из пайпа (например ``echo "2" | ...``), а при EOF сразу
+        бросается ValueError со списком коллекций и подсказкой ``--collection``;
+        невалидный ввод повторяется до ``max_attempts`` раз, затем ValueError.
+    """
+    if requested:
+        print(f"Использую коллекцию {requested} (задана через --collection).")
+        return requested
+
+    try:
+        names = sorted(c.name for c in client.get_collections().collections)
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось получить список коллекций Qdrant: {exc}") from exc
+
+    if not names:
+        print(f"Коллекций нет — создам {DEFAULT_COLLECTION}.")
+        return DEFAULT_COLLECTION
+    if len(names) == 1:
+        print(f"Использую коллекцию {names[0]} (единственная в базе).")
+        return names[0]
+
+    listing = "\n".join(f"  {i}. {name}" for i, name in enumerate(names, 1))
+    print("Найдено несколько коллекций:")
+    print(listing)
+
+    if input_fn is None:
+        input_fn = input
+    if isatty_fn is None:
+        isatty_fn = sys.stdin.isatty
+
+    prompt = f"В какую коллекцию писать? (1-{len(names)}) "
+
+    def _read_choice() -> int | None:
+        raw = input_fn(prompt)
+        try:
+            idx = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return None
+        if 1 <= idx <= len(names):
+            return idx
+        return None
+
+    def _confirm(name: str) -> str:
+        print(f"Использую коллекцию {name} (выбрана пользователем).")
+        return name
+
+    if not isatty_fn():
+        # stdin — не tty: одна строка из пайпа, при EOF — ошибка со списком.
+        try:
+            choice = _read_choice()
+        except EOFError:
+            choice = None
+        if choice is None:
+            raise ValueError(
+                "Укажите --collection <имя> (stdin не интерактивен). Доступны:\n" + listing
+            )
+        return _confirm(names[choice - 1])
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            choice = _read_choice()
+        except EOFError:
+            choice = None
+        if choice is not None:
+            return _confirm(names[choice - 1])
+        print(f"Некорректный ввод, попробуй ещё раз ({attempt}/{max_attempts}).")
+
+    raise ValueError(
+        f"Не удалось выбрать коллекцию после {max_attempts} попыток. Укажите --collection <имя>."
+    )
+
+
 def main():
     ap = argparse.ArgumentParser(description="Индексация чанков в Qdrant (dense: SiliconFlow, sparse: fastembed).")
-    ap.add_argument("--chunks", required=True, type=Path, help="JSONL с чанками документа")
-    ap.add_argument("--assets", required=True, type=Path, help="JSON с assets.json документа")
-    ap.add_argument("--collection", default=DEFAULT_COLLECTION,
-                    help=f"Имя коллекции Qdrant (по умолчанию {DEFAULT_COLLECTION})")
+    ap.add_argument(
+        "input_dir", nargs="?", type=Path, default=None,
+        help="Папка документа: в ней ищутся *_chunks.jsonl и *_assets.json "
+             "(альтернатива --chunks/--assets)",
+    )
+    ap.add_argument("--chunks", type=Path, default=None, help="JSONL с чанками документа (взаимоисключающе с input_dir)")
+    ap.add_argument("--assets", type=Path, default=None, help="JSON с assets.json документа (взаимоисключающе с input_dir)")
+    ap.add_argument("--collection", default=None,
+                    help="Имя коллекции Qdrant (по умолчанию авто-выбор: единственная в базе / новая / спросить)")
     ap.add_argument("--qdrant-path", default="./qdrant_data",
                     help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -259,11 +422,24 @@ def main():
     )
     args = ap.parse_args()
 
+    try:
+        chunks_path, assets_path = resolve_input_paths(args.input_dir, args.chunks, args.assets)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.input_dir is not None:
+        print(f"Найдены файлы в папке {args.input_dir}:")
+    else:
+        print("Файлы заданы явно:")
+    print(f"  chunks: {chunks_path}")
+    print(f"  assets: {assets_path}")
+
     api_key = resolve_api_key(args.api_key)
 
-    assets_by_id, doc_meta = load_assets(args.assets)
+    assets_by_id, doc_meta = load_assets(assets_path)
 
-    chunks = [json.loads(l) for l in args.chunks.read_text(encoding="utf-8").splitlines() if l.strip()]
+    chunks = [json.loads(l) for l in chunks_path.read_text(encoding="utf-8").splitlines() if l.strip()]
 
     errors = validate_data(chunks, assets_by_id, doc_meta)
     if errors:
@@ -282,15 +458,21 @@ def main():
 
     client = QdrantClient(path=args.qdrant_path)
 
+    try:
+        collection = select_collection(client, args.collection)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+
     embed_texts = [build_embed_text(c, assets_by_id, doc_meta) for c in chunks]
 
     # Узнаём размерность dense-вектора по первому эмбеддингу и создаём
     # коллекцию с dense (COSINE) + sparse векторами, как в example/ingest.py.
-    if not client.collection_exists(args.collection):
+    if not client.collection_exists(collection):
         probe = embed_texts_siliconflow(embed_texts[:1], api_key)
         dense_dim = len(probe[0])
         client.create_collection(
-            collection_name=args.collection,
+            collection_name=collection,
             vectors_config={
                 "dense": models.VectorParams(size=dense_dim, distance=models.Distance.COSINE),
             },
@@ -298,9 +480,9 @@ def main():
                 "sparse": models.SparseVectorParams(),
             },
         )
-        print(f"Коллекция {args.collection} создана (dense dim={dense_dim}).")
+        print(f"Коллекция {collection} создана (dense dim={dense_dim}).")
     else:
-        print(f"Коллекция {args.collection} уже существует, добавляю точки.")
+        print(f"Коллекция {collection} уже существует, добавляю точки.")
 
     # Удаляем старые точки документа перед переиндексацией —
     # upsert перезаписывает только при совпадении UUID, а он зависит от row_index,
@@ -310,7 +492,7 @@ def main():
         del_filter = models.Filter(
             must=[models.FieldCondition(key="document_id", match=models.MatchValue(value=doc_id))]
         )
-        del_result = client.delete(collection_name=args.collection, points_selector=del_filter)
+        del_result = client.delete(collection_name=collection, points_selector=del_filter)
         if del_result.status == models.UpdateStatus.COMPLETED:
             print(f"Старые точки документа {doc_id} удалены перед индексацией.")
 
@@ -339,9 +521,9 @@ def main():
                 )
             )
 
-        client.upsert(collection_name=args.collection, points=points)
+        client.upsert(collection_name=collection, points=points)
 
-    print(f"Готово: {len(chunks)} чанков в коллекции {args.collection}.")
+    print(f"Готово: {len(chunks)} чанков в коллекции {collection}.")
 
 
 if __name__ == "__main__":
