@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-15 — by: orchestrator — task: флаг --reg реализован (PASS); инцидент --reg идемпотентности разбирается
+_Last updated: 2026-08-15 — by: orchestrator — task: флаг --reg реализован (PASS)
 
 ## Working functionality
 
@@ -29,7 +29,6 @@ _Last updated: 2026-08-15 — by: orchestrator — task: флаг --reg реал
 - Слабая уверенность привязки Б.1 (Jaccard 0.11) и Ж.1 (0.27) при объединении в одну таблицу — ожидаемо (слияние снижает оценку), не блокирует результат.
 - **Provod `/chat/completions` недоступен (2026-08-15):** `/models` отвечает 200, но чат-эндпоинт виснет по всем моделям (gemini-2.5-flash-lite, glm-4.6v, gemini-2.5-flash, glm-5v-turbo, gemini-3.5-flash) — провайдерская деградация, не ключи. Vision временно на anymodel. Когда provod восстановится — вернуть `config_ai.yaml` (коммит `0d36607`).
 - **`create_index.py` не читает `QDRANT_PATH` из `.env`:** дефолт `--qdrant-path` — относительный `./qdrant_data`, без явного абсолютного пути индекс уходит в dev-копию рядом с cwd, а не в рабочую базу `/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data` (её читает бот). Всегда передавать `--qdrant-path` абсолютный + `--strict`.
-- **`--reg` на уже зарегистрированном документе (совпадение по stem `source_file`) переписал запись вместо skip:** инцидент 2026-08-15 — прогон `--reg` на готовом `.md` переписал запись ГОСТ 18410 (`GOST_18410_kabel` → `GOST_18410`, `domain` → null, `date_enacted` → 1975, `source_file` → `.md`) и затёр следующую запись `old_snip` (СНиП 2.04.05-86). Идемпотентность §5.3 не сработала. Требует фикса: skip при полном совпадении + защита от затирания соседних записей.
 
 ## In progress
 
