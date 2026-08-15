@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-15 — by: orchestrator — task: vision-провайдер переведён на anymodel (provod /chat недоступен)
+_Last updated: 2026-08-15 — by: orchestrator — task: ГОСТ 18410-73 проиндексирован (4 документа в Qdrant), README + STATE обновлены
 
 ## Working functionality
 
@@ -24,9 +24,10 @@ _Last updated: 2026-08-15 — by: orchestrator — task: vision-провайде
 - `firmware/tests/test_gap_filling.py` содержит 8 предсуществующих падений; полный регрессионный прогон выполняется с `--ignore=tests/test_gap_filling.py`.
 - Порог Jaccard `0.10` для fallback-привязки таблиц подобран на СП89; на других документах может потребоваться калибровка. Слабая уверенность логируется WARNING, но не блокирует результат.
 - `test_gemini_full_pdf.py` падает на `import fitz` в изолированной среде coder-воркера (не в рабочем окружении проекта) — окружение, не дефект кода.
-- Полная переиндексация корпуса (кроме СП89) после исправления table→image не выполнялась.
+- Переиндексация корпуса с новой логикой `component_images` выполнена частично: СП89 (2026-08-14) и ГОСТ 18410-73 (2026-08-15). ГОСТ 31996 и СО153 — ещё на старой логике.
 - Слабая уверенность привязки Б.1 (Jaccard 0.11) и Ж.1 (0.27) при объединении в одну таблицу — ожидаемо (слияние снижает оценку), не блокирует результат.
 - **Provod `/chat/completions` недоступен (2026-08-15):** `/models` отвечает 200, но чат-эндпоинт виснет по всем моделям (gemini-2.5-flash-lite, glm-4.6v, gemini-2.5-flash, glm-5v-turbo, gemini-3.5-flash) — провайдерская деградация, не ключи. Vision временно на anymodel. Когда provod восстановится — вернуть `config_ai.yaml` (коммит `0d36607`).
+- **`create_index.py` не читает `QDRANT_PATH` из `.env`:** дефолт `--qdrant-path` — относительный `./qdrant_data`, без явного абсолютного пути индекс уходит в dev-копию рядом с cwd, а не в рабочую базу `/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data` (её читает бот). Всегда передавать `--qdrant-path` абсолютный + `--strict`.
 
 ## In progress
 
@@ -34,7 +35,7 @@ _Last updated: 2026-08-15 — by: orchestrator — task: vision-провайде
 
 ## Planned / backlog
 
-- Выполнить sweep по остальным документам корпуса: повторно построить RAG assets с новой логикой component_images, затем переиндексировать фактическое хранилище consumer'а.
+- Переиндексировать ГОСТ 31996 и СО153 с новой логикой `component_images` (сейчас на старой); ГОСТ 18410-73 и СП89 уже на новой.
 - Отдельно разобраться с `test_gap_filling.py`; не включать в зелёный прогон до исправления.
 - Закоммитить оставшиеся untracked: `AGENTS.md`, `.hermes/STATE.md`, workflow-артефакты `workflows/t_*` (раздельно от кода).
 
@@ -48,6 +49,7 @@ _Last updated: 2026-08-15 — by: orchestrator — task: vision-провайде
 - **ID-маркеры таблиц** (2026-08-15): `extract_table_images()` назначал id по boundingBox Yandex, а `_inject_table_ids()` пересчитывал по `page_boundaries` → на границе страницы маркер съезжал, AI-сверка резолвила в чужой vision-эталон. Решение: id рождается в `parse_yandex_json_to_md()` (тот же порядок итерации `pages`/`tables[]`, что в вырезке — id совпадает); группировка `component_images` — только spatial-pass, без голого `table_num` (номера не уникальны между разделами/приложениями).
 - **R-2 (2026-08-15, коммит fdee917):** spatial-pass `extract_table_images()` расширен предикатом `_is_continuation_caption()` — подписи «Продолжение/Окончание таблицы N» теперь тоже группируются (все страницы в `component_images`/`image_paths`), при совпадении `table_num` с головой и соблюдении геометрии. Босая «Таблица N» по-прежнему не группируется (дефект 2 не возвращается).
 - **AI-провайдеры (2026-08-15, коммит 0d36607):** vision `provod → anymodel` (`gc/gemini-2.5-flash` primary / `glm/glm-4.6v` fallback) из-за недоступности provod `/chat/completions`; `ai_postprocess` fallback → `glm/glm-5.2`; primary deepseek (`deepseek-v4-pro`) не менялся — работает. `ANYMODEL_API_KEY` добавлен в `firmware/src/.env`.
+- **ГОСТ 18410-73 проиндексирован (2026-08-15):** prod-база Qdrant теперь 4 документа (234 точки): ГОСТ 31996=109, СО153=53, СП89=62, ГОСТ 18410-73=10. `document_id` в `rag_config.yaml` исправлен «ГОСТ 18410—1973»→«ГОСТ 18410—73».
 
 ## Project instructions
 
@@ -60,6 +62,7 @@ _Last updated: 2026-08-15 — by: orchestrator — task: vision-провайде
 - Живой прогон СП 89.13330.2016 (2026-08-14): 12 таблиц, component_images + image_paths подтверждены чтением фактического `assets.json`.
 - Коммиты: `13b55f7` (fix tables), `2522cf0` (chore orchestration) — поверх `d71e8c4`.
 - Тесты: 258 passed (`--ignore=tests/test_gap_filling.py`).
+- Prod-база Qdrant: 4 документа, 234 точки (ГОСТ 31996=109, СО153=53, СП89=62, ГОСТ 18410-73=10).
 - История архитектуры: `docs/architecture/rag-v2-architecture.md`, `docs/architecture/decision-records/adr-010-rag-semantic-assets-and-token-chunking.md`.
 
 ## Notes
