@@ -89,6 +89,26 @@ documents:
       - "Предисловие"
       - "Содержание"
 
+  # ── ГОСТ18410-73_Кабели_с_бумажной_изоляцией ──
+  GOST_18410_kabel:
+    document_id: "ГОСТ 18410—1973"
+    document_id_alt: null
+    document_type: "ГОСТ"      # ГОСТ, СП, ПУЭ, СО, СНиП — пользователь заполнит сам
+    domain: "Кабели"             # молниезащита, кабели, котельные — пользователь заполнит сам
+    title: "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ"
+    edition: "1973"
+    date_enacted: "1973-01-01"
+    date_amended: null
+    amended_by: null
+    source_file: "ГОСТ18410-73_Кабели_с_бумажной_изоляцией.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Предисловие"
+      - "Содержание"
+
   # ── Пример недействующего документа: СНиП 2.04.05-86 ──
   old_snip:
     document_id: "СНиП 2.04.05-86"
