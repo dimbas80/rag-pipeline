@@ -604,6 +604,14 @@ def parse_yandex_json_to_md(
         # 3. Рендерим страницу в порядке Y
         page_lines: list[str] = []
 
+        # Индекс таблицы в массиве ta["tables"] — единственный источник id.
+        # Тот же список итерирует extract_table_images() через enumerate(ta["tables"]),
+        # поэтому ti здесь == ti в вырезке (тождество id, контракт table-id-marker §4).
+        # НЕ порядковый счётчик Y-сортировки и НЕ позиция в page_lines.
+        table_raw_index: dict[int, int] = {
+            id(t): i for i, t in enumerate(raw_tables)
+        }
+
         for y, etype, data in elements:
             if etype == "block":
                 # Пропускаем блоки, которые являются частью таблицы
@@ -616,6 +624,12 @@ def parse_yandex_json_to_md(
                 md_table, note_text = _table_to_md(data)
                 if md_table:
                     caption = _find_table_caption_for(blocks, data, raw_tables)
+                    ti = table_raw_index.get(id(data))
+                    if ti is not None:
+                        # ID-маркер рождается здесь (parse), а не в постобработке:
+                        # (page_idx, таблица) доступны в том же порядке, что в вырезке.
+                        # Маркер всегда перед подписью; без подписи — перед строками таблицы.
+                        page_lines.append(f"<!-- t_p{page_idx + 1}_{ti} -->")
                     if caption:
                         page_lines.append(f"*{caption}*")
                     page_lines.append(md_table)
@@ -1765,16 +1779,10 @@ def extract_table_images(
                 table_geometry[id(item)] = (pi, ti, max(ys) * sy, page.rect.height)
                 log.info(f"  Вырезана таблица {table_counter}: стр.{pi+1}, {fname} ({rect.width:.0f}x{rect.height:.0f} px)")
 
-    # Сначала сохраняем старое связывание по номеру таблицы.
-    groups: dict[str, list[dict]] = {}
-    for item in table_images:
-        if item.get("table_num"):
-            groups.setdefault(item["table_num"], []).append(item)
-    for group in groups.values():
-        if len(group) > 1:
-            paths = [part["path"] for part in group]
-            for part in group:
-                part["component_images"] = paths
+    # component_images формируются ТОЛЬКО spatial-pass'ем ниже.
+    # Группировка по голому table_num удалена (контракт table-id-marker §5.3):
+    # номер «Таблица N» не уникален между разделами/приложениями — три несвязанные
+    # таблицы с одинаковым номером склеивались в одну и удалялись склейкой.
 
     # На продолжении Yandex OCR часто не выдаёт ни caption, ни table_num.
     tables_by_page: dict[int, list[dict]] = {}
@@ -2708,98 +2716,6 @@ def fix_latex_caret_spaces(md_text: str) -> str:
 # 9. Полная скриптовая постобработка
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _inject_table_ids(
-    md_text: str,
-    page_boundaries: list[tuple[int, int]] | None = None,
-    table_images: list[dict] | None = None,
-) -> str:
-    """Вставить ID-маркеры <!-- t_pN_M --> перед Markdown-таблицами.
-
-    Сквозная маркировка для AI-сопоставления OCR-таблиц с vision-эталонами
-    (тот же формат id, что в extract_table_images(): t_p{page+1}_{index}).
-
-    Логика:
-      - md_text разбивается на строки; для каждой строки определяется номер
-        страницы через page_boundaries ([(start, end), ...], 0-based строки,
-        end exclusive).
-      - Таблица = группа строк |...|, перед которой (пропуская пустые строки)
-        идёт строка-название (не |...|-строка). Несколько |...|-строк подряд —
-        ОДНА таблица.
-      - Индекс таблицы на странице (idx) сбрасывается на новой странице.
-      - Маркер <!-- t_p{page+1}_{idx} --> вставляется отдельной строкой
-        ПЕРЕД строкой-названием.
-
-    Порядок таблиц в md_text совпадает с порядком в Yandex JSON (один
-    источник — parse_yandex_json_to_md), поэтому индексы совпадают с id
-    из extract_table_images().
-
-    Args:
-        md_text: Markdown-текст (после шагов 1–2 постобработки).
-        page_boundaries: Границы страниц в md_text.
-        table_images: Список от extract_table_images() — используется как
-            признак «включить маркировку» (проверяется в
-            run_script_postprocess()).
-
-    Returns:
-        md_text с вставленными ID-маркерами.
-    """
-    if not page_boundaries:
-        return md_text
-
-    lines = md_text.split("\n")
-
-    def _is_row(line: str) -> bool:
-        stripped = line.strip()
-        return stripped.startswith("|") and "|" in stripped[1:]
-
-    def _page_of_line(line_num: int) -> int:
-        for page_idx, (p_start, p_end) in enumerate(page_boundaries):
-            if p_start <= line_num < p_end:
-                return page_idx
-        # Строки за пределами последней границы относим к последней странице
-        return len(page_boundaries) - 1
-
-    # Проход 1: найти таблицы — пары (индекс строки-названия, индекс первой |-строки)
-    table_starts: list[tuple[int, int]] = []
-    prev_nonblank = -1
-    prev_nonblank_is_row = False
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        is_row = _is_row(line)
-        if is_row and not prev_nonblank_is_row:
-            table_starts.append((prev_nonblank, i))
-        prev_nonblank = i
-        prev_nonblank_is_row = is_row
-
-    if not table_starts:
-        return md_text
-
-    # Собираем маркеры: по одному на строку-название, индекс — на страницу
-    markers: dict[int, str] = {}
-    page_table_idx: dict[int, int] = {}
-    for name_idx, first_row_idx in table_starts:
-        page = _page_of_line(first_row_idx)
-        idx = page_table_idx.get(page, 0)
-        markers[name_idx] = f"<!-- t_p{page + 1}_{idx} -->"
-        page_table_idx[page] = idx + 1
-
-    # Проход 2: собрать результат, вставляя маркер перед строкой-названием
-    result: list[str] = []
-    # Таблица в самом начале документа без строки-названия — маркер в начало
-    prefix = markers.pop(-1, None)
-    if prefix is not None:
-        result.append(prefix)
-    for i, line in enumerate(lines):
-        marker = markers.get(i)
-        if marker is not None:
-            result.append(marker)
-        result.append(line)
-
-    return "\n".join(result)
-
-
 def _table_id_sort_key(tid: str) -> tuple[int, int]:
     """Ключ сортировки ID-маркеров таблиц в порядке t_p1_0, t_p1_1, t_p2_0, ...
 
@@ -2911,7 +2827,6 @@ def _merge_by_component_images(md_text: str, table_images: list[dict] | None) ->
 def run_script_postprocess(
     md_text: str,
     img_dir: str | Path,
-    page_boundaries: list[tuple[int, int]] | None = None,
     table_images: list[dict] | None = None,
 ) -> str:
     """Выполнить всю скриптовую постобработку.
@@ -2919,8 +2834,7 @@ def run_script_postprocess(
     Порядок (без wrap_equations — в Yandex формулы уже в $$):
       1. HTML-таблицы → MD
       2. Объединение смежных таблиц
-      2b. Вставка ID-маркеров <!-- t_pN_M --> перед таблицами
-          (если переданы page_boundaries и table_images)
+      2c. Склейка по component_images (если переданы table_images)
       3. LaTeX-чистка
       4. Переименование изображений
       5. Подписи → курсив
@@ -2929,14 +2843,16 @@ def run_script_postprocess(
       8. OCR-артефакты
       9. Пробелы вокруг ^ в LaTeX-формулах
 
+    ID-маркеры <!-- t_pN_M --> рождаются в parse_yandex_json_to_md() и уже
+    присутствуют в md_text; здесь они не пересчитываются (контракт
+    table-id-marker §5.5: шаг 2b удалён, page_boundaries не нужны).
+
     Args:
         md_text: Markdown-текст.
         img_dir: Папка с изображениями.
-        page_boundaries: [(start_line, end_line), ...] — границы страниц
-            в md_text (0-based строки, end exclusive), из parse_yandex_json_to_md().
         table_images: Список от extract_table_images() — включает id каждой
-            вырезанной таблицы. Маркеры вставляются только при наличии обоих
-            параметров (иначе пайплайн ведёт себя как раньше).
+            вырезанной таблицы. Склейка по component_images выполняется
+            только при наличии списка (иначе пайплайн ведёт себя как раньше).
     """
     log.info("Скриптовая постобработка:")
 
@@ -2946,9 +2862,7 @@ def run_script_postprocess(
     md_text = merge_tables(md_text)
     log.info("  2. Таблицы: объединение")
 
-    if page_boundaries and table_images:
-        md_text = _inject_table_ids(md_text, page_boundaries, table_images)
-        log.info("  2b. Таблицы: ID-маркеры вставлены")
+    if table_images:
         md_text = _merge_by_component_images(md_text, table_images)
         log.info("  2c. Таблицы: склейка по component_images")
 
@@ -5234,7 +5148,6 @@ def process_file(
         # Этап 5: Скриптовая постобработка
         md_text = run_script_postprocess(
             md_text, img_dir,
-            page_boundaries=page_boundaries,
             table_images=table_images if use_ai else None,
         )
 
