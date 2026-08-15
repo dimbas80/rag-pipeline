@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-15 — by: orchestrator — task: фикс ID-маркеров + R-2 завершены (оба PASS)
+_Last updated: 2026-08-15 — by: orchestrator — task: vision-провайдер переведён на anymodel (provod /chat недоступен)
 
 ## Working functionality
 
@@ -26,6 +26,7 @@ _Last updated: 2026-08-15 — by: orchestrator — task: фикс ID-марке�
 - `test_gemini_full_pdf.py` падает на `import fitz` в изолированной среде coder-воркера (не в рабочем окружении проекта) — окружение, не дефект кода.
 - Полная переиндексация корпуса (кроме СП89) после исправления table→image не выполнялась.
 - Слабая уверенность привязки Б.1 (Jaccard 0.11) и Ж.1 (0.27) при объединении в одну таблицу — ожидаемо (слияние снижает оценку), не блокирует результат.
+- **Provod `/chat/completions` недоступен (2026-08-15):** `/models` отвечает 200, но чат-эндпоинт виснет по всем моделям (gemini-2.5-flash-lite, glm-4.6v, gemini-2.5-flash, glm-5v-turbo, gemini-3.5-flash) — провайдерская деградация, не ключи. Vision временно на anymodel. Когда provod восстановится — вернуть `config_ai.yaml` (коммит `0d36607`).
 
 ## In progress
 
@@ -46,6 +47,7 @@ _Last updated: 2026-08-15 — by: orchestrator — task: фикс ID-марке�
 - После изменений пайплайна обязательны независимый pytest-прогон и реальная проверка на документе.
 - **ID-маркеры таблиц** (2026-08-15): `extract_table_images()` назначал id по boundingBox Yandex, а `_inject_table_ids()` пересчитывал по `page_boundaries` → на границе страницы маркер съезжал, AI-сверка резолвила в чужой vision-эталон. Решение: id рождается в `parse_yandex_json_to_md()` (тот же порядок итерации `pages`/`tables[]`, что в вырезке — id совпадает); группировка `component_images` — только spatial-pass, без голого `table_num` (номера не уникальны между разделами/приложениями).
 - **R-2 (2026-08-15, коммит fdee917):** spatial-pass `extract_table_images()` расширен предикатом `_is_continuation_caption()` — подписи «Продолжение/Окончание таблицы N» теперь тоже группируются (все страницы в `component_images`/`image_paths`), при совпадении `table_num` с головой и соблюдении геометрии. Босая «Таблица N» по-прежнему не группируется (дефект 2 не возвращается).
+- **AI-провайдеры (2026-08-15, коммит 0d36607):** vision `provod → anymodel` (`gc/gemini-2.5-flash` primary / `glm/glm-4.6v` fallback) из-за недоступности provod `/chat/completions`; `ai_postprocess` fallback → `glm/glm-5.2`; primary deepseek (`deepseek-v4-pro`) не менялся — работает. `ANYMODEL_API_KEY` добавлен в `firmware/src/.env`.
 
 ## Project instructions
 
