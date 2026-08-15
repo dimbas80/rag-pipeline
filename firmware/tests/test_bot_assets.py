@@ -111,6 +111,40 @@ def test_is_document_list_request_content_query_not_false_positive():
         assert helpers.is_document_list_request(value) is False, value
 
 
+# ─── Форматирование перечня документов (format_document_list) ─────────
+
+def test_format_document_list_empty_and_none():
+    """Пустой список и None → «База пуста / не удалось получить список»."""
+    empty_msg = "База пуста / не удалось получить список"
+    assert helpers.format_document_list([]) == empty_msg
+    assert helpers.format_document_list(None) == empty_msg
+
+
+def test_format_document_list_multiple_documents():
+    """Несколько документов → заголовок с верным N и строки «• id — title»."""
+    documents = [
+        {"document_id": "gost_31996", "title": "ГОСТ 31996-2012"},
+        {"document_id": "sp_89", "title": "СП 89.13330.2016"},
+        {"document_id": "so_153", "title": "СО 153-34.21.122-2003"},
+    ]
+    result = helpers.format_document_list(documents)
+    lines = result.splitlines()
+    assert lines[0] == "📚 Документы в базе (3):"
+    assert lines[1] == "• gost_31996 — ГОСТ 31996-2012"
+    assert lines[2] == "• sp_89 — СП 89.13330.2016"
+    assert lines[3] == "• so_153 — СО 153-34.21.122-2003"
+
+
+def test_format_document_list_single_document():
+    """Один документ → заголовок «(1)» и ровно одна строка перечня."""
+    result = helpers.format_document_list(
+        [{"document_id": "gost_31996", "title": "ГОСТ 31996-2012"}]
+    )
+    lines = result.splitlines()
+    assert lines[0] == "📚 Документы в базе (1):"
+    assert lines[1] == "• gost_31996 — ГОСТ 31996-2012"
+
+
 # ─── Извлечение ссылок из ответа ───────────────────────────────────────
 
 def test_extract_references_table_variants():

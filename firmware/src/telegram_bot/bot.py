@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 
 from asset_helpers import (
     extract_asset_references,
+    format_document_list,
     is_document_list_request,
     resolve_images_to_send,
     strip_markdown_tables,
@@ -93,9 +94,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Допустимый ток ВВГ 4×120 в земле»\n"
         "• «Как организовать электроснабжение котельной»\n"
         "• «Можно ли использовать крышу как молниеприемник»\n\n"
-        "База: ГОСТ 31996, СП 89.13330, СО 153-34.",
+        "База: ГОСТ 31996, СП 89.13330, СО 153-34.\n\n"
+        "Команды:\n"
+        "/list — перечень документов в базе",
         parse_mode="Markdown",
     )
+
+
+async def list_documents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /list — перечень документов в базе.
+
+    В отличие от текстовой ветки handle_message: без _send_images и без
+    записи в _history. Форматирование — через общий format_document_list.
+    """
+    try:
+        documents = await asyncio.to_thread(get_qa().list_documents)
+    except Exception as exc:
+        logger.error("Не удалось получить список документов: %s", exc, exc_info=True)
+        documents = None
+    reply_text = format_document_list(documents)
+    # Telegram-сообщения ограничены 4096 символами (страховка от длинного
+    # списка документов — как для обычного answer ниже).
+    if len(reply_text) > 4000:
+        reply_text = reply_text[:4000] + "\n\n…(ответ обрезан)"
+    await update.message.reply_text(reply_text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -111,14 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_document_list_request(query):
         try:
             documents = await asyncio.to_thread(get_qa().list_documents)
-            if documents:
-                lines = [f"📚 Документы в базе ({len(documents)}):"]
-                lines.extend(
-                    f"• {doc['document_id']} — {doc['title']}" for doc in documents
-                )
-                reply_text = "\n".join(lines)
-            else:
-                reply_text = "База пуста / не удалось получить список"
+            reply_text = format_document_list(documents)
             # Telegram-сообщения ограничены 4096 символами (страховка от
             # длинного списка документов — как для обычного answer ниже).
             if len(reply_text) > 4000:
@@ -346,6 +361,7 @@ def main():
             _asyncio.set_event_loop(_asyncio.new_event_loop())
             app = Application.builder().token(TOKEN).build()
             app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("list", list_documents_command))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             app.add_error_handler(error_handler)
             logger.info("Бот запущен, ожидаю сообщения...")

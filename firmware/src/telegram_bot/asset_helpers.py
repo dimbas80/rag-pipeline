@@ -112,6 +112,24 @@ def is_document_list_request(query: str) -> bool:
     return any(pattern.search(query) for pattern in _DOCUMENT_LIST_PATTERNS)
 
 
+def format_document_list(documents: list[dict] | None) -> str:
+    """Форматирует перечень документов для команды /list и текстовой ветки.
+
+    Непустой список → «📚 Документы в базе (N):\\n• document_id — title\\n• …»;
+    пустой список или None → «База пуста / не удалось получить список».
+
+    Обрезка до 4000 символов остаётся на стороне bot.py (не здесь).
+    """
+    if not documents:
+        return "База пуста / не удалось получить список"
+    lines = [f"📚 Документы в базе ({len(documents)}):"]
+    lines.extend(
+        f"• {doc.get('document_id', '')} — {doc.get('title', '')}"
+        for doc in documents
+    )
+    return "\n".join(lines)
+
+
 # ─── Номера ссылок/подписей ────────────────────────────────────────────
 # Форматы номеров: «19», «3.1», «Д.1», «А.2» (буква приложения опциональна).
 _REF_NUM = r"(?:[A-Za-zА-Яа-яЁё]\.)?\d+(?:\.\d+)*"
