@@ -89,41 +89,22 @@ documents:
       - "Предисловие"
       - "Содержание"
 
-  # ── ГОСТ18410-73_Кабели_с_бумажной_изоляцией ──
-  GOST_18410_kabel:
+  # ── ГОСТ 18410—73 — добавлено --reg 2026-08-15 ──
+  GOST_18410:
     document_id: "ГОСТ 18410—73"
     document_id_alt: null
-    document_type: "ГОСТ"      # ГОСТ, СП, ПУЭ, СО, СНиП — пользователь заполнит сам
-    domain: "Кабели"             # молниезащита, кабели, котельные — пользователь заполнит сам
-    title: "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ"
+    document_type: "ГОСТ"
+    domain: null
+    title: "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ. ТЕХНИЧЕСКИЕ УСЛОВИЯ"
     edition: "1973"
-    date_enacted: "1973-01-01"
+    date_enacted: "1975-01-01"
     date_amended: null
     amended_by: null
-    source_file: "ГОСТ18410-73_Кабели_с_бумажной_изоляцией.pdf"
+    source_file: "ГОСТ18410-73_Кабели_с_бумажной_изоляцией.md"
     status: active
     status_reason: null
     replaced_by_document_id: null
     replaced_by_doc_key: null
     ignore_sections:
       - "Предисловие"
-      - "Содержание"
-
-  # ── Пример недействующего документа: СНиП 2.04.05-86 ──
-  old_snip:
-    document_id: "СНиП 2.04.05-86"
-    document_id_alt: null
-    document_type: null      # ГОСТ, СП, ПУЭ, СО, СНиП — пользователь заполнит сам
-    domain: null             # молниезащита, кабели, котельные — пользователь заполнит сам
-    title: "Отопление, вентиляция и кондиционирование"
-    edition: "1986"
-    date_enacted: "1987-01-01"
-    date_amended: null
-    amended_by: null
-    source_file: "СНиП_2.04.05-86.pdf"
-    status: inactive
-    status_reason: "Заменён на СП 60.13330.2012"
-    replaced_by_document_id: "СП 60.13330.2012"   # официальный номер документа-преемника
-    replaced_by_doc_key: "sp60_otoplenie"         # ключ каталога (slug) при необходимости
-    ignore_sections:
       - "Содержание"
