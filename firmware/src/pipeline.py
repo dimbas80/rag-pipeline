@@ -862,6 +862,21 @@ def _extract_table_num_from_text(text: str) -> str | None:
     return match.group(1).upper().replace(".", ".") if match else None
 
 
+_CONTINUATION_CAPTION_RE = re.compile(
+    r"(?:Окончани[ея]|Продолжени[ея]|Продолж\.?)\s+(?:таблиц[аы]|табл\.?|table)",
+    re.IGNORECASE,
+)
+
+
+def _is_continuation_caption(caption: str) -> bool:
+    """Подпись явно помечает продолжение/окончание таблицы (не босая «Таблица N»).
+
+    Гарантия: босая подпись «Таблица 2» под предикат НЕ попадает — это
+    защита от дефекта 2 (ложная склейка одноимённых таблиц).
+    """
+    return bool(caption) and bool(_CONTINUATION_CAPTION_RE.search(_normalize_spaced_text(caption)))
+
+
 def _table_to_md(table: dict) -> tuple[str, str]:
     """Преобразовать структурированную таблицу в Markdown + примечание.
 
@@ -1794,21 +1809,50 @@ def extract_table_images(
     for pi in sorted(tables_by_page):
         page_tables = tables_by_page[pi]
         for ti, item in enumerate(page_tables):
+            caption = item.get("caption") or ""
             has_caption = bool(item.get("caption") or item.get("table_num"))
-            if has_caption:
+            is_continuation = _is_continuation_caption(caption)
+
+            # Обычная подпись (не «Продолжение/Окончание таблицы N») — новая группа.
+            if has_caption and not is_continuation:
                 current_group = item
                 current_group_members = [item]
                 continue
+
+            # caption-less ИЛИ явная подпись-продолжение → попытка присоединиться
+            # к текущей группе (как caption-less продолжение).
             if ti != 0 or pi <= 0 or current_group is None:
+                if is_continuation:
+                    # Не присоединилась (нет группы / не первая на странице) —
+                    # собственная новая группа, чтобы следующие caption-less
+                    # таблицы не приклеились к чужой голове.
+                    current_group = item
+                    current_group_members = [item]
                 continue
 
             previous_tables = tables_by_page.get(pi - 1, [])
             if not previous_tables or previous_tables[-1] is not current_group_members[-1]:
+                if is_continuation:
+                    current_group = item
+                    current_group_members = [item]
                 continue
             previous = previous_tables[-1]
             _, _, bottom, page_height = table_geometry[id(previous)]
             if bottom < page_height * 0.9:
+                if is_continuation:
+                    current_group = item
+                    current_group_members = [item]
                 continue
+
+            # Для подписи-продолжения номер обязан совпасть с головой группы:
+            # «Продолжение таблицы А.1» при голове «Таблица Б.1» — не склеивать.
+            if is_continuation:
+                item_num = item.get("table_num")
+                group_num = current_group.get("table_num")
+                if item_num and group_num and item_num != group_num:
+                    current_group = item
+                    current_group_members = [item]
+                    continue
 
             paths = list(current_group.get("component_images") or [current_group["path"]])
             if item["path"] not in paths:

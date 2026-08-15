@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Тесты контракта ID-маркеров таблиц (docs/architecture/table-id-marker-contract.md).
 
-Покрывают тест-план §10: T1-T13.
+Покрывают тест-план §10: T1-T18.
   A. parse_yandex_json_to_md — маркеры рождаются в parse (T1-T5)
   B. склейки и маркеры (T6-T8)
-  C. extract_table_images — component_images только spatial-pass'ем (T9-T11)
+  C. extract_table_images — component_images только spatial-pass'ем (T9-T18)
+     T14-T18 (R-2): явная подпись «Продолжение/Окончание таблицы N»
+     присоединяется spatial-pass'ем к текущей группе при совпадающем номере
   D. интеграция постобработки / AI-резолв (T12-T13)
 """
 
@@ -295,7 +297,7 @@ def test_t8_merge_by_component_images_from_parse_markers():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# C. extract_table_images — component_images только spatial-pass (T9-T11)
+# C. extract_table_images — component_images только spatial-pass (T9-T18)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -358,10 +360,11 @@ def test_t11_spatial_pass_no_false_merges(tmp_path):
     pdf_path = _make_pdf(tmp_path, n_pages=2)
     img_dir = tmp_path / "img"
 
-    # (а) продолжение С подписью → не группируется
+    # (а) продолжение С подписью, но номер НЕ совпадает (2 ≠ 1) → не группируется.
+    #     (Совпадающий номер «Продолжение таблицы 1» теперь группируется — R-2, T14.)
     pages_a = (
         _page([_table(1600, bottom=1700)], [_caption_block(1550, "Таблица 1 — Низ")])
-        + _page([_table(200)], [_caption_block(150, "Продолжение таблицы 1")])
+        + _page([_table(200)], [_caption_block(150, "Продолжение таблицы 2")])
     )
     with patch("fitz.Page.get_pixmap") as mock_pix:
         mock_pix.return_value.save = MagicMock()
@@ -393,6 +396,141 @@ def test_t11_spatial_pass_no_false_merges(tmp_path):
     for item in result_c:
         ci = item.get("component_images")
         assert ci is None or ci == [item["path"]], f"(в) ложно склеено: {ci}"
+
+
+def test_t14_continuation_caption_joins_group(tmp_path):
+    """T14: стр.2 «Продолжение таблицы Б.1» присоединяется к стр.1 «Таблица Б.1» (R-2).
+
+    стр.1 упирается в низ (bottom ≥ 90%); стр.2 — первая на странице,
+    подпись-продолжение с совпадающим номером → component_images = [table_1, table_2]
+    у обоих; caption головы распространён на продолжение.
+    """
+    p1 = _page(
+        [_table(1600, bottom=1700)],
+        [_caption_block(1550, "Таблица Б.1 — Допустимые токи")],
+    )
+    p2 = _page(
+        [_table(200)],
+        [_caption_block(150, "Продолжение таблицы Б.1")],
+    )
+    pages = p1 + p2
+
+    pdf_path = _make_pdf(tmp_path, n_pages=2)
+    img_dir = tmp_path / "img"
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    assert len(result) == 2
+    expected = [item["path"] for item in result]
+    assert expected == ["table_1.png", "table_2.png"]
+    for item in result:
+        assert item["component_images"] == expected
+        assert item["caption"] == "Таблица Б.1 — Допустимые токи"
+
+
+def test_t15_continuation_caption_wrong_number_not_joined(tmp_path):
+    """T15: стр.2 «Продолжение таблицы А.1» при голове «Таблица Б.1» — НЕ склеены.
+
+    Номер не совпал (А.1 ≠ Б.1) → у каждого своя группа:
+    component_images отсутствует или == [свой path].
+    """
+    p1 = _page(
+        [_table(1600, bottom=1700)],
+        [_caption_block(1550, "Таблица Б.1 — Допустимые токи")],
+    )
+    p2 = _page(
+        [_table(200)],
+        [_caption_block(150, "Продолжение таблицы А.1")],
+    )
+    pages = p1 + p2
+
+    pdf_path = _make_pdf(tmp_path, n_pages=2)
+    img_dir = tmp_path / "img"
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    assert len(result) == 2
+    for item in result:
+        ci = item.get("component_images")
+        assert ci is None or ci == [item["path"]], f"номер не совпал, но склеено: {ci}"
+
+
+def test_t16_bare_table_2_not_continuation(tmp_path):
+    """T16: регрессия дефекта 2 — три босые «Таблица 2» на разных страницах.
+
+    Предикат _is_continuation_caption НЕ должен зацепить «Таблица 2»:
+    никакой общей группы.
+    """
+    pages = []
+    for page_y in (200, 200, 200):
+        pages.extend(_page(
+            [_table(page_y)],
+            [_caption_block(page_y - 50, "Таблица 2 — Разные таблицы")],
+        ))
+
+    pdf_path = _make_pdf(tmp_path, n_pages=3)
+    img_dir = tmp_path / "img"
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    assert len(result) == 3
+    for item in result:
+        ci = item.get("component_images")
+        assert ci is None or ci == [item["path"]], f"«Таблица 2» зацеплена предикатом: {ci}"
+
+
+def test_t17_continuation_caption_geometry_fail(tmp_path):
+    """T17: голова НЕ упирается в низ (bottom < 90%) — «Продолжение таблицы Б.1» НЕ склеено."""
+    p1 = _page(
+        [_table(200, bottom=300)],
+        [_caption_block(150, "Таблица Б.1 — Допустимые токи")],
+    )
+    p2 = _page(
+        [_table(200)],
+        [_caption_block(150, "Продолжение таблицы Б.1")],
+    )
+    pages = p1 + p2
+
+    pdf_path = _make_pdf(tmp_path, n_pages=2)
+    img_dir = tmp_path / "img"
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    assert len(result) == 2
+    for item in result:
+        ci = item.get("component_images")
+        assert ci is None or ci == [item["path"]], f"геометрия нарушена, но склеено: {ci}"
+
+
+def test_t18_continuation_caption_not_first_on_page(tmp_path):
+    """T18: «Продолжение таблицы Б.1» НЕ первая на стр.2 (ti != 0) — НЕ склеена."""
+    p1 = _page(
+        [_table(1600, bottom=1700)],
+        [_caption_block(1550, "Таблица Б.1 — Допустимые токи")],
+    )
+    p2 = _page(
+        [_table(200), _table(500)],
+        [
+            _caption_block(150, "Таблица 9 — Другая"),
+            _caption_block(450, "Продолжение таблицы Б.1"),
+        ],
+    )
+    pages = p1 + p2
+
+    pdf_path = _make_pdf(tmp_path, n_pages=2)
+    img_dir = tmp_path / "img"
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    assert len(result) == 3
+    for item in result:
+        ci = item.get("component_images")
+        assert ci is None or ci == [item["path"]], f"ti != 0, но склеено: {ci}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
