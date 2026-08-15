@@ -1,30 +1,31 @@
 # Build_Search_index — состояние проекта
 
-Обновлено: 2026-08-14 (Orchestrator)
+Обновлено: 2026-08-15 (Orchestrator)
 
 ## Работающая функциональность
-- Поисковый индекс ГОСТ/СП в Qdrant: `create_index.py` + `search.py` (SiliconFlow embeddings/rerank, fastembed BM25, валидация `--strict`). СП 89.13330.2016 переиндексирован (t_d6074b7e).
-- LangGraph QA-система: `qa_graph.py` (6 узлов), configurable LLM через `firmware/src/llm_config.yaml` (чат — DeepSeek API), расчёты по формулам `execute_calculation` (изолированный exec).
-- Telegram-бот: `firmware/src/telegram_bot/bot.py` — citation-based image routing + точечный fallback изображений по caption при пустом `cited_chunk_ids` (t_de873a2d, ревью PASS t_b3608b01): пачку search_results не шлёт.
-- Бот запущен (PID 22318), Qdrant-база: `/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data` (`QDRANT_PATH` в .env).
+- Поисковый индекс ГОСТ/СП в Qdrant: `create_index.py` + `search.py` (SiliconFlow embeddings/rerank, fastembed BM25, валидация `--strict`). Упрощённый CLI (папка + авто-выбор коллекции).
+- LangGraph QA-система: `qa_graph.py` (6 узлов), configurable LLM через `llm_config.yaml` (чат — DeepSeek API), расчёты `execute_calculation`.
+- Telegram-бот: `firmware/src/telegram_bot/bot.py` — citation-based image routing + точечный fallback по caption (t_de873a2d). Фиксы 3.1-3.3 (освобождение Qdrant per-request, query-приоритет 1 изображения, ответ на «покажи таблицу Б.1») + многостраничные таблицы (все image_paths) — reviewer PASS, всё done на доске.
+- Бот запущен (PID 30640), Qdrant-база: `/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data` (`QDRANT_PATH` в корневом .env).
+
+## Документы в базе (эталон для «перечня документов»)
+- СО 153-34.21.122-2003 — Инструкция по устройству молниезащиты зданий, сооружений и промышленных коммуникаций
+- ГОСТ 31996—2012 — Кабели силовые с пластмассовой изоляцией на номинальное напряжение 0,66; 1 и 3 кВ
+- СП 89.13330.2016 — Котельные установки
+- ГОСТ 18410—73 — КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ. ТЕХНИЧЕСКИЕ УСЛОВИЯ
+(document_id содержит длинное тире «—», не дефис.)
 
 ## Known issues
-- 4 предсуществующих падения в `firmware/tests/test_qa_graph.py` (192 passed / 4 failed): тестовые ожидания не обновлены под накопленные QA-изменения (новое поле cited_chunk_ids в состоянии, новое поведение расчётов). Никто не скрывал и не обходил (отчёт t_508d475b).
-- Бот держит эксклюзивную блокировку Qdrant после ответа (qa_graph._get_qdrant_client — синглтон без close). → фикс в t_024db80f.
-- «Покажи таблицу Х» шлёт 2 изображения (нужное + соседнее, Е.1+Д.1): cited-ветка _send_images шлёт все asset'ы чанка. → фикс в t_024db80f.
-- «Покажи таблицу Б1 СП 89.13330» → «Не удалось сформировать ответ» (qa.run без final_answer, вероятно interrupt ask_clarification; таблица Б.1 в источнике есть). → фикс в t_024db80f.
+- LLM-ответ может содержать markdown-таблицы (`| ... |`), которые Telegram parse_mode=Markdown не рендерит → мусор в тексте. Таблицы должны уходить только картинкой (механизм `_send_images` уже работает). → фикс A (задача ниже).
+- На запрос «какие документы в базе» бот гонит запрос в LLM, который выдумывает список; фактического списка из Qdrant нет. → фикс B (задача ниже).
+- 4 предсуществующих падения в `firmware/tests/test_qa_graph.py` (не чинить — вне объёма текущих фиксов; отчёт t_508d475b).
 
 ## In progress / Planned
-- t_024db80f (coder, running): фиксы бота 3.1-3.3 (освобождение Qdrant, query-приоритет 1 изображения, ответ на таблицу Б.1). Создана параллельной сессией оркестратора, dir-workspace.
-- t_3533d5ca (reviewer, todo): ревью t_024db80f.
-- Свёрнуты как дубликаты (одновременный запуск двух оркестраторных сессий): t_0baaab2e + t_9030aa12 (закрыты 2026-08-14). Урок: перед созданием карточек с тем же объёмом сверяться с доской (там уже были t_ece7d157/t_024db80f).
+- (coder) fix(bot): не вставлять markdown-таблицы в текст + список документов по запросу — фиксы A и B.
+- (reviewer, child) ревью фиксов A+B.
 
 ## Recent decisions
-- 2026-08-06: чат-LLM — DeepSeek API через `llm_config.yaml` (configurable), не SiliconFlow.
-- 2026-08-06: расчёты по формулам в generate_answer через изолированный exec (timeout 5 с, запрет input()/while True).
-- 2026-08-07: переиндексация документа с дедупом — удаление старых точек перед upsert.
-- 2026-08-08: при `cited_chunk_ids=[]` бот НЕ шлёт все search_results; извлекает «Таблица N»/«Рисунок N» из answer/query и шлёт только однозначный asset по caption; при неоднозначности — не шлёт.
-
-## Незакоммиченные изменения (master)
-- Изменены: `README.md`, `firmware/src/create_index.py`, `firmware/src/llm_config.yaml`, `firmware/src/qa_graph.py`
-- Новые: `firmware/src/telegram_bot/` (бот + asset_helpers), `firmware/tests/test_bot_assets.py`, `workflows/t_b3608b01/`, `workflows/t_d6074b7e/`, `workflows/t_de873a2d/`
+- 2026-08-15: фиксы A+B правятся в слое бота без этапа Architect (точечные правки, не системная архитектура): `coder → reviewer`.
+- 2026-08-15: список документов берётся из Qdrant (уникальные document_id+title, per-request client + close в finally); интент-детект — чистые фразы, не через LLM; вырезание markdown-таблиц — детерминированная пост-обработка в bot.py (промпты LLM не трогаем).
+- 2026-08-06: чат-LLM — DeepSeek API через `llm_config.yaml`; расчёты через изолированный exec.
+- 2026-08-08: при `cited_chunk_ids=[]` бот НЕ шлёт все search_results; шлёт только однозначный asset по caption.
