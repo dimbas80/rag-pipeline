@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-14 — by: orchestrator — task: multi-page table pipeline + reindex_
+_Last updated: 2026-08-15 — by: orchestrator — task: фикс ID-маркеров таблиц (цепочка в работе)
 
 ## Working functionality
 
@@ -29,7 +29,7 @@ _Last updated: 2026-08-14 — by: orchestrator — task: multi-page table pipeli
 
 ## In progress
 
-- Нет активных или заблокированных задач Orchestrator (доска `create_markdown_ya`, проверено 2026-08-14).
+- Фикс рассогласования ID-маркеров таблиц (симптом: «Таблица 2» Приложения 2 обрезана/галлюцинирована). Цепочка на доске `create_markdown_ya`: architect `t_6340b905` → coder `t_d50ff6ce` → reviewer `t_7b443193`. Направление: id рождается в `parse_yandex_json_to_md()`, группировка `component_images` по голому `table_num` удаляется (остаётся spatial-pass продолжений по геометрии).
 
 ## Planned / backlog
 
@@ -44,6 +44,7 @@ _Last updated: 2026-08-14 — by: orchestrator — task: multi-page table pipeli
 - Объединение многостраничных таблиц — детерминированное, по `component_images` (spatial grouping), а не по маркерам «Продолжение/Окончание таблицы» (Yandex OCR их не выдаёт) и не в надежде на deepseek.
 - `image_path` таблиц не выводится позиционным счётчиком; связь по `<!-- t_pN_M -->` + persisted map, fallback по содержимому с диагностикой.
 - После изменений пайплайна обязательны независимый pytest-прогон и реальная проверка на документе.
+- **ID-маркеры таблиц** (2026-08-15): `extract_table_images()` назначал id по boundingBox Yandex, а `_inject_table_ids()` пересчитывал по `page_boundaries` → на границе страницы маркер съезжал, AI-сверка резолвила в чужой vision-эталон. Решение: id рождается в `parse_yandex_json_to_md()` (тот же порядок итерации `pages`/`tables[]`, что в вырезке — id совпадает); группировка `component_images` — только spatial-pass, без голого `table_num` (номера не уникальны между разделами/приложениями).
 
 ## Project instructions
 
