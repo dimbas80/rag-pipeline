@@ -77,14 +77,14 @@ DOCX → PDF (LibreOffice)
 
 ### `table_vision` — Vision-распознавание таблиц
 
-Изображения таблиц (PNG, вырезанные из PDF) отправляются в Gemini.
+Изображения таблиц (PNG, вырезанные из PDF) отправляются в Gemini/GLM через AnyModel.
 
 | Поле | Описание |
 |------|----------|
-| `provider` | Провайдер: `provod` |
-| `model` | Модель: `google/gemini-2.5-flash-lite` |
-| `api_key_env` | Переменная окружения с API-ключом: `PROVOD_API_KEY` |
-| `base_url` | Базовый URL API: `https://api.provod.ai/v1` |
+| `provider` | Провайдер: `anymodel` |
+| `model` | Модель: `gc/gemini-2.5-flash` |
+| `api_key_env` | Переменная окружения с API-ключом: `ANYMODEL_API_KEY` |
+| `base_url` | Базовый URL API: `https://anymodel.org/v1` |
 | `prompt` | Промпт для vision-модели — инструкция по переводу таблицы в Markdown |
 | `fallback` | Резервный провайдер (если primary недоступен) |
 
@@ -99,7 +99,7 @@ DOCX → PDF (LibreOffice)
 | `api_key_env` | Переменная окружения: `DEEPSEEK_API_KEY` |
 | `base_url` | `https://api.deepseek.com/v1` |
 | `prompt` | **Объединённый промпт**: правила 1–13 (постобработка: LaTeX, OCR-артефакты, форматирование), правила 14–20 (сверка таблиц: сравнение по ID, заполнение ячеек, in-place редактирование) |
-| `fallback` | Резервный провайдер: `provod` / `google/gemini-3.5-flash` |
+| `fallback` | Резервный провайдер: `anymodel` / `glm/glm-5.2` |
 
 **Важно:** если `prompt` не задан — скрипт завершится с ошибкой. Дефолтных промтов нет.
 
@@ -107,9 +107,9 @@ DOCX → PDF (LibreOffice)
 
 Каждая таблица получает сквозной ID `t_p{страница}_{индекс}` на всём пути пайплайна:
 
-1. **Вырезка** (`extract_table_images`): каждой таблице присваивается ID по странице и порядковому индексу на странице
+1. **Вырезка** (`extract_table_images`): каждой таблице присваивается ID `t_p{страница}_{индекс}` по boundingBox Yandex
 2. **Vision-распознавание**: ID записывается первой строкой `table_N.md` как `<!-- t_pN_M -->`
-3. **Скриптовая постобработка**: `_inject_table_ids()` вставляет такой же маркер перед названием md-таблицы, определяя страницу по `page_boundaries`
+3. **Рендер MD** (`parse_yandex_json_to_md`): маркер `<!-- t_pN_M -->` вставляется перед названием таблицы в момент рендера — тот же порядок итерации `pages`/`tables[]`, что и в вырезке, поэтому ID совпадает
 4. **AI-проход**: для каждого чанка извлекаются ID, подставляются только релевантные vision-эталоны. AI сверяет таблицы с одинаковыми ID, удаляет маркеры из выдачи
 5. **Пост-проверка**: если после AI остались `<!-- t_p... -->` — warning в лог
 
@@ -191,7 +191,8 @@ documents:
 | `YANDEX_API_KEY` | API-ключ Yandex Vision OCR |
 | `YANDEX_FOLDER_ID` | ID каталога Yandex Cloud |
 | `DEEPSEEK_API_KEY` | API-ключ DeepSeek |
-| `PROVOD_API_KEY` | API-ключ Provod (Gemini) |
+| `ANYMODEL_API_KEY` | API-ключ AnyModel (vision-распознавание таблиц) |
+| `PROVOD_API_KEY` | Устарел: Provod (Gemini) — не используется после перехода на AnyModel |
 
 ## Выходные файлы
 
@@ -217,4 +218,4 @@ documents:
 - Python 3.10+
 - LibreOffice (для конвертации DOCX/DOC)
 - PyMuPDF (`fitz`) — для вырезки таблиц и изображений
-- Доступ к API: Yandex Cloud, DeepSeek, Provod
+- Доступ к API: Yandex Cloud, DeepSeek, AnyModel
