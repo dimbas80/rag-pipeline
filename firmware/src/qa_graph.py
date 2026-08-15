@@ -1625,6 +1625,45 @@ class QAGraph:
             "error": None,
         }
 
+    def list_documents(self) -> list[dict]:
+        """Return unique document IDs and titles from the configured collection."""
+        client = None
+        try:
+            client = _get_qdrant_client(self.config.qdrant_path)
+            offset = None
+            documents: list[dict] = []
+            seen: set[str] = set()
+            while True:
+                records, next_offset = client.scroll(
+                    collection_name=self.config.collection,
+                    offset=offset,
+                    limit=256,
+                    with_payload=["document_id", "title"],
+                    with_vectors=False,
+                )
+                for record in records:
+                    payload = record.payload or {}
+                    document_id = payload.get("document_id")
+                    if document_id is None:
+                        continue
+                    document_id = str(document_id)
+                    if document_id in seen:
+                        continue
+                    seen.add(document_id)
+                    documents.append({
+                        "document_id": document_id,
+                        "title": str(payload.get("title") or document_id),
+                    })
+                if next_offset is None:
+                    return documents
+                offset = next_offset
+        except Exception:
+            logger.exception("Не удалось получить список документов из Qdrant")
+            return []
+        finally:
+            if client is not None:
+                _close_qdrant_client(self.config.qdrant_path, client)
+
     def _thread_config(self) -> dict:
         """RunnableConfig: qa_config для узлов + thread_id для checkpointer."""
         return {

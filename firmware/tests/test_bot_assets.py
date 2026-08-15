@@ -48,6 +48,69 @@ helpers = _load("asset_helpers")
 bot = _load("bot")
 
 
+# ─── Удаление Markdown-таблиц из текста ────────────────────────────────
+
+def test_strip_markdown_table_without_caption():
+    text = "До\n| A | B |\n|---|:---:|\n| 1 | 2 |\nПосле"
+    assert helpers.strip_markdown_tables(text) == (
+        "До\n(таблица — см. прикреплённое изображение)\nПосле"
+    )
+
+
+def test_strip_markdown_table_keeps_caption_number():
+    text = "Таблица 19 — Токи\n| A | B |\n|---|---|\n| 1 | 2 |"
+    assert helpers.strip_markdown_tables(text) == (
+        "Таблица 19 — см. прикреплённое изображение"
+    )
+
+
+def test_strip_markdown_tables_multiple_and_preserves_citations():
+    text = (
+        "[Документ, табл. 1]\n| A | B |\n|---|---|\n| 1 | 2 |\n\n"
+        "Текст [Документ, п. 2]\n| X | Y |\n|:---|---:|\n| x | y |"
+    )
+    result = helpers.strip_markdown_tables(text)
+    assert "[Документ, табл. 1]" in result
+    assert "[Документ, п. 2]" in result
+    assert result.count("см. прикреплённое изображение") == 2
+
+
+def test_strip_markdown_tables_leaves_plain_text_unchanged():
+    text = "Обычный текст [Документ, табл. 1]"
+    assert helpers.strip_markdown_tables(text) == text
+
+
+# ─── Intent detection for document listing ─────────────────────────────
+
+def test_is_document_list_request_positive_and_negative():
+    positives = [
+        "Какие документы в базе?",
+        "Перечень документов",
+        "Список документов",
+        "Что загружено?",
+        "Какие ГОСТ/СП есть в базе",
+        "Перечисли документы",
+        "Какие нормативы в базе",
+    ]
+    negatives = ["Какой допустимый ток кабеля?", "Что требует СП 89.13330?", "Покажи таблицу 19"]
+    assert all(helpers.is_document_list_request(value) for value in positives)
+    assert not any(helpers.is_document_list_request(value) for value in negatives)
+
+
+def test_is_document_list_request_content_query_not_false_positive():
+    """Контент-запросы «какие документы/нормативы регламентируют …» не должны
+    распознаваться как запрос списка документов (фикс ложного позитива)."""
+    content_queries = [
+        "Какие документы регламентируют молниезащиту?",
+        "Какие нормативные документы регламентируют молниезащиту?",
+        "Какие нормативы регламентируют молниезащиту?",
+        "Какие документы требуют заземление оборудования?",
+        "Какие документы определяют категорию надёжности электроснабжения?",
+    ]
+    for value in content_queries:
+        assert helpers.is_document_list_request(value) is False, value
+
+
 # ─── Извлечение ссылок из ответа ───────────────────────────────────────
 
 def test_extract_references_table_variants():

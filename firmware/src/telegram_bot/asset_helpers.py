@@ -20,6 +20,98 @@
 import os
 import re
 
+
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$"
+)
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_CAPTION_RE = re.compile(
+    r"^\s*(?:таблиц\w*|табл\.?)\s+((?:[А-Яа-яЁёA-Za-z]\.)?\d+(?:\.\d+)*)"
+    r"(?:\s*[—–-].*)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_markdown_tables(text: str) -> str:
+    """Replace Markdown table blocks with short image indicators.
+
+    Only pipe-delimited blocks containing a Markdown separator row are
+    replaced.  Ordinary prose (including citation brackets) is preserved.
+    """
+    if not text or "|" not in text:
+        return text
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if not _TABLE_ROW_RE.match(lines[i]):
+            out.append(lines[i])
+            i += 1
+            continue
+
+        start = i
+        while i < len(lines) and _TABLE_ROW_RE.match(lines[i]):
+            i += 1
+        block = lines[start:i]
+        separator_index = next(
+            (j for j, line in enumerate(block) if _TABLE_SEPARATOR_RE.match(line)),
+            None,
+        )
+        if separator_index is None:
+            out.extend(block)
+            continue
+
+        # Include preceding table rows, but never consume a citation/prose line.
+        caption = ""
+        caption_line_index = None
+        if out:
+            match = _TABLE_CAPTION_RE.match(out[-1])
+            if match:
+                caption = f"Таблица {match.group(1)}"
+                caption_line_index = len(out) - 1
+        if caption and caption_line_index is not None:
+            out.pop(caption_line_index)
+            indicator = f"{caption} — см. прикреплённое изображение"
+        else:
+            indicator = "(таблица — см. прикреплённое изображение)"
+        out.append(indicator)
+
+    return "\n".join(out)
+
+
+_DOCUMENT_LIST_PATTERNS = (
+    # «какие» НЕ входит сюда намеренно: «какие документы в базе» покрывается
+    # паттерном `документ\w*\s+в\s+базе`, а «перечень/список документов» —
+    # своим паттерном ниже. Иначе «Какие документы регламентируют …» даёт
+    # ложный позитив и уводит контент-запрос в голый список документов.
+    re.compile(r"\b(?:перечисли|перечислите)\s+документ\w*", re.IGNORECASE),
+    re.compile(r"\b(?:перечень|список)\s+документ\w*", re.IGNORECASE),
+    re.compile(r"\bдокумент\w*\s+в\s+базе\b", re.IGNORECASE),
+    re.compile(r"\bчто\s+(?:есть\s+)?в\s+базе\b", re.IGNORECASE),
+    re.compile(r"\bчто\s+загружено\b", re.IGNORECASE),
+    re.compile(r"\bкакие\s+(?:гост|сп)\s*/\s*(?:гост|сп)\s+есть\s+в\s+базе\b", re.IGNORECASE),
+    # «какие нормативы» — только список, а не контент-вопрос: отсекаем
+    # продолжение глаголами-предикатами («регламентируют», «требуют», …).
+    # \b после \w* обязателен, иначе \w* откатывается до «норматив» и
+    # negative lookahead ложно проходит (не видит \s+ перед «ы»).
+    # (?:\w+\s+){0,2} пропускает прилагательное/существительное между
+    # «норматив…» и глаголом: «нормативные документы регламентируют …».
+    re.compile(
+        r"\bкакие\s+норматив\w*\b"
+        r"(?!\s+(?:\w+\s+){0,2}(?:регламентир|содерж|треб|описыв|устанавл|определ|применя)\w*)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def is_document_list_request(query: str) -> bool:
+    """Return whether *query* asks for the documents stored in the database."""
+    if not query:
+        return False
+    return any(pattern.search(query) for pattern in _DOCUMENT_LIST_PATTERNS)
+
+
 # ─── Номера ссылок/подписей ────────────────────────────────────────────
 # Форматы номеров: «19», «3.1», «Д.1», «А.2» (буква приложения опциональна).
 _REF_NUM = r"(?:[A-Za-zА-Яа-яЁё]\.)?\d+(?:\.\d+)*"

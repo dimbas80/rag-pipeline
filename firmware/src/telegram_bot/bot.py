@@ -24,7 +24,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-from asset_helpers import extract_asset_references, resolve_images_to_send
+from asset_helpers import (
+    extract_asset_references,
+    is_document_list_request,
+    resolve_images_to_send,
+    strip_markdown_tables,
+)
 
 # Загружаем .env из корня проекта
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
@@ -103,6 +108,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     logger.info(f"Запрос от {user.full_name} (@{user.username}) [chat={chat_id}]: {query[:80]}")
 
+    if is_document_list_request(query):
+        try:
+            documents = await asyncio.to_thread(get_qa().list_documents)
+            if documents:
+                lines = [f"📚 Документы в базе ({len(documents)}):"]
+                lines.extend(
+                    f"• {doc['document_id']} — {doc['title']}" for doc in documents
+                )
+                reply_text = "\n".join(lines)
+            else:
+                reply_text = "База пуста / не удалось получить список"
+            # Telegram-сообщения ограничены 4096 символами (страховка от
+            # длинного списка документов — как для обычного answer ниже).
+            if len(reply_text) > 4000:
+                reply_text = reply_text[:4000] + "\n\n…(ответ обрезан)"
+            await update.message.reply_text(reply_text)
+        except Exception as exc:
+            logger.error("Не удалось получить список документов: %s", exc, exc_info=True)
+            await update.message.reply_text("База пуста / не удалось получить список")
+        return
+
     # Собираем контекст из истории диалога
     history = _history.get(chat_id, [])
     if history:
@@ -157,10 +183,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _history[chat_id] = _history[chat_id][-MAX_HISTORY:]
 
         # Telegram-сообщения ограничены 4096 символами
-        if len(answer) > 4000:
-            answer = answer[:4000] + "\n\n…(ответ обрезан)"
+        answer_for_text = strip_markdown_tables(answer)
+        if len(answer_for_text) > 4000:
+            answer_for_text = answer_for_text[:4000] + "\n\n…(ответ обрезан)"
 
-        await _send_answer(update, answer)
+        await _send_answer(update, answer_for_text)
         # Отправляем изображения с приоритетом: явная ссылка в query →
         # явная ссылка в answer → старое cited-поведение (фикс 3.2).
         await _send_images(
