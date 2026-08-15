@@ -144,3 +144,24 @@ ai_postprocess:
     
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Извлечение полей для --reg (интерактивная регистрация документа).
+# Контракт: docs/architecture/rag-register-flag.md §4.2.
+# Переиспользует эндпоинт ai_postprocess, но со своим коротким промптом.
+reg_extract:
+  provider: deepseek
+  model: deepseek-v4-pro          # как ai_postprocess
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com/v1
+  fallback:                        # как ai_postprocess
+    provider: anymodel
+    model: glm/glm-5.2
+    api_key_env: ANYMODEL_API_KEY
+    base_url: https://anymodel.org/v1
+  prompt: |
+    Ты — библиограф нормативных документов. Ниже — начало Markdown-файла,
+    полученного из OCR нормативного документа (ГОСТ/СП/СО/СНиП/ПУЭ).
+    Извлеки строго в JSON без пояснений:
+    {"document_id": "<официальное обозначение с тире, напр. ГОСТ 18410—73>",
+     "title": "<заголовок документа КАК НАПИСАН, без кавычек>",
+     "domain_hint": "<1 слово тематики, напр. Кабели>"}
+    Если поле не определяется — null. Только JSON.

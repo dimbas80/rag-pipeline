@@ -22,6 +22,7 @@ pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown 
 
 import argparse
 import base64
+import datetime
 import json
 import logging
 import os
@@ -4179,6 +4180,681 @@ def _write_rag_jsonl(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 12b. --reg: интерактивная регистрация документа в rag_config.yaml
+# Контракт: docs/architecture/rag-register-flag.md
+# ═══════════════════════════════════════════════════════════════════════════
+
+_REG_HEAD_LINES = 50
+_REG_FIELD_ORDER = (
+    "document_id", "document_id_alt", "document_type", "domain", "title",
+    "edition", "date_enacted", "date_amended", "amended_by", "source_file",
+    "status", "status_reason", "replaced_by_document_id", "replaced_by_doc_key",
+    "ignore_sections",
+)
+# Порядок диалога §3: те же поля без source_file (авто) и без inactive-блока
+_REG_DIALOG_ORDER = (
+    "document_id", "document_id_alt", "document_type", "domain", "title",
+    "edition", "date_enacted", "date_amended", "amended_by",
+)
+# «Полностью определена» (§5.3) — эти поля обязаны быть не-None
+_REG_COMPLETENESS_FIELDS = (
+    "document_id", "title", "document_type", "domain", "edition",
+    "date_enacted", "source_file",
+)
+_REG_VALID_TYPES = ("ГОСТ", "СП", "СО", "СНиП", "ПУЭ")
+_REG_PREFIX_MAP = {"ГОСТ": "GOST", "СП": "SP", "СО": "SO", "СНиП": "SNIP", "ПУЭ": "PUE"}
+_REG_DEFAULT_IGNORE = ["Предисловие", "Содержание"]
+_REG_SLUG_RE = re.compile(r"^[A-Za-z0-9_]+$")
+# Обозначение: префикс + первая группа цифр (тире любые из -—–−)
+_REG_DOC_ID_RE = re.compile(r"(ГОСТ\s*Р?\s*№?|СП|СО|СНиП|ПУЭ)\s*№?\s*(\d[\d.\-—–−]*)")
+# Транслитерация кириллицы для хвоста slug (§5.1 п.3): «Молниезащита»→molniezashita
+_REG_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d",
+    "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i",
+    "й": "y", "к": "k", "л": "l", "м": "m", "н": "n",
+    "о": "o", "п": "p", "р": "r", "с": "s", "т": "t",
+    "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "sh", "ъ": "", "ы": "y", "ь": "",
+    "э": "e", "ю": "yu", "я": "ya",
+}
+# Спецификации полей диалога: auto — есть авто-слой (подтверждение), иначе B-промпт
+_REG_FIELD_SPECS = {
+    "document_id": {"auto": True, "comment": "не определено"},
+    "document_id_alt": {"comment": "старое обозначение (напр. СНиП II-35-76)"},
+    "document_type": {"auto": True, "comment": "ГОСТ, СП, ПУЭ, СО, СНиП"},
+    "domain": {"comment": "семантика документа (напр. «Кабели»)"},
+    "title": {"auto": True, "comment": "заголовок документа (напр. Кабели силовые)"},
+    "edition": {"auto": True, "comment": "год издания, напр. 2016"},
+    "date_enacted": {
+        "comment": "дата ввода в действие, формат ГГГГ-ММ-ДД (напр. 2017-06-17)",
+        "date": True,
+    },
+    "date_amended": {"comment": "дата последних изменений, ГГГГ-ММ-ДД", "date": True},
+    "amended_by": {"comment": "чем изменён (напр. Приказ Минстроя РФ № 295/пр от 18.05.2021)"},
+}
+
+
+def run_registration(
+    input_path: str | Path,
+    md_text: str,
+    rag_config_path: str | Path,
+    rag_config: dict,
+    ai_config: dict | None,
+) -> dict | None:
+    """Оркестратор --reg: TTY-проверка → идемпотентность → извлечение
+    (regex+LLM) → пошаговый диалог → append/null-fill + гейт + safe_write.
+
+    Контракт: docs/architecture/rag-register-flag.md.
+
+    Returns:
+        Обновлённый dict конфига (успех: новая запись / дополнение / skip)
+        или None (отказ/отмена/не-TTY).
+    """
+    # §8: без TTY — понятная ошибка, конфиг не мутируется
+    if not sys.stdin.isatty():
+        log.error(
+            "--reg требует интерактивного терминала (TTY); конфиг не изменён. "
+            "Запустите в терминале или добавьте запись в rag_config.yaml вручную"
+        )
+        return None
+
+    documents = rag_config.setdefault("documents", {})
+    source_file = Path(input_path).name
+
+    # §5.3: идемпотентность через _find_doc_key
+    doc_key = _find_doc_key(input_path, rag_config)
+    if doc_key is not None:
+        record = documents.get(doc_key, {}) or {}
+        if _reg_record_complete(record):
+            log.info(f"Документ уже зарегистрирован: {doc_key} — регистрация пропущена")
+            return rag_config
+        log.info(f"Документ найден: {doc_key} — дополнение недостающих полей")
+        return _reg_fill_existing(
+            md_text, rag_config_path, rag_config, doc_key, record, ai_config, source_file,
+        )
+
+    return _reg_create_new(md_text, rag_config_path, rag_config, ai_config, source_file)
+
+
+def _reg_record_complete(record: dict) -> bool:
+    """§5.3: запись «полностью определена» — все ключевые поля не-None."""
+    return all(record.get(k) is not None for k in _REG_COMPLETENESS_FIELDS)
+
+
+def _reg_create_new(
+    md_text: str,
+    rag_config_path: str | Path,
+    rag_config: dict,
+    ai_config: dict | None,
+    source_file: str,
+) -> dict | None:
+    """Новая запись: извлечение → диалог → гейт → append + safe_write."""
+    documents = rag_config.setdefault("documents", {})
+    head = _reg_head(md_text)
+    extracted = _reg_extract_fields(head, ai_config)
+    existing_slugs = set(documents.keys())
+
+    result = _reg_interactive_fill(extracted, source_file, existing_slugs, None, None)
+    if result is None:
+        return None
+    slug, fields, _filled = result
+
+    block = _reg_render_record_block(slug, fields)
+    print("── Запись будет добавлена в rag_config.yaml: ──")
+    print(block, end="")
+    ans = _reg_ask_write()
+    if ans is None:
+        return None
+    if not ans:
+        print("Регистрация отменена, конфиг не изменён")
+        return None
+
+    try:
+        text = Path(rag_config_path).read_text(encoding="utf-8")
+    except Exception as e:
+        log.error(f"Не удалось прочитать {rag_config_path}: {e}")
+        return None
+    new_text = _reg_append_record(text, slug, fields)
+    if new_text is None:
+        return None
+    safe_write(rag_config_path, new_text)
+    log.info(f"Документ зарегистрирован: {slug} → {rag_config_path}")
+    documents[slug] = fields
+    return rag_config
+
+
+def _reg_fill_existing(
+    md_text: str,
+    rag_config_path: str | Path,
+    rag_config: dict,
+    doc_key: str,
+    record: dict,
+    ai_config: dict | None,
+    source_file: str,
+) -> dict | None:
+    """§5.3 режим дополнения: спрашиваем только недостающие (None) поля."""
+    documents = rag_config.setdefault("documents", {})
+    head = _reg_head(md_text)
+    extracted = _reg_extract_fields(head, ai_config)
+
+    result = _reg_interactive_fill(
+        extracted, source_file, set(documents.keys()), record, doc_key,
+    )
+    if result is None:
+        return None
+    slug, fields, filled = result
+    if not filled:
+        print("Нет недостающих полей — запись не изменена")
+        return rag_config
+
+    block = _reg_render_record_block(slug, fields)
+    print("── Запись будет дополнена в rag_config.yaml: ──")
+    print(block, end="")
+    ans = _reg_ask_write()
+    if ans is None:
+        return None
+    if not ans:
+        print("Регистрация отменена, конфиг не изменён")
+        return None
+
+    try:
+        text = Path(rag_config_path).read_text(encoding="utf-8")
+    except Exception as e:
+        log.error(f"Не удалось прочитать {rag_config_path}: {e}")
+        return None
+    new_text = _reg_fill_nulls(text, doc_key, filled)
+    if new_text is None:
+        return None
+    safe_write(rag_config_path, new_text)
+    log.info(f"Запись дополнена: {doc_key} → {rag_config_path}")
+    documents[doc_key] = fields
+    return rag_config
+
+
+def _reg_head(md_text: str) -> str:
+    """Первые 50 строк финального .md (§4.3 — титульный лист)."""
+    lines = (md_text or "").splitlines()
+    return "\n".join(lines[:_REG_HEAD_LINES])
+
+
+def _reg_extract_fields(md_head: str, ai_config: dict | None) -> dict:
+    """Двухуровневое извлечение (§4): regex-слой всегда + LLM-слой опционально.
+
+    Returns:
+        {document_id, title, document_type, edition, domain_hint}
+    """
+    result: dict = {
+        "document_id": None, "title": None,
+        "document_type": None, "edition": None, "domain_hint": None,
+    }
+
+    # ── regex-слой (§4.1) ──
+    m = _REG_DOC_ID_RE.search(md_head or "")
+    if m:
+        doc_id = re.sub(r"\s+", " ", m.group(0)).strip()
+        result["document_id"] = doc_id
+        prefix = m.group(1).replace("Р", "").replace("№", "").strip()
+        if prefix in _REG_VALID_TYPES:
+            result["document_type"] = prefix
+
+    # title: первая строка ^#{1,2}, иначе самая длинная КАПС-строка (≥4 слов)
+    m = re.search(r"^#{1,2}\s+(.+)", md_head or "", re.MULTILINE)
+    if m:
+        result["title"] = m.group(1).strip()
+    else:
+        best = None
+        for line in (md_head or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            caps_words = re.findall(r"[А-ЯЁ]{2,}", line)
+            if len(caps_words) >= 4 and (best is None or len(line) > len(best)):
+                best = line
+        result["title"] = best
+
+    # ── LLM-слой (§4.2), опционально ──
+    reg_cfg = (ai_config or {}).get("reg_extract") if ai_config else None
+    if reg_cfg and reg_cfg.get("prompt"):
+        try:
+            resp = _call_ai_api(md_head, reg_cfg)
+        except Exception as e:
+            log.warning(f"  --reg: ошибка LLM-извлечения: {e} — работаю на regex-слое")
+            resp = None
+        if resp:
+            llm = _reg_parse_llm_json(resp)
+            if llm is None:
+                log.warning("  --reg: LLM вернул не-JSON — работаю на regex-слое")
+            else:
+                if llm.get("document_id"):
+                    result["document_id"] = str(llm["document_id"]).strip()
+                if llm.get("title"):
+                    result["title"] = str(llm["title"]).strip()
+                if llm.get("domain_hint"):
+                    result["domain_hint"] = str(llm["domain_hint"]).strip()
+    else:
+        log.warning("  --reg: секция reg_extract отсутствует или пустой prompt — regex-слой")
+
+    # Тип и год пересчитываем по ИТОГОВОМУ document_id (LLM мог его заменить)
+    if result["document_id"]:
+        result["document_type"] = _reg_type_from_id(result["document_id"])
+        result["edition"] = _reg_edition_from_id(result["document_id"])
+    return result
+
+
+def _reg_type_from_id(document_id: str) -> str | None:
+    """Префикс обозначения → нормализованный тип (ГОСТ/СП/СО/СНиП/ПУЭ)."""
+    m = re.match(r"(ГОСТ|СП|СО|СНиП|ПУЭ)", document_id.strip())
+    if not m:
+        return None
+    prefix = m.group(1)
+    return "ГОСТ" if prefix == "ГОСТ" else prefix
+
+
+def _reg_parse_llm_json(resp: str) -> dict | None:
+    """Первый {...} в ответе LLM → dict; отказ → None."""
+    m = re.search(r"\{.*\}", resp, re.S)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _reg_edition_from_id(document_id: str | None) -> str | None:
+    """§5.2: год из обозначения. 4 цифры — как есть; 2 — век (≥50 → 19xx)."""
+    if not document_id:
+        return None
+    groups = re.findall(r"\d+", document_id)
+    if not groups:
+        return None
+    last = groups[-1]
+    if len(last) == 4:
+        return last
+    if len(last) == 2:
+        n = int(last)
+        return f"19{n}" if n >= 50 else f"20{n}"
+    return None
+
+
+def _reg_translit(word: str) -> str:
+    """Кириллица → латиница (нижний регистр); небуквенный мусор вырезаем.
+
+    §5.1 п.3: пример контракта `Кабели`→`kabel` (и существующие ключи
+    `GOST_18410_kabel`/`GOST_31996_kabel`) — отсекаем конечную «и» у
+    транслитерированного слова, если перед ней согласная (это даёт основу
+    слова: кабели→кабел). «Отопление»→otoplenie и «Котельные»→kotelnye
+    не затрагиваются (оканчиваются на -е).
+    """
+    out: list[str] = []
+    for ch in word.lower():
+        if ch in _REG_TRANSLIT:
+            out.append(_REG_TRANSLIT[ch])
+        elif ch.isascii() and ch.isalnum():
+            out.append(ch)
+    s = "".join(out)
+    if len(s) > 1 and s.endswith("i") and s[-2].isalpha() and s[-2] not in "aeiouy":
+        s = s[:-1]
+    return s
+
+
+def _reg_make_slug(
+    document_id: str,
+    document_type: str | None,
+    domain: str | None,
+    existing: set[str],
+) -> str:
+    """§5.1: {PREFIX}[_number][_domain_word]; коллизии → _2, _3, …
+
+    Префикс — ВЕРХНИЙ регистр (GOST/SP/SO/SNIP/PUE), по нормативному правилу
+    §5.1 п.4 и существующим ключам (GOST_18410_kabel).
+    """
+    prefix = "doc"
+    if document_type:
+        for k, v in _REG_PREFIX_MAP.items():
+            if k.lower() == document_type.strip().lower():
+                prefix = v
+                break
+    m = re.search(r"\d+", document_id or "")
+    number = m.group(0) if m else ""
+    tail = ""
+    if domain:
+        first_word = re.split(r"\s+", domain.strip())[0]
+        tail = _reg_translit(first_word)
+
+    parts = [prefix]
+    if number:
+        parts.append(number)
+    if tail:
+        parts.append(tail)
+    base = "_".join(parts)
+    slug = base
+    n = 2
+    while slug in existing:
+        slug = f"{base}_{n}"
+        n += 1
+    return slug
+
+
+def _reg_valid_date(s: str) -> bool:
+    try:
+        datetime.datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _reg_escape_yaml(s: str) -> str:
+    """Экранирование строкового значения для YAML (§6.3): \\ и " экранируются,
+    контрол-символы вырезаются."""
+    s = s.replace("\\", "\\\\").replace('"', '\\"')
+    return "".join(ch for ch in s if ord(ch) >= 32)
+
+
+def _reg_ask_write() -> bool | None:
+    """Финальный гейт «Записать? [Y/n]». True — да, False — нет, None — отмена."""
+    try:
+        ans = input("Записать? [Y/n]: ")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return ans.strip().lower() in ("", "y", "yes")
+
+
+def _reg_interactive_fill(
+    extracted: dict,
+    source_file: str,
+    existing_slugs: set[str],
+    existing_record: dict | None,
+    existing_slug: str | None,
+) -> tuple[str, dict, dict] | None:
+    """Пошаговый диалог §7. Возвращает (slug, fields, filled) или None (отмена)."""
+    def ask(prompt_text: str) -> str | None:
+        """None = EOF/Ctrl-C (отмена)."""
+        try:
+            return input(prompt_text)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+    print("════ РЕГИСТРАЦИЯ ДОКУМЕНТА В rag_config.yaml ════")
+    print(f"Файл: {source_file}")
+
+    fields: dict = {}
+    if existing_record:
+        fields.update(existing_record)
+    else:
+        fields = {k: None for k in _REG_FIELD_ORDER}
+        fields["ignore_sections"] = list(_REG_DEFAULT_IGNORE)
+        fields["source_file"] = source_file
+    if existing_slug:
+        print(f"Дополнение записи: {existing_slug}")
+
+    # ── Поля по порядку §3 ──
+    for key in _REG_DIALOG_ORDER:
+        # Режим дополнения: существующие значения не переспрашиваем
+        if existing_record is not None and fields.get(key) is not None:
+            continue
+        spec = _REG_FIELD_SPECS[key]
+        auto = extracted.get(key) if spec.get("auto") else None
+        if auto:
+            print(f"Определено: {auto}")
+            ans = ask(f"{key} [Enter = подтвердить / или новое значение]: ")
+            if ans is None:
+                return None
+            fields[key] = auto if ans.strip() == "" else ans.strip()
+        else:
+            print(f"{key} — {spec['comment']}")
+            if key == "domain" and extracted.get("domain_hint"):
+                print(f"Подсказка ИИ: {extracted['domain_hint']}")
+            while True:
+                ans = ask("[Enter = пропустить / или значение]: ")
+                if ans is None:
+                    return None
+                val = ans.strip()
+                if spec.get("date") and val and not _reg_valid_date(val):
+                    print(f"Некорректная дата: {val} — формат ГГГГ-ММ-ДД")
+                    continue
+                fields[key] = val if val else None
+                break
+
+    # source_file — авто, без отдельного промпта (§3)
+    if fields.get("source_file") is None:
+        fields["source_file"] = source_file
+
+    # status — пользователь, дефолт active
+    if existing_record is None or fields.get("status") is None:
+        while True:
+            ans = ask("Статус документа [active]: ")
+            if ans is None:
+                return None
+            val = ans.strip().lower()
+            if val == "":
+                fields["status"] = "active"
+                break
+            if val in ("active", "inactive"):
+                fields["status"] = val
+                break
+            print("Допустимо: active или inactive")
+
+    # inactive-поля (§3): обязательный status_reason + опциональные replaced_by_*
+    if fields.get("status") == "inactive":
+        if existing_record is None or fields.get("status_reason") is None:
+            print("status_reason — причина недействования (напр. «Заменён на СП 60.13330.2012»)")
+            while True:
+                ans = ask("[обязательное поле]: ")
+                if ans is None:
+                    return None
+                val = ans.strip()
+                if val:
+                    fields["status_reason"] = val
+                    break
+                print("Поле обязательно при статусе inactive")
+        if existing_record is None or fields.get("replaced_by_document_id") is None:
+            ans = ask(
+                "replaced_by_document_id — официальный номер преемника "
+                "(напр. СП 60.13330.2012), НЕ slug\n[Enter = пропустить / или значение]: "
+            )
+            if ans is None:
+                return None
+            fields["replaced_by_document_id"] = ans.strip() or None
+        if existing_record is None or fields.get("replaced_by_doc_key") is None:
+            ans = ask(
+                "replaced_by_doc_key — ключ каталога-преемника (slug), если известен\n"
+                "[Enter = пропустить / или значение]: "
+            )
+            if ans is None:
+                return None
+            fields["replaced_by_doc_key"] = ans.strip() or None
+    elif existing_record is None:
+        # active: инвариант validate_rag_config — поля inactive = null
+        fields["status_reason"] = None
+        fields["replaced_by_document_id"] = None
+        fields["replaced_by_doc_key"] = None
+
+    # ignore_sections — авто + подтверждение
+    if existing_record is None or fields.get("ignore_sections") is None:
+        default = list(_REG_DEFAULT_IGNORE)
+        print(f"Определено: {', '.join(default)}")
+        ans = ask("ignore_sections [Enter = подтвердить / или список через запятую]: ")
+        if ans is None:
+            return None
+        if ans.strip():
+            items = [x.strip() for x in ans.split(",") if x.strip()]
+            fields["ignore_sections"] = items or default
+        else:
+            fields["ignore_sections"] = default
+
+    # slug (§5.1) — только для новой записи; для дополнения ключ уже есть
+    if existing_slug:
+        slug = existing_slug
+    else:
+        candidate = _reg_make_slug(
+            fields.get("document_id") or "",
+            fields.get("document_type"),
+            fields.get("domain"),
+            set(existing_slugs),
+        )
+        while True:
+            ans = ask(f"Ключ записи (slug): {candidate} — Enter = подтвердить или введите свой: ")
+            if ans is None:
+                return None
+            val = ans.strip()
+            if val == "":
+                slug = candidate
+                break
+            if not _REG_SLUG_RE.match(val):
+                print("Slug: допустимы только латиница, цифры и _")
+                continue
+            if val.lower() in {s.lower() for s in existing_slugs}:
+                print(f"Ключ уже занят: {val} — выберите другой")
+                continue
+            slug = val
+            break
+
+    # Только что заполненные поля (для точечного null-fill и гейта)
+    if existing_record is not None:
+        filled = {
+            k: v for k, v in fields.items()
+            if existing_record.get(k) is None and v is not None
+        }
+    else:
+        filled = dict(fields)
+
+    return slug, fields, filled
+
+
+def _reg_render_field_line(key: str, val) -> str:
+    """Одна строка YAML для поля (или многострочный ignore_sections)."""
+    if val is None:
+        return f"    {key}: null"
+    if key == "status":
+        return f"    {key}: {val}"
+    if key == "ignore_sections":
+        if not val:
+            return "    ignore_sections: []"
+        parts = ["    ignore_sections:"]
+        for item in val:
+            parts.append(f'      - "{_reg_escape_yaml(str(item))}"')
+        return "\n".join(parts)
+    return f'    {key}: "{_reg_escape_yaml(str(val))}"'
+
+
+def _reg_render_record_block(slug: str, fields: dict) -> str:
+    """§6.3: текстовый блок записи точно в стиле существующих записей
+    (2 пробела — slug, 4 — поля, двойные кавычки, null-литералы)."""
+    doc_id = fields.get("document_id") or slug
+    today = datetime.date.today().isoformat()
+    lines = [""]
+    lines.append(f"  # ── {doc_id} — добавлено --reg {today} ──")
+    lines.append(f"  {slug}:")
+    for key in _REG_FIELD_ORDER:
+        lines.append(_reg_render_field_line(key, fields.get(key)))
+    return "\n".join(lines) + "\n"
+
+
+def _reg_find_record_block(text: str, slug: str) -> tuple[int, int] | None:
+    """Индексы (start, end) блока documents.<slug> в тексте конфига."""
+    lines = text.splitlines(keepends=True)
+    start_idx = None
+    for i, line in enumerate(lines):
+        if re.match(rf"^  {re.escape(slug)}:\s*$", line):
+            start_idx = i
+            break
+    if start_idx is None:
+        return None
+    end_idx = len(lines)
+    for j in range(start_idx + 1, len(lines)):
+        stripped = lines[j].strip()
+        if stripped and not lines[j].startswith("    "):
+            end_idx = j
+            break
+    start = sum(len(x) for x in lines[:start_idx])
+    end = sum(len(x) for x in lines[:end_idx])
+    return start, end
+
+
+def _reg_append_record(text: str, slug: str, fields: dict) -> str | None:
+    """§6: append нового блока + safe_load-гейт. None — гейт отклонил."""
+    # Защита от дубля ключа: YAML last-wins проглотил бы повторный ключ,
+    # оставив две записи с одним slug в тексте
+    if _reg_find_record_block(text, slug) is not None:
+        log.error(f"Гейт YAML: запись {slug} уже существует — append отменён")
+        return None
+    block = _reg_render_record_block(slug, fields)
+    new_text = text.rstrip("\n") + "\n" + block
+    try:
+        parsed = yaml.safe_load(new_text) or {}
+    except yaml.YAMLError as e:
+        log.error(f"Гейт YAML: append не распарсился: {e} — запись отменена")
+        return None
+    doc = (parsed.get("documents") or {}).get(slug)
+    if doc is None:
+        log.error(f"Гейт YAML: documents.{slug} отсутствует после append — запись отменена")
+        return None
+    for k, v in fields.items():
+        if doc.get(k) != v:
+            log.error(
+                f"Гейт YAML: documents.{slug}.{k} = {doc.get(k)!r}, "
+                f"ожидалось {v!r} — запись отменена"
+            )
+            return None
+    return new_text
+
+
+def _reg_fill_nulls(text: str, slug: str, fields: dict) -> str | None:
+    """§6.1: точечная замена строк '    field: null' в блоке записи + гейт.
+
+    Меняются только строки целевой записи (поиск блока по slug);
+    комментарии других строк не трогаются. None — гейт отклонил.
+    """
+    region = _reg_find_record_block(text, slug)
+    if region is None:
+        log.error(f"Запись {slug} не найдена в rag_config — null-fill невозможен")
+        return None
+    start, end = region
+    block_lines = text[start:end].splitlines(keepends=True)
+
+    pending = {k: v for k, v in fields.items() if v is not None}
+    out: list[str] = []
+    for line in block_lines:
+        m = re.match(r"^    (\S+): null\s*(?:#.*)?\n?$", line)
+        if m and m.group(1) in pending:
+            key = m.group(1)
+            rendered = _reg_render_field_line(key, pending[key])
+            out.append(rendered + "\n")
+            del pending[key]
+        else:
+            out.append(line)
+    if pending:
+        missing = ", ".join(pending.keys())
+        log.error(f"Не найдены строки для заполнения в {slug}: {missing}")
+        return None
+    new_text = text[:start] + "".join(out) + text[end:]
+
+    # Гейт: распарсилось и содержит ожидаемые значения
+    try:
+        parsed = yaml.safe_load(new_text) or {}
+    except yaml.YAMLError as e:
+        log.error(f"Гейт YAML: null-fill не распарсился: {e} — запись отменена")
+        return None
+    doc = (parsed.get("documents") or {}).get(slug)
+    if doc is None:
+        log.error(f"Гейт YAML: documents.{slug} отсутствует после null-fill")
+        return None
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if doc.get(k) != v:
+            log.error(
+                f"Гейт YAML: documents.{slug}.{k} = {doc.get(k)!r}, "
+                f"ожидалось {v!r} — запись отменена"
+            )
+            return None
+    return new_text
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 13. Tokenizer Chunking (ADR-010)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4975,6 +5651,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
   %(prog)s -i file.pdf --rag               # дополнительно RAG JSONL + assets
   %(prog)s -i file.pdf --ai --rag          # AI-постобработка + RAG
+  %(prog)s -i file.pdf --ai --reg --rag    # + интерактивная регистрация в rag_config.yaml
   %(prog)s -i Markdown/file/file.md --rag  # RAG-индексация проверенного MD
         """,
     )
@@ -5010,6 +5687,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="./rag_config.yaml",
         help="Путь к rag_config.yaml (по умолч. ./rag_config.yaml)",
     )
+    parser.add_argument(
+        "--reg",
+        action="store_true",
+        help="После прогона интерактивно зарегистрировать "
+        "документ в rag_config.yaml (требует TTY)",
+    )
 
     return parser.parse_args(argv)
 
@@ -5024,6 +5707,8 @@ def process_file(
     tmp_base: str,
     use_rag: bool = False,
     rag_config: dict | None = None,
+    use_reg: bool = False,
+    rag_config_path: str | Path = "",
 ) -> bool:
     """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
 
@@ -5033,6 +5718,9 @@ def process_file(
       - .md внутри Markdown/ + --rag: только RAG-индексация проверенного MD
         (без OCR/AI/извлечения), перезаписывает rag_chunks.jsonl + rag_assets.json
       - .md вне Markdown/: AI-постобработка (--ai) и/или RAG (--rag)
+      - --reg (любой поток): после получения финального .md — интерактивная
+        регистрация документа в rag_config.yaml (контракт rag-register-flag.md);
+        обновлённый конфиг передаётся в --rag того же запуска
 
     Returns:
         True при успехе, False при ошибке.
@@ -5047,9 +5735,24 @@ def process_file(
 
     # ── Режим .md внутри Markdown/ + --rag: ТОЛЬКО индексация ──
     if file_type == "md_rag":
-        if not use_rag:
-            log.error(".md в Markdown/: требуется флаг --rag")
+        if not (use_rag or use_reg):
+            log.error(".md в Markdown/: требуется флаг --rag (или --reg)")
             return False
+        # --reg: регистрация по готовому .md (до RAG-индексации)
+        if use_reg:
+            if rag_config is None:
+                log.error("--reg требует загруженного rag_config")
+                return False
+            md_reg_text = input_path_obj.read_text(encoding="utf-8")
+            new_config = run_registration(
+                input_path_obj, md_reg_text, rag_config_path, rag_config, config,
+            )
+            if new_config is None:
+                return False
+            rag_config = new_config
+        if not use_rag:
+            log.info(f"{'=' * 60}")
+            return True
         log.info(f"RAG-индексация проверенного Markdown: {input_path}")
         ok = _run_rag_only(input_path_obj, rag_config)
         log.info(f"{'=' * 60}")
@@ -5070,8 +5773,8 @@ def process_file(
     # Режим: .md вне Markdown/ → только постобработка, без OCR и скриптов
     ext = input_path_obj.suffix.lower()
     if ext == ".md":
-        if use_ai or use_rag:
-            log.info(f"Обработка MD: {file_stem}.md (ai={use_ai}, rag={use_rag})")
+        if use_ai or use_rag or use_reg:
+            log.info(f"Обработка MD: {file_stem}.md (ai={use_ai}, rag={use_rag}, reg={use_reg})")
             md_text = input_path_obj.read_text(encoding="utf-8")
             if use_ai:
                 ai_cfg = config.get("ai_postprocess", config.get("postprocess", config))
@@ -5083,13 +5786,24 @@ def process_file(
                 safe_write(out_path, result)
                 log.info(f"Результат: {out_path} ({len(result)} символов)")
                 md_text = result
+            # --reg: интерактивная регистрация (после AI, до RAG)
+            if use_reg:
+                if rag_config is None:
+                    log.error("--reg требует загруженного rag_config")
+                    return False
+                new_config = run_registration(
+                    input_path_obj, md_text, rag_config_path, rag_config, config,
+                )
+                if new_config is None:
+                    return False
+                rag_config = new_config
             # --rag: JSONL + assets из готового MD (_source_page = null, нет Yandex JSON)
             if use_rag:
                 _write_rag_jsonl(md_text, None, rag_config, input_path, out_dir, file_stem)
             log.info(f"{'=' * 60}")
             return True
         else:
-            log.error(".md файл требует флаг --ai (или --rag)")
+            log.error(".md файл требует флаг --ai (или --rag, или --reg)")
             return False
 
     # Этап 1: DOCX → PDF (если нужно)
@@ -5325,6 +6039,19 @@ def process_file(
         safe_write(md_path, md_text)
         log.info(f"Итоговый Markdown: {md_path} ({len(md_text)} символов)")
 
+        # Этап 8a: --reg — интерактивная регистрация документа в rag_config.yaml
+        # (после финального .md, до RAG-генерации; контракт rag-register-flag.md)
+        if use_reg:
+            if rag_config is None:
+                log.error("--reg требует загруженного rag_config")
+                return False
+            new_config = run_registration(
+                input_path_obj, md_text, rag_config_path, rag_config, config,
+            )
+            if new_config is None:
+                return False
+            rag_config = new_config
+
         # Этап 8b: RAG JSONL (если --rag) — из финального MD + Yandex JSON
         if use_rag:
             _write_rag_jsonl(md_text, headings, rag_config, input_path, out_dir, file_stem)
@@ -5362,6 +6089,7 @@ def main() -> None:
     log.info(f"Вход: {args.input}")
     log.info(f"AI: {args.ai}")
     log.info(f"RAG: {args.rag}")
+    log.info(f"REG: {args.reg}")
     log.info(f"Выход: {output_base}")
     log.info(f"Лог: {log_path}")
 
@@ -5385,17 +6113,24 @@ def main() -> None:
             log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
             sys.exit(1)
 
-    # Загружаем конфиг AI (если нужен — для --ai)
-    config = load_config(args.config) if args.ai else {}
+    # Загружаем конфиг AI (если нужен — для --ai или LLM-слоя --reg)
+    config = load_config(args.config) if (args.ai or args.reg) else {}
 
-    # Загружаем rag_config (если --rag); при ошибке — пропустить RAG-генерацию
+    # Загружаем rag_config (если --rag или --reg). При ошибке загрузки:
+    #   --rag — как раньше: warning, RAG-генерация пропущена;
+    #   --reg — жёсткая ошибка (exit 1): регистрация невозможна без конфига
+    #   (при обоих флагах ошибка --reg приоритетна, контракт §2).
     rag_config = None
-    if args.rag:
+    if args.rag or args.reg:
         try:
             rag_config = load_rag_config(args.rag_config)
             log.info(f"RAG-конфиг загружен: {args.rag_config}")
         except Exception as e:
-            log.error(f"Не удалось загрузить rag_config: {e} — RAG-генерация пропущена")
+            log.error(f"Не удалось загрузить rag_config: {e}")
+            if args.reg:
+                log.error("--reg требует корректного rag_config.yaml — регистрация невозможна")
+                sys.exit(1)
+            log.error("RAG-генерация пропущена")
 
     # Обрабатываем один файл
     ok = process_file(
@@ -5408,6 +6143,8 @@ def main() -> None:
         tmp_base,
         use_rag=args.rag,
         rag_config=rag_config,
+        use_reg=args.reg,
+        rag_config_path=args.rag_config,
     )
 
     log.info(f"{'=' * 60}")
