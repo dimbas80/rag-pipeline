@@ -4,17 +4,17 @@
 
 table_vision:
   # Провайдер для vision-распознавания таблиц (--ai-table)
-  provider: provod
-  model: google/gemini-2.5-flash-lite
-  api_key_env: PROVOD_API_KEY
-  base_url: https://api.provod.ai/v1
+  provider: anymodel
+  model: gc/gemini-2.5-flash
+  api_key_env: ANYMODEL_API_KEY
+  base_url: https://anymodel.org/v1
 
   # Резервный провайдер для vision-распознавания
   fallback:
-    provider: provod
-    model: google/gemini-2.5-flash
-    api_key_env: PROVOD_API_KEY
-    base_url: https://api.provod.ai/v1
+    provider: anymodel
+    model: glm/glm-4.6v
+    api_key_env: ANYMODEL_API_KEY
+    base_url: https://anymodel.org/v1
 
   # Промпт для vision-модели (картинка + промпт)
   prompt: |
@@ -26,7 +26,7 @@ table_vision:
     
 
   
-# API-ключи задаются через .env (DEEPSEEK_API_KEY, PROVOD_API_KEY).
+# API-ключи задаются через .env (DEEPSEEK_API_KEY, ANYMODEL_API_KEY).
 # Порядок загрузки: .env → переменные окружения.
 #
 # ═══════════════════════════════════════════════════════════════════════════
@@ -46,10 +46,10 @@ ai_postprocess:
 
   # Резервный провайдер (если primary не отвечает или ключ не задан)
   fallback:
-    provider: provod
-    model: google/gemini-3.5-flash
-    api_key_env: PROVOD_API_KEY
-    base_url: https://api.provod.ai/v1
+    provider: anymodel
+    model: glm/glm-5.2
+    api_key_env: ANYMODEL_API_KEY
+    base_url: https://anymodel.org/v1
 
   # Объединённый промпт: постобработка + сверка таблиц с vision-эталоном.
   # Правила 1–13 — постобработка, 14–20 — сверка таблиц.
