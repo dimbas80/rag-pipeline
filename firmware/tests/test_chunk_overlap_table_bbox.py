@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Тесты: overlap 3 строки между чанками AI-постобработки + расширение boundingBox таблиц вверх на 30px."""
+"""Тесты: overlap 3 строки между чанками AI-постобработки + расширение boundingBox таблиц вверх на 64pt."""
 import os
 import sys
 from unittest.mock import patch, MagicMock
@@ -102,7 +102,7 @@ def test_ai_postprocess_multi_chunk_overlap_short_prev(monkeypatch, tmp_path):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# extract_table_images: boundingBox вверх на 30px
+# extract_table_images: вырезка таблиц (верх включает подпись, иначе 64pt)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -138,8 +138,8 @@ def _page_with_table(min_y):
     }]
 
 
-def test_extract_table_images_bbox_extended_up_30px(tmp_path):
-    """y0 таблицы поднят на 30px вверх (с учётом исходных -2), x0 не изменён."""
+def test_extract_table_images_bbox_no_caption_fallback_64pt(tmp_path):
+    """Без подписи верх вырезки = 64pt над таблицей, x0 не изменён."""
     import fitz
 
     pdf_path = _make_pdf(tmp_path)
@@ -156,7 +156,7 @@ def test_extract_table_images_bbox_extended_up_30px(tmp_path):
 
     assert mock_pix.call_count == 1
     clip = mock_pix.call_args.kwargs["clip"]
-    assert abs(clip.y0 - (200 * sy - 32)) < 1e-6, f"y0={clip.y0}, ожидалось {200 * sy - 32}"
+    assert abs(clip.y0 - (200 * sy - 64)) < 1e-6, f"y0={clip.y0}, ожидалось {200 * sy - 64}"
     assert abs(clip.x0 - (100 * sx - 2)) < 1e-6, f"x0={clip.x0}, ожидалось {100 * sx - 2}"
     assert abs(clip.x1 - (1140 * sx + 2)) < 1e-6
     assert abs(clip.y1 - (600 * sy + 2)) < 1e-6
@@ -171,7 +171,7 @@ def test_extract_table_images_bbox_clamped_at_page_top(tmp_path):
 
     pdf_path = _make_pdf(tmp_path)
     img_dir = tmp_path / "img"
-    # Таблица почти у верхнего края: min(ys)*sy - 32 < 0
+    # Таблица почти у верхнего края: min(ys)*sy - 64 < 0
     pages = _page_with_table(min_y=10)
 
     with patch("fitz.Page.get_pixmap") as mock_pix:
@@ -180,6 +180,47 @@ def test_extract_table_images_bbox_clamped_at_page_top(tmp_path):
 
     clip = mock_pix.call_args.kwargs["clip"]
     assert clip.y0 == 0, f"y0={clip.y0}, ожидался clamp в 0"
+
+
+def _page_with_table_and_caption(caption_top_y):
+    """Страница с таблицей (top=200) и блоком-подписью выше неё."""
+    page = _page_with_table(min_y=200)
+    ta = page[0]["result"]["textAnnotation"]
+    ta["blocks"] = [{
+        "boundingBox": {
+            "vertices": [
+                {"x": 100, "y": caption_top_y},
+                {"x": 1140, "y": caption_top_y},
+                {"x": 1140, "y": caption_top_y + 30},
+                {"x": 100, "y": caption_top_y + 30},
+            ]
+        },
+        "layoutType": "LAYOUT_TYPE_CAPTION",
+        "lines": [{"text": "Таблица 1.2 — Пример"}],
+    }]
+    return page
+
+
+def test_extract_table_images_bbox_includes_caption(tmp_path):
+    """Найденная подпись → верх вырезки = верх подписи (с -2pt), а не 64pt."""
+    import fitz
+
+    pdf_path = _make_pdf(tmp_path)
+    img_dir = tmp_path / "img"
+    pages = _page_with_table_and_caption(caption_top_y=120)
+
+    with patch("fitz.Page.get_pixmap") as mock_pix:
+        mock_pix.return_value.save = MagicMock()
+        result = extract_table_images(str(pdf_path), pages, img_dir)
+
+    page = fitz.open(str(pdf_path))[0]
+    sy = page.rect.height / 1754
+
+    clip = mock_pix.call_args.kwargs["clip"]
+    assert abs(clip.y0 - (120 * sy - 2)) < 1e-6, f"y0={clip.y0}, ожидалось {120 * sy - 2}"
+    assert abs(clip.y1 - (600 * sy + 2)) < 1e-6
+    # Подпись должна попасть в результат (проверка, что блок найден корректно)
+    assert result[0].get("caption") == "Таблица 1.2 — Пример"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

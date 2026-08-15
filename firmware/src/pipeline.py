@@ -721,19 +721,96 @@ def _block_to_md(block: dict) -> str:
     return raw_text
 
 
+_TABLE_WORD_RE = re.compile(r"Т\s*а\s*б\s*л\s*и\s*ц\s*а", re.IGNORECASE)
+
+
+def _block_text(block: dict) -> str:
+    """Собрать текст блока из строк OCR (без хвостовых пробелов)."""
+    text = ""
+    for line_data in block.get("lines", []):
+        t = line_data.get("text", "").strip()
+        if t:
+            text += " " + t
+    return text.strip()
+
+
+def _find_table_caption_block(
+    blocks: list[dict],
+    table: dict,
+    all_tables: list[dict],
+) -> dict | None:
+    """Найти блок-подпись для таблицы (с boundingBox) или None.
+
+    Выбирается ближайший сверху блок, который является LAYOUT_TYPE_CAPTION
+    или содержит текст «Т а б л и ц а» (с произвольными пробелами между
+    буквами — OCR-артефакт), и при этом не относится к другой, более
+    близкой по Y таблице. Возвращает сам блок (с геометрией), а не текст,
+    чтобы вырезка могла учесть высоту подписи.
+    """
+    table_vertices = table.get("boundingBox", {}).get("vertices", [])
+    if not table_vertices:
+        return None
+    table_y = min(float(v.get("y", 0)) for v in table_vertices)
+
+    # Y-позиции других таблиц (для определения, какая таблица ближе к caption).
+    other_table_ys: list[float] = []
+    for other in all_tables:
+        if other is table:
+            continue
+        ov = other.get("boundingBox", {}).get("vertices", [])
+        if ov:
+            other_table_ys.append(min(float(v.get("y", 0)) for v in ov))
+
+    # Сортируем блоки по Y (возрастание — сверху вниз).
+    blocks_with_y: list[tuple[float, dict]] = []
+    for block in blocks:
+        bv = block.get("boundingBox", {}).get("vertices", [])
+        by = min(float(v.get("y", 0)) for v in bv) if bv else 0.0
+        blocks_with_y.append((by, block))
+    blocks_with_y.sort(key=lambda x: x[0])
+
+    best_block: dict | None = None
+    best_y_diff: float = float("inf")
+
+    for by, block in blocks_with_y:
+        if by >= table_y:
+            continue  # Блок ниже таблицы — не подходит
+
+        # Не ближе ли другая таблица к этому блоку (тогда блок — её подпись)?
+        if any(by < ot_y < table_y for ot_y in other_table_ys):
+            continue
+
+        layout_type = block.get("layoutType", "")
+        block_text = _block_text(block)
+        is_caption_block = layout_type == "LAYOUT_TYPE_CAPTION"
+        has_table_word = bool(_TABLE_WORD_RE.search(block_text))
+
+        if is_caption_block or has_table_word:
+            y_diff = table_y - by
+            if y_diff < best_y_diff:
+                best_y_diff = y_diff
+                best_block = block
+
+    return best_block
+
+
+def _caption_block_to_text(block: dict | None) -> str:
+    """Нормализованный текст подписи из блока (пустая строка, если блока нет)."""
+    if not block:
+        return ""
+    block_text = _block_text(block)
+    if _TABLE_WORD_RE.search(block_text):
+        caption = _normalize_spaced_text(block_text)
+        return re.sub(r"\s+", " ", caption)
+    return block_text
+
+
 def _find_table_caption_for(
     blocks: list[dict],
     table: dict,
     all_tables: list[dict],
 ) -> str:
     """Найти подпись для таблицы среди блоков.
-
-    Ищет ближайший по Y сверху блок, который является:
-    - LAYOUT_TYPE_CAPTION
-    - или содержит текст «Т а б л и ц а» (с пробелами между буквами — OCR-артефакт)
-
-    Исключает блоки, которые уже являются подписью для другой, более близкой
-    по Y таблицы.
 
     Args:
         blocks: Все блоки страницы.
@@ -743,80 +820,7 @@ def _find_table_caption_for(
     Returns:
         Нормализованный текст подписи, или пустая строка.
     """
-    # Y-позиция текущей таблицы (min y)
-    table_vertices = table.get("boundingBox", {}).get("vertices", [])
-    if not table_vertices:
-        return ""
-    table_y = min(float(v.get("y", 0)) for v in table_vertices)
-
-    # Y-позиции других таблиц (для определения, какая таблица ближе к caption)
-    other_table_ys: list[float] = []
-    for other in all_tables:
-        if other is table:
-            continue
-        ov = other.get("boundingBox", {}).get("vertices", [])
-        if ov:
-            other_table_ys.append(min(float(v.get("y", 0)) for v in ov))
-
-    # Сортируем блоки по Y (возрастание — сверху вниз)
-    blocks_with_y: list[tuple[float, dict]] = []
-    for block in blocks:
-        bv = block.get("boundingBox", {}).get("vertices", [])
-        if bv:
-            by = min(float(v.get("y", 0)) for v in bv)
-        else:
-            by = 0.0
-        blocks_with_y.append((by, block))
-    blocks_with_y.sort(key=lambda x: x[0])
-
-    # Ищем блоки, которые могут быть подписью для этой таблицы.
-    # Они должны быть выше таблицы (y < table_y).
-    # Выбираем САМЫЙ БЛИЖНИЙ сверху.
-    best_caption: str = ""
-    best_y_diff: float = float("inf")
-
-    # OCR может расставлять произвольное число пробелов между буквами.
-    # Не ограничиваем поиск фиксированным отступом: заголовок часто имеет
-    # отдельный блок и находится заметно выше boundingBox таблицы.
-    caption_pattern = re.compile(r"Т\s*а\s*б\s*л\s*и\s*ц\s*а", re.IGNORECASE)
-
-    for by, block in blocks_with_y:
-        if by >= table_y:
-            continue  # Блок ниже таблицы — не подходит
-
-        # Проверяем, не ближе ли другой таблице этот блок
-        # (Если другая таблица находится между этим блоком и текущей таблицей,
-        #  то блок относится к той, другой таблице)
-        is_closer_to_other = False
-        for ot_y in other_table_ys:
-            if by < ot_y < table_y:
-                is_closer_to_other = True
-                break
-        if is_closer_to_other:
-            continue
-
-        layout_type = block.get("layoutType", "")
-        block_text = ""
-        for line_data in block.get("lines", []):
-            t = line_data.get("text", "").strip()
-            if t:
-                block_text += " " + t
-        block_text = block_text.strip()
-
-        is_caption_block = layout_type == "LAYOUT_TYPE_CAPTION"
-        has_table_word = bool(caption_pattern.search(block_text))
-
-        if is_caption_block or has_table_word:
-            y_diff = table_y - by
-            if y_diff < best_y_diff:
-                best_y_diff = y_diff
-                if has_table_word:
-                    best_caption = _normalize_spaced_text(block_text)
-                    best_caption = re.sub(r"\s+", " ", best_caption)
-                else:
-                    best_caption = block_text
-
-    return best_caption
+    return _caption_block_to_text(_find_table_caption_block(blocks, table, all_tables))
 
 
 def _extract_table_num_from_text(text: str) -> str | None:
@@ -1648,6 +1652,20 @@ def _insert_images_into_md(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _table_crop_top(caption_block: dict | None, table_top: float, sy: float) -> float:
+    """Верхняя граница вырезки таблицы: включает подпись целиком.
+
+    Если подпись найдена, верх вырезки — это верхняя грань блока подписи
+    (с отступом 2pt). Иначе — фиксированный запас 64pt над таблицей.
+    """
+    if caption_block:
+        bv = caption_block.get("boundingBox", {}).get("vertices", [])
+        if bv:
+            caption_top = min(float(v.get("y", 0)) for v in bv) * sy
+            return max(0.0, caption_top - 2)
+    return max(0.0, table_top - 64)
+
+
 def extract_table_images(
     pdf_path: str | Path,
     pages: list[dict],
@@ -1714,7 +1732,15 @@ def extract_table_images(
                 xs = [float(v.get("x", 0)) for v in bbox]
                 ys = [float(v.get("y", 0)) for v in bbox]
                 x0 = min(xs) * sx - 2
-                y0 = max(0, min(ys) * sy - 32)  # +30px вверх для заголовка
+
+                # Подпись таблицы: находим блок (с геометрией), чтобы вырезка
+                # сверху включила её целиком (динамический отступ).
+                caption_block = _find_table_caption_block(
+                    ta.get("blocks", []), table, tables
+                )
+                caption = _caption_block_to_text(caption_block)
+                y0 = _table_crop_top(caption_block, min(ys) * sy, sy)
+
                 x1, y1 = max(xs) * sx + 2, max(ys) * sy + 2
 
                 rect = fitz.Rect(x0, y0, x1, y1)
@@ -1723,9 +1749,6 @@ def extract_table_images(
                 table_counter += 1
                 fname = f"table_{table_counter}.png"
                 pix.save(str(img_dir / fname))
-                caption = _find_table_caption_for(
-                    ta.get("blocks", []), table, tables
-                )
 
                 table_num = _extract_table_num_from_text(caption)
                 item = {
