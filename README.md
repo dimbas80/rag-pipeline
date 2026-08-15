@@ -58,19 +58,26 @@ python search.py --query "тросовый молниеприемник" --json
 
 Перед индексацией **удаляет старые точки** документа с тем же `document_id` — переиндексация безопасна.
 
+Основной способ — передать папку документа позиционным аргументом (в ней автоматически
+найдутся `*_chunks.jsonl` и `*_assets.json`):
+
 ```bash
-python create_index.py \
-  --chunks "СО153_Молниезащита_chunks.jsonl" \
-  --assets "СО153_Молниезащита_assets.json" \
-  --qdrant-path "/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data"
+python3 create_index.py '/mnt/sdb/!База_ГОСТ/Markdown/ГОСТ18410-73_Кабели_с_бумажной_изоляцией' \
+    --qdrant-path '/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data' --strict
 ```
+
+> **Важно:** `--qdrant-path` по умолчанию — относительный `./qdrant_data`. Без явного
+> абсолютного пути индекс уходит в dev-копию рядом с cwd, а не в рабочую базу
+> (`/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data`, которую читает бот). Переменная
+> `QDRANT_PATH` из `.env` этим скриптом НЕ читается (её берёт только `bot.py`) —
+> всегда передавайте `--qdrant-path` явно.
 
 | Параметр | По умолчанию | Описание |
 |---|---|---|
-| `--chunks` (обязательный) | — | JSONL с чанками |
-| `--assets` (обязательный) | — | JSON с assets.json |
-| `--collection` | `technical_standard` | Имя коллекции |
-| `--qdrant-path` | `./qdrant_data` | Путь к Qdrant |
+| `input_dir` (позиционный) | — | Папка документа: авто-поиск `*_chunks.jsonl` + `*_assets.json` |
+| `--chunks` / `--assets` | — | Альтернатива `input_dir`: явные файлы (взаимоисключающе) |
+| `--collection` | авто-выбор | Имя коллекции (единственная в базе подхватится сама) |
+| `--qdrant-path` | `./qdrant_data` | Путь к Qdrant — **задавайте абсолютный** (см. выше) |
 | `--batch-size` | `16` | Размер батча индексации |
 | `--api-key` | из `.env` | API-ключ SiliconFlow |
 | `--strict` | — | Прервать при ошибках валидации |

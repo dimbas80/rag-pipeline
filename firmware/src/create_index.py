@@ -17,6 +17,9 @@ sparse — локальный fastembed (Qdrant/bm25).
     # Основной способ — путь к папке документа: *_chunks.jsonl и *_assets.json
     # ищутся автоматически, коллекция выбирается автоматически.
     python create_index.py "path/to/doc_folder"
+    пример:
+    python3 create_index.py '/mnt/sdb/!База_ГОСТ/Markdown/ГОСТ18410-73_Кабели_с_бумажной_изоляцией' \
+        --qdrant-path '/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data' --strict
 
     # Прежний способ — явные файлы.
     python create_index.py --chunks path/to/chunks.jsonl --assets path/to/assets.json \
