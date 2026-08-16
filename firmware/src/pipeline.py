@@ -77,6 +77,8 @@ class Table:
     component_images: Optional[list[str]] = None
     image_path: Optional[str] = None
     md_lines: Optional[tuple[int, int]] = None
+    # Stable identity assigned by stitch_tables; None means not stitched.
+    stitch_group_id: Optional[int] = None
 
 
 @dataclass
@@ -224,6 +226,134 @@ def parse_yandex_json_to_model(pages: list[dict] | None) -> Document:
             pictures.append(picture)
         document_pages.append(Page(page_index, width, height, page_blocks, table_indices, page_picture_indices))
     return Document(document_pages, headings, tables, pictures, {"page_count": len(document_pages)})
+
+
+def count_columns(table: Table) -> int:
+    return max((cell.col + cell.colspan for cell in table.cells), default=0)
+
+
+def geometry_says_same_table(
+    page: Page,
+    prev: Table,
+    curr: Table,
+    bottom_threshold_ratio: float = 0.75,
+) -> bool:
+    if curr.page != prev.page + 1 or count_columns(prev) != count_columns(curr):
+        return False
+    overlap = min(prev.bbox.x1, curr.bbox.x1) - max(prev.bbox.x0, curr.bbox.x0)
+    span = max(prev.bbox.x1 - prev.bbox.x0, curr.bbox.x1 - curr.bbox.x0)
+    return (
+        overlap > 0 and span > 0 and overlap / span >= 0.5
+        and page.height > 0
+        and prev.bbox.y1 / page.height >= bottom_threshold_ratio
+    )
+
+
+def _table_stitching_config() -> dict:
+    """Load table stitching options, retaining safe defaults when absent."""
+    config = {"bottom_threshold_ratio": 0.75, "require_table_num_match": True}
+    candidates = [Path.cwd() / "rag_config.yaml", Path(__file__).with_name("rag_config.yaml")]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with path.open(encoding="utf-8") as stream:
+                section = (yaml.safe_load(stream) or {}).get("table_stitching", {})
+            if isinstance(section, dict):
+                config.update({key: section[key] for key in config if key in section})
+            break
+        except (OSError, yaml.YAMLError) as exc:
+            log.warning("Не удалось загрузить table_stitching из %s: %s", path, exc)
+    return config
+
+
+def stitch_tables(doc: Document) -> None:
+    """Stitch structured tables; explicit matching continuations override geometry."""
+    config = _table_stitching_config()
+    threshold = float(config["bottom_threshold_ratio"])
+    require_num = bool(config["require_table_num_match"])
+    ordered = sorted(doc.tables, key=lambda table: (table.page, table.table_index))
+    current_head = current_last = None
+    current_num = None
+    group_id = 0
+    for table in ordered:
+        table.stitch_group_id = group_id
+        if table.caption and not table.is_continuation:
+            group_id += 1
+            table.stitch_group_id = group_id
+            current_head = current_last = table
+            current_num = table.table_num
+        elif (table.is_continuation and current_head is not None and
+              (not require_num or table.table_num == current_num)):
+            table.caption = current_head.caption
+            table.stitch_group_id = current_head.stitch_group_id
+            current_last = table
+        elif (not table.caption and current_last is not None and
+              geometry_says_same_table(
+                  doc.pages[current_last.page], current_last, table, threshold
+              )):
+            table.caption = current_head.caption
+            table.stitch_group_id = current_head.stitch_group_id
+            current_last = table
+        else:
+            group_id += 1
+            table.stitch_group_id = group_id
+            current_head = current_last = table
+            current_num = table.table_num
+
+
+def _caption_bbox_for_table(doc: Document, table: Table) -> BBox | None:
+    candidates = [b for b in doc.pages[table.page].blocks if b.is_table_caption and b.bbox.y1 <= table.bbox.y0]
+    return max(candidates, key=lambda b: b.bbox.y1).bbox if candidates else None
+
+
+def extract_table_images_from_model(pdf_path: str | Path, doc: Document, img_dir: str | Path) -> None:
+    import fitz
+    img_dir = ensure_dir(img_dir)
+    with fitz.open(str(pdf_path)) as pdf:
+        for ordinal, table in enumerate(doc.tables, 1):
+            if table.page >= pdf.page_count:
+                continue
+            page = pdf[table.page]
+            model_page = doc.pages[table.page]
+            sx = page.rect.width / model_page.width if model_page.width else 1.0
+            sy = page.rect.height / model_page.height if model_page.height else 1.0
+            caption_bbox = _caption_bbox_for_table(doc, table)
+            top = caption_bbox.y0 if caption_bbox else table.bbox.y0
+            rect = fitz.Rect(table.bbox.x0 * sx, top * sy, table.bbox.x1 * sx, table.bbox.y1 * sy)
+            path = img_dir / f"table_{ordinal}.png"
+            if _crop_and_save_image(page, rect, path):
+                table.image_path = str(path)
+
+
+def extract_pictures_from_model(pdf_path: str | Path, doc: Document, img_dir: str | Path) -> None:
+    import fitz
+    img_dir = ensure_dir(img_dir)
+    with fitz.open(str(pdf_path)) as pdf:
+        for ordinal, picture in enumerate(doc.pictures, 1):
+            if picture.page >= pdf.page_count:
+                continue
+            page = pdf[picture.page]
+            model_page = doc.pages[picture.page]
+            sx = page.rect.width / model_page.width if model_page.width else 1.0
+            sy = page.rect.height / model_page.height if model_page.height else 1.0
+            rect = fitz.Rect(picture.bbox.x0 * sx, picture.bbox.y0 * sy, picture.bbox.x1 * sx, picture.bbox.y1 * sy)
+            path = img_dir / f"fig_{ordinal}.png"
+            if _crop_and_save_image(page, rect, path):
+                picture.image_path = str(path)
+
+
+def populate_component_images(doc: Document) -> None:
+    groups: dict[int, list[Table]] = {}
+    for table in sorted(doc.tables, key=lambda item: (item.page, item.table_index)):
+        if not table.caption or table.stitch_group_id is None:
+            continue
+        groups.setdefault(table.stitch_group_id, []).append(table)
+    for group in groups.values():
+        paths = [table.image_path for table in group if table.image_path]
+        if len(group) > 1:
+            for table in group:
+                table.component_images = list(paths)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
