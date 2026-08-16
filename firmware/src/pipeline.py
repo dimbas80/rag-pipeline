@@ -32,13 +32,198 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class BBox:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+@dataclass(frozen=True)
+class Cell:
+    row: int
+    col: int
+    rowspan: int
+    colspan: int
+    text: str
+
+
+@dataclass
+class Block:
+    y: float
+    layout_type: str
+    text: str
+    bbox: BBox
+    heading_level: Optional[int] = None
+    heading_number: Optional[str] = None
+    is_table_caption: bool = False
+    is_continuation_caption: bool = False
+
+
+@dataclass
+class Table:
+    page: int
+    table_index: int
+    bbox: BBox
+    cells: list[Cell]
+    caption: Optional[str] = None
+    table_num: Optional[str] = None
+    is_continuation: bool = False
+    component_images: Optional[list[str]] = None
+    image_path: Optional[str] = None
+    md_lines: Optional[tuple[int, int]] = None
+
+
+@dataclass
+class Picture:
+    page: int
+    bbox: BBox
+    score: float
+    image_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Heading:
+    page: int
+    level: int
+    number: str
+    text: str
+    full_text: str
+    y: float
+
+
+@dataclass
+class Page:
+    index: int
+    width: float
+    height: float
+    blocks: list[Block]
+    table_indices: list[int] = field(default_factory=list)
+    picture_indices: list[int] = field(default_factory=list)
+
+
+@dataclass
+class Document:
+    pages: list[Page]
+    headings: list[Heading]
+    tables: list[Table]
+    pictures: list[Picture]
+    metadata: dict = field(default_factory=dict)
+
 
 import httpx
 import yaml
 
 # ── Логирование (базовое) ─────────────────────────────────────────────
 log = logging.getLogger("create-md-ya")
+
+
+def _model_bbox(value: dict | None) -> BBox:
+    vertices = (value or {}).get("vertices", [])
+    if not vertices:
+        return BBox(0.0, 0.0, 0.0, 0.0)
+    xs = [float(v.get("x", 0)) for v in vertices]
+    ys = [float(v.get("y", 0)) for v in vertices]
+    return BBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _model_block_text(block: dict) -> str:
+    return " ".join(str(line.get("text", "")).strip()
+                     for line in block.get("lines", []) if line.get("text", "").strip()).strip()
+
+
+def _model_heading_parts(text: str) -> tuple[str, str] | None:
+    match = re.match(r"^(\d+(?:\.\d+)*\.?)(?:\s+|$)(.*)$", text.strip())
+    if not match:
+        return None
+    number = match.group(1).rstrip(".")
+    title = match.group(2).strip()
+    if not title or len(text) >= 100 or len(text.split()) >= 10:
+        return None
+    return number, title
+
+
+def parse_yandex_json_to_model(pages: list[dict] | None) -> Document:
+    """Build the Phase 1 structured model without changing the Markdown parser."""
+    if not pages:
+        return Document([], [], [], [], {})
+    document_pages: list[Page] = []
+    headings: list[Heading] = []
+    tables: list[Table] = []
+    pictures: list[Picture] = []
+    for page_index, page in enumerate(pages):
+        ta = page.get("result", {}).get("textAnnotation", {})
+        width = float(ta.get("width", 0) or 0)
+        height = float(ta.get("height", 0) or 0)
+        raw_blocks = ta.get("blocks", []) or []
+        raw_tables = ta.get("tables", []) or []
+        raw_pictures = ta.get("pictures", []) or []
+        table_models: list[Table] = []
+        table_boxes: list[BBox] = []
+        for table_index, raw_table in enumerate(raw_tables):
+            bbox = _model_bbox(raw_table.get("boundingBox"))
+            table_boxes.append(bbox)
+            cells = []
+            for raw_cell in raw_table.get("cells", []) or []:
+                cells.append(Cell(int(raw_cell.get("rowIndex", 0)), int(raw_cell.get("columnIndex", 0)),
+                                  int(raw_cell.get("rowSpan", 1)), int(raw_cell.get("columnSpan", 1)),
+                                  str(raw_cell.get("text", "")).replace("\n", " ").strip()))
+            caption_block = _find_table_caption_block(raw_blocks, raw_table, raw_tables)
+            if caption_block is None:
+                for candidate in raw_blocks:
+                    candidate_text = _model_block_text(candidate)
+                    if re.search(r"(?:Окончани[ея]|Продолжени[ея]|Продолж\.?)\s+(?:таблиц[аы]|табл\.?)", candidate_text, re.IGNORECASE):
+                        candidate_box = _model_bbox(candidate.get("boundingBox"))
+                        if candidate_box.y1 <= bbox.y0:
+                            caption_block = candidate
+            caption = _caption_block_to_text(caption_block) or None
+            table_num = _extract_table_num_from_text(caption or "")
+            table_models.append(Table(page_index, table_index, bbox, cells, caption, table_num,
+                                      _is_continuation_caption(caption or "")))
+        tables.extend(table_models)
+        table_indices = list(range(len(tables) - len(table_models), len(tables)))
+        page_blocks: list[Block] = []
+        raw_y: list[tuple[float, dict, BBox, str]] = []
+        for raw_block in raw_blocks:
+            bbox = _model_bbox(raw_block.get("boundingBox"))
+            line_boxes = [_model_bbox(line.get("boundingBox")) for line in raw_block.get("lines", [])]
+            if line_boxes:
+                bbox = BBox(min(b.x0 for b in line_boxes), min(b.y0 for b in line_boxes),
+                            max(b.x1 for b in line_boxes), max(b.y1 for b in line_boxes))
+            text = _model_block_text(raw_block)
+            raw_y.append((bbox.y0, raw_block, bbox, text))
+        for y, raw_block, bbox, text in raw_y:
+            if any(bbox.y0 >= tb.y0 and bbox.y1 <= tb.y1 and bbox.y1 > bbox.y0 for tb in table_boxes):
+                continue
+            layout = str(raw_block.get("layoutType", ""))
+            caption_flag = bool(_TABLE_WORD_RE.search(_normalize_spaced_text(text))) or layout.endswith("CAPTION")
+            continuation_flag = _is_continuation_caption(text)
+            heading_parts = _model_heading_parts(text) if layout.endswith("SECTION_HEADER") else None
+            level = number = title = None
+            if heading_parts and bbox.x0 / width < 0.50:
+                number, title = heading_parts
+                level = number.count(".") + 1
+                nearby = [other_y for other_y, _, _, _ in raw_y if other_y != y and abs(other_y - y) <= 15]
+                if nearby:
+                    level = number = title = None
+            block_model = Block(y, layout.removeprefix("LAYOUT_TYPE_"), text, bbox, level, number,
+                                caption_flag, continuation_flag)
+            page_blocks.append(block_model)
+            if level is not None:
+                headings.append(Heading(page_index, level, number, title, text, y))
+        page_picture_indices = []
+        for raw_picture in raw_pictures:
+            picture = Picture(page_index, _model_bbox(raw_picture.get("boundingBox")),
+                              float(raw_picture.get("score", raw_picture.get("confidence", 0.0)) or 0.0))
+            page_picture_indices.append(len(pictures))
+            pictures.append(picture)
+        document_pages.append(Page(page_index, width, height, page_blocks, table_indices, page_picture_indices))
+    return Document(document_pages, headings, tables, pictures, {"page_count": len(document_pages)})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
