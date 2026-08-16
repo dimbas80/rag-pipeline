@@ -6175,6 +6175,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Таблицы вырезаются в image/ ВСЕГДА (без --ai); --ai добавляет vision-коррекцию",
     )
     parser.add_argument(
+        "--json-native",
+        action="store_true",
+        help="Использовать структурный JSON-native путь рендеринга вместо legacy-парсера",
+    )
+    parser.add_argument(
         "--config",
         default="./config_ai.yaml",
         help="Путь к config_ai.yaml (по умолч. ./config_ai.yaml)",
@@ -6202,6 +6207,54 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _process_json_native_pages(
+    pages: list[dict],
+    pdf_path: str,
+    file_tmp_dir: Path,
+    img_dir: Path,
+    use_ai: bool,
+    config: dict,
+    file_stem: str,
+) -> str:
+    """Обработать OCR JSON структурным JSON-native конвейером."""
+    doc = parse_yandex_json_to_model(pages)
+    stitch_tables(doc)
+    extract_table_images_from_model(pdf_path, doc, img_dir)
+    extract_pictures_from_model(pdf_path, doc, img_dir)
+    populate_component_images(doc)
+    md_text = render_document_to_md(doc)
+    md_text = merge_tables_by_model(md_text, doc)
+    md_text = run_script_postprocess(md_text, img_dir, doc=doc)
+
+    if use_ai:
+        vision_api_key = os.environ.get(
+            config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"), ""
+        )
+        if vision_api_key:
+            table_images = []
+            for ordinal, table in enumerate(doc.tables, 1):
+                if not table.image_path:
+                    continue
+                table_images.append({
+                    "path": Path(table.image_path).name,
+                    "table_idx": ordinal,
+                    "id": f"t_p{table.page + 1}_{table.table_index}",
+                })
+            if table_images:
+                recognized = recognize_tables_vision(
+                    table_images, img_dir, config, file_tmp_dir, vision_api_key,
+                )
+                log.info("  Распознано native-таблиц: %s/%s", recognized, len(table_images))
+        vision_tables = load_vision_tables_from_model(doc, file_tmp_dir)
+        ai_cfg = dict(config.get("ai_postprocess", config.get("postprocess", config)))
+        if not ai_cfg.get("prompt"):
+            ai_cfg["prompt"] = config.get("table_vision", {}).get("prompt")
+        if not ai_cfg.get("prompt"):
+            raise ValueError("не задан промт для JSON-native AI-постобработки")
+        md_text = ai_postprocess_json_native(md_text, ai_cfg, file_stem, vision_tables)
+    return md_text
+
+
 def process_file(
     input_path: str,
     use_ai: bool,
@@ -6214,6 +6267,7 @@ def process_file(
     rag_config: dict | None = None,
     use_reg: bool = False,
     rag_config_path: str | Path = "",
+    use_json_native: bool = False,
 ) -> bool:
     """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
 
@@ -6328,9 +6382,33 @@ def process_file(
             log.warning("  Yandex OCR вернул пустой результат")
             return False
 
-        # Сохраняем JSON
+        # Сохраняем JSON в обоих режимах: это исходный OCR-артефакт, а не raw.md.
         json_path = file_tmp_dir / "yandex_result.json"
         safe_write(json_path, json.dumps(pages, ensure_ascii=False, indent=2))
+
+        if use_json_native:
+            md_text = _process_json_native_pages(
+                pages, pdf_path, file_tmp_dir, img_dir, use_ai, config, file_stem,
+            )
+            if not md_text.strip():
+                log.warning("  Markdown пуст после JSON-native конвейера")
+                return False
+            headings = _extract_headings_from_json(pages)
+            md_path = out_dir / f"{file_stem}.md"
+            safe_write(md_path, md_text)
+            log.info(f"Итоговый Markdown: {md_path} ({len(md_text)} символов)")
+            if use_reg:
+                if rag_config is None:
+                    log.error("--reg требует загруженного rag_config")
+                    return False
+                rag_config = run_registration(
+                    input_path_obj, md_text, rag_config_path, rag_config, config,
+                )
+                if rag_config is None:
+                    return False
+            if use_rag:
+                _write_rag_jsonl(md_text, headings, rag_config, input_path, out_dir, file_stem)
+            return True
 
         # Этап 3: Парсинг JSON → Markdown
         md_text, pictures, page_boundaries = parse_yandex_json_to_md(pages=pages)
@@ -6650,6 +6728,7 @@ def main() -> None:
         rag_config=rag_config,
         use_reg=args.reg,
         rag_config_path=args.rag_config,
+        use_json_native=args.json_native,
     )
 
     log.info(f"{'=' * 60}")
