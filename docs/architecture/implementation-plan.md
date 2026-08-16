@@ -1,664 +1,618 @@
-# Implementation Plan: pipeline.py
+# Implementation Plan: JSON-Native Pipeline Migration
 
-Порядок реализации модулей файла `firmware/src/pipeline.py` от фундамента к интеграции.
-
-## Принцип
-
-Каждый юнит реализуется как атомарный блок с тестированием в `tests/`. Юниты 1–4 могут разрабатываться параллельно (независимые утилиты). Юниты 5–6 зависят от 1. Юниты 7–11 — последовательная цепочка.
-
----
-
-## Unit 0: Структура файла и импорты
-
-**Цель:** Создать каркас файла с импортами, константами, docstring.
-
-**Строки:** ~20
-
-**Содержание:**
-- Shebang `#!/usr/bin/env python3`
-- Docstring модуля
-- Все импорты: `argparse, json, logging, os, re, shutil, sys, time, io, base64` + `pathlib.Path` + `httpx, yaml, fitz` + `dotenv` (условный импорт)
-- Константы: `YANDEX_OCR_URL`, `YANDEX_POLL_URL`, `PROVOD_BASE_URL`, `AI_MAX_CHARS=24000`
-
-**Зависимости:** Нет
-
-**Приёмка:**
-- `python3 -c "import sys; sys.path.insert(0, 'firmware/src'); import pipeline"` проходит без ошибок
+**Task:** `t_f82ca6a2` — Design architecture for JSON-native pipeline (no `raw.md`)  
+**Output:** `docs/architecture/json-native-pipeline.md` (completed) + this plan  
+**Branch:** `refactor/json-pipeline` (only `firmware/src/pipeline.py` changes)  
+**Method:** Incremental phases, working pipeline at each step
 
 ---
 
-## Unit 1: Утилиты
+## Phase Overview
 
-**Цель:** Реализовать служебные функции, не зависящие от Yandex/постобработки.
-
-**Строки:** ~80
-
-**Функции:**
-1. `setup_logging(log_path)` — скопировать из Create_Markdown_mineru.py:97-111
-2. `load_env(env_path)` — скопировать из Create_Markdown_mineru.py:114-125
-3. `load_config(config_path)` — скопировать из Create_Markdown_mineru.py:128-136, адаптировать default под Yandex
-4. `ensure_dir(path)` — скопировать из Create_Markdown_mineru.py:139-142
-5. `find_input_files(input_path)` — скопировать, убрать pptx/xlsx
-6. `safe_write(path, content)` — скопировать из Create_Markdown_mineru.py:162-165
-
-**Зависимости:** Нет
-
-**Приёмка:**
-- `load_env()` читает .env, возвращает dict
-- `find_input_files("file.pdf")` → `[Path("file.pdf")]`
-- `find_input_files("dir/")` → все .pdf/.docx/.doc
+| Phase | Focus | New Functions | Modified Functions | Validation |
+|-------|-------|---------------|-------------------|------------|
+| 1 | Structured Model + Stage 1 Parser | `parse_yandex_json_to_model`, dataclasses | — | Unit tests T1-T5 from table-id-marker-contract |
+| 2 | Table Stitching + PDF Extraction | `stitch_tables`, `extract_table_images_from_model`, `extract_pictures_from_model` | — | Table 4.1 (4 parts), Б.1 (3 parts), no false grouping |
+| 3 | Single-Pass Render | `render_document_to_md` | — | Diff vs current `final.md` on 3 corpus docs |
+| 4 | Remove ID Marker Mechanics | — | Delete `_inject_table_ids`, remove marker emission, update `run_script_postprocess` | No `<!-- t_p -->` in output; all tests pass |
+| 5 | Simplify AI Stage | `ai_postprocess_json_native` | `process_file` (new code path) | AI corrects tables without markers |
+| 6 | Cleanup & Integration | — | `process_file` flag `--json-native`, remove `raw.md` writes | Full regression: 312 tests pass |
 
 ---
 
-## Unit 2: Yandex OCR API
+## Phase 1: Structured Document Model + Stage 1 Parser
 
-**Цель:** Отправка PDF в Yandex Vision OCR, получение результата.
+### 1.1 Add Dataclasses (top of pipeline.py, after imports)
 
-**Строки:** ~120
-
-**Функции:**
-1. `convert_docx_to_pdf(input_path, tmp_dir)` — вызов LibreOffice headless
-2. `send_to_yandex_ocr(pdf_path, api_key, folder_id, model, timeout)` — async отправка + опрос
-3. `_poll_yandex_operation(operation_id, api_key, folder_id, timeout, poll_interval)` — GET-цикл опроса
-
-**Алгоритм `send_to_yandex_ocr()`:**
-```
-1. Прочитать PDF → base64
-2. POST /ocr/v1/recognizeTextAsync:
-   body = {mimeType: "application/pdf", languageCodes: ["ru","en"],
-           model: "math-markdown", content: base64_pdf}
-3. Извлечь operationId из ответа
-4. Вызвать _poll_yandex_operation()
-5. Сохранить результат как tmp/<file>/yandex_result.json
-6. Вернуть pages (list[dict])
-```
-
-**Обработка ошибок:**
-- HTTP 429: ретрай через 5с (rate limit)
-- HTTP 4xx/5xx: 3 ретрая с exponential backoff (1с, 4с, 16с)
-- Таймаут операции: `log.error`, raise `TimeoutError`
-
-**Зависимости:** Unit 0 (импорты), Unit 1 (ensure_dir)
-
-**Приёмка:**
-- Вызов с тестовым PDF возвращает list[dict] длиной = количеству страниц
-- Каждый элемент имеет `result.textAnnotation`
-- Промежуточный JSON сохраняется в tmp/
-
----
-
-## Unit 3: JSON → Markdown Parser
-
-**Цель:** Разбор Yandex JSON в Markdown-текст + список изображений.
-
-**Строки:** ~200
-
-**Функции:**
-1. `parse_yandex_json_to_md(json_path, pages=None)` — главная (читает JSON или принимает pages)
-2. `_extract_markdown_field(pages)` — извлечь поле `markdown`
-3. `_parse_tables_from_json(pages)` — структурированные таблицы → MD
-4. `_parse_pictures_from_json(pages)` — bounding box'ы картинок
-5. `_parse_blocks_to_text(pages)` — FALLBACK: блоки (layoutType) → текст
-
-**Алгоритм `parse_yandex_json_to_md()`:**
-```
-1. Загрузить JSON (если pages не передан)
-2. _extract_markdown_field() → md_text
-3. Если markdown пуст — _parse_blocks_to_text() как fallback
-4. _parse_tables_from_json() → таблицы (вставить в md_text ИЛИ добавить)
-5. _parse_pictures_from_json() → pictures_list
-6. Вернуть (md_text, pictures_list)
-```
-
-**Алгоритм `_parse_tables_from_json()`:**
-```
-Для каждой страницы:
-  Для каждой таблицы в textAnnotation.tables:
-    Извлечь cells (rowIndex, columnIndex, text, columnSpan)
-    Построить матрицу ячеек (аналогично _parse_table_html)
-    Конвертировать в Markdown (_matrix_to_markdown)
-    Добавить перед таблицей её координаты (page, y_start)
-```
-
-**Алгоритм `_parse_blocks_to_text()` (fallback):**
-```
-Для каждой страницы:
-  Сортировать блоки по y, затем по x
-  Для каждого блока:
-    layoutType TEXT/UNSPECIFIED → параграф (join lines через пробел)
-    layoutType LIST → маркированный список (префикс "- ")
-    Разделять блоки двойным переносом строки
-    Если y-разрыв между блоками > порога → дополнительный \n (новый параграф)
-```
-
-**Важно:** Поле `markdown` из `math-markdown` модели уже содержит Markdown с заголовками, списками, формулами и таблицами. Если оно есть — `_parse_blocks_to_text()` не вызывается.
-
-**Зависимости:** Unit 0
-
-**Приёмка:**
-- Тестовый JSON (7 стр) → валидный Markdown
-- Формулы `$...$` сохранены как есть
-- Таблицы из поля `tables` сконвертированы в MD
-- `pictures_list` содержит bounding box'ы
-
----
-
-## Unit 3b: Heading Extractor
-
-**Цель:** Извлечь заголовки разделов из Yandex JSON и заменить `**жирные**` заголовки в MD на правильные `##`/`###`/`####`.
-
-**Строки:** ~60
-
-**Функции:**
-1. `_extract_headings_from_json(pages)` — извлечение заголовков по 5 правилам
-2. `_apply_headings_to_md(md_text, headings)` — замена `**text**` на `#{level+1} text` в MD
-
-**Алгоритм `_extract_headings_from_json()`:**
-```
-1. Построить per-page индекс Y-координат всех блоков (для правила 4).
-2. Для каждой страницы, для каждого блока:
-   a. Извлечь text, y_top, x_left, width
-   b. Вычислить rel_x = x_left / width
-   c. Правило 1: text.match(r'^\d+\.(\d+\.)*\s')
-   d. Правило 2: len(text) < 100 AND len(text.split()) < 10
-   e. Правило 3: rel_x < 0.50
-   f. Правило 4: count_blocks_at_y(page, y_top, tolerance=15) == 1
-   g. Правило 5: level = text.match(r'^(\d+(?:\.\d+)*)\.')[1].count('.')
-3. Вернуть список {page, y, level, number, text, full_text}
-```
-
-**Коррекция regex:** `^\d+\.(\d+\.)*\s` (не `^\d+(\.\d+)*\s`) — номер всегда заканчивается точкой перед пробелом: «3. ЗАЩИТА», «3.2.1. Молниеприемники».
-
-**Алгоритм `_apply_headings_to_md()`:**
-```
-Для каждого heading в headings:
-  1. Построить паттерн: r'\*\*' + re.escape(full_text) + r'\*\*'
-  2. Заменить на: '#' * (level + 1) + ' ' + full_text
-  3. Использовать re.sub(count=1) — заменять только первое вхождение
-     (дубликаты в оглавлении останутся **жирными**, что корректно)
-Edge cases:
-  - headings пуст → вернуть md_text без изменений
-  - full_text содержит спецсимволы → re.escape()
-  - Заголовок уже `# ...` → не заменять (проверка: строка начинается с **)
-```
-
-**Интеграция в `process_file()`:**
 ```python
-# После Этапа 3 (parse_yandex_json_to_md), перед Этапом 5 (run_script_postprocess)
-headings = _extract_headings_from_json(pages)
-if headings:
-    md_text = _apply_headings_to_md(md_text, headings)
-    log.info(f"  Заголовков заменено: {len(headings)}")
-else:
-    log.info("  Заголовки не найдены — MD без изменений")
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class BBox:
+    x0: float; y0: float; x1: float; y1: float
+
+@dataclass
+class Cell:
+    row: int; col: int; rowspan: int; colspan: int; text: str
+
+@dataclass
+class Block:
+    y: float
+    layout_type: str
+    text: str
+    bbox: BBox
+    heading_level: Optional[int] = None
+    heading_number: Optional[str] = None
+    is_table_caption: bool = False
+    is_continuation_caption: bool = False
+
+@dataclass
+class Table:
+    page: int
+    table_index: int
+    bbox: BBox
+    cells: list[Cell]
+    caption: Optional[str] = None
+    table_num: Optional[str] = None
+    is_continuation: bool = False
+    component_images: Optional[list[str]] = None
+    image_path: Optional[str] = None
+    md_lines: Optional[tuple[int, int]] = None
+
+@dataclass
+class Picture:
+    page: int
+    bbox: BBox
+    score: float
+    image_path: Optional[str] = None
+
+@dataclass
+class Heading:
+    page: int
+    level: int
+    number: str
+    text: str
+    full_text: str
+    y: float
+
+@dataclass
+class Page:
+    index: int
+    width: float
+    height: float
+    blocks: list[Block]
+    table_indices: list[int] = field(default_factory=list)
+    picture_indices: list[int] = field(default_factory=list)
+
+@dataclass
+class Document:
+    pages: list[Page]
+    headings: list[Heading]
+    tables: list[Table]
+    pictures: list[Picture]
+    metadata: dict = field(default_factory=dict)
 ```
 
-**Зависимости:** Unit 0 (re, collections.defaultdict), Unit 3 (формат pages из parse_yandex_json_to_md)
+### 1.2 Implement `parse_yandex_json_to_model(pages) -> Document`
 
-**Приёмка:**
-- Тестовый JSON (29 стр, СО153-34.21.122-2003) → 68 заголовков извлечено
-- `**3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ**` → `## 3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ`
-- `**3.2.1. Молниеприемники**` → `#### 3.2.1. Молниеприемники`
-- `**200 кА**` (табличное значение) → НЕ заменяется (нет в headings)
-- `**1. ВВЕДЕНИЕ**` → `## 1. ВВЕДЕНИЕ` (rel_x=0.455 < 0.50)
-- Заголовки в оглавлении (дубликаты) → НЕ заменяются (count=1)
-- JSON без blocks[] → `_extract_headings_from_json()` → `[]`, MD без изменений
+**Algorithm:**
+1. Iterate pages → extract `ta = page["result"]["textAnnotation"]`
+2. **Headings from blocks[]:**
+   - Filter `layout_type == "LAYOUT_TYPE_SECTION_HEADER"`
+   - Number pattern: `^\d+(\.\d+)*\.?\s` (includes "1. ", "3.2.1. ")
+   - Length < 100, words < 10
+   - rel_x = x_left / page_width < 0.50
+   - Y-isolation: no other block at same Y (±15px)
+   - Level = number.count(".") + 1 (1→##, 2→###, 3→####, 4→#####)
+   - Handle split headings: number on line N, title on line N+1 (same x, adjacent Y)
+3. **Tables from ta["tables"][]:**
+   - Convert cells via existing `_build_cell_matrix` + `_merge_table_headers`
+   - Find caption: reuse `_find_table_caption_block` + `_caption_block_to_text`
+   - Extract `table_num` via `_extract_table_num_from_text`
+   - Detect continuation: `_is_continuation_caption(caption)`
+   - Store `table_index` = position in `ta["tables"]` array
+4. **Pictures from ta["pictures"][]:** bbox + score
+5. **Filter blocks:** exclude blocks inside any table bbox (reuse `_block_in_table`)
+6. Build `Page` objects with cross-references (indices into document.tables/pictures)
+7. Return `Document`
 
----
+**Unit Tests (from table-id-marker-contract.md §10.2):**
+- T1: Page boundary regression — Table 2 on page 2 gets `table_index=1` not `0`
+- T2: ID correspondence — same `pages` through parse + extract_table_images → matching IDs
+- T3: No caption → marker before table rows
+- T4: Array order ≠ Y-order → indices follow array order
+- T5: End-to-end ID match with extract_table_images (mock fitz)
 
-## Unit 4: Image Extractor
+### 1.3 Validation Script
 
-**Цель:** Вырезать изображения из PDF по координатам из Yandex `pictures`.
-
-**Строки:** ~80
-
-**Функции:**
-1. `extract_images_from_pdf(pdf_path, pictures, output_img_dir)` — главная
-2. `_match_images_to_pictures(doc, pictures, page_dims)` — сопоставление
-3. `_crop_and_save_image(page, bbox, output_path, scale_x, scale_y)` — вырезание
-
-**Алгоритм `extract_images_from_pdf()`:**
+```bash
+# Compare headings/tables between old parse and new model
+python3 -c "
+from pipeline import parse_yandex_json_to_md, parse_yandex_json_to_model
+pages = load_test_pages()
+md_old, _, _ = parse_yandex_json_to_md(pages=pages)
+doc_new = parse_yandex_json_to_model(pages)
+print(f'Old headings: {count_headings(md_old)}')
+print(f'New headings: {len(doc_new.headings)}')
+print(f'Old tables: {count_tables(md_old)}')
+print(f'New tables: {len(doc_new.tables)}')
+"
 ```
-1. Открыть PDF через fitz.open(pdf_path)
-2. Для каждой страницы вычислить scale_x, scale_y
-3. _match_images_to_pictures() — для каждого picture найти ближайшее изображение в PDF
-4. Для каждого сопоставленного:
-   - _crop_and_save_image() — вырезать область с высоким DPI (matrix=fitz.Matrix(3,3))
-   - Сохранить как image/fig_N.png
-5. Вернуть список {"fig_num": N, "page": P, "filename": "fig_N.png", "bbox": {...}}
-```
-
-**Алгоритм `_match_images_to_pictures()`:**
-```
-Для каждого picture в pictures:
-  Для каждого встроенного изображения на соответствующей странице:
-    Получить bbox изображения через page.get_image_bbox()
-    Вычислить IoU (Intersection over Union)
-    Если IoU > 0.5 → считать соответствием
-  Если соответствие не найдено → пометить как неразрешённое
-```
-
-**Зависимости:** Unit 0, Unit 3 (формат pictures)
-
-**Приёмка:**
-- Тестовый PDF → изображения вырезаны в image/
-- Имена: fig_1.png, fig_2.jpg, ...
-- Размеры соответствуют координатам
 
 ---
 
-## Unit 5: Postprocessing — LaTeX
+## Phase 2: Table Stitching + PDF Extraction
 
-**Цель:** Очистка LaTeX-формул (скопировать из Create_Markdown_mineru.py).
+### 2.1 Implement `stitch_tables(document: Document) -> None`
 
-**Строки:** ~80
-
-**Функции (копируются как есть):**
-1. `_clean_spaces_in_numbers(text)` — из Create_Markdown_mineru.py:855-859
-2. `_simplify_math_commands(text)` — из Create_Markdown_mineru.py:862-875
-3. `_fix_latex_ocr_artifacts(text)` — из Create_Markdown_mineru.py:942-948
-4. `_clean_extra_braces(text)` — из Create_Markdown_mineru.py:878-939
-5. `cleanup_latex(md_text)` — из Create_Markdown_mineru.py:961-970
-
-**ВАЖНО:** `wrap_equations()` **не копировать** — в Yandex формулы уже в `$...$`.
-
-**Зависимости:** Unit 0 (re)
-
-**Приёмка:**
-- `_clean_spaces_in_numbers("0 , 4 2 9")` → `"0,429"`
-- `_simplify_math_commands("\\mathsf{X}")` → `"X"`
-- `cleanup_latex()` на тестовом Markdown — формулы очищены
-
----
-
-## Unit 6: Postprocessing — Tables
-
-**Цель:** Конвертация HTML-таблиц и объединение смежных таблиц.
-
-**Строки:** ~180
-
-**Функции (скопировать из Create_Markdown_mineru.py):**
-1. `_parse_table_html(html)` — стр. 521-571
-2. `_matrix_to_markdown(matrix)` — стр. 574-598
-3. `_merge_header_rows(matrix)` — стр. 601-627
-4. `_clean_table_html(html)` — стр. 630-664
-5. `convert_html_tables(md_text)` — стр. 667-693
-6. `_find_table_boundaries(lines)` — стр. 697-711
-7. `_table_header(table_lines)` — стр. 714-716
-8. `_is_continuation(text)` — стр. 719-722
-9. `_extract_table_number(text)` — стр. 815-818
-10. `_same_table_caption(lines, t1_start, t2_start)` — стр. 821-848
-11. `merge_tables(md_text)` — стр. 725-812
-
-**Адаптация:** Никакой — функции копируются дословно (работают с чистым Markdown).
-
-**Зависимости:** Unit 0 (re, BeautifulSoup)
-
-**Приёмка:**
-- HTML-таблица → Markdown-таблица
-- Две таблицы с «Продолжение» → объединены
-- Примечание из colspan строки → `> Примечание`
-
----
-
-## Unit 7: Postprocessing — Images & Captions
-
-**Цель:** Переименование изображений, форматирование подписей.
-
-**Строки:** ~60
-
-**Функции (скопировать из Create_Markdown_mineru.py):**
-1. `rename_images(md_text, img_dir)` — стр. 1010-1043
-2. `fix_image_captions(md_text)` — стр. 1046-1063
-3. `fix_table_fig_labels(md_text)` — стр. 1066-1080
-
-**Адаптация:** Путь `image/` вместо `images/`. В `rename_images()` заменить `images/` на `image/`.
-
-**Зависимости:** Unit 0 (re, shutil, Path)
-
-**Приёмка:**
-- `fig_1.png` в image/ → `![Рисунок 1](image/fig_1.png)` в Markdown
-- Строка «Рис. 1 Схема» после изображения → `*Рис. 1 Схема*`
-- `# Таблица 3.4` → `Таблица 3.4` (без #)
-
----
-
-## Unit 8: Postprocessing — Notes & OCR Fixes
-
-**Цель:** Примечания → цитаты, склейка разбитых слов.
-
-**Строки:** ~60
-
-**Функции (скопировать из Create_Markdown_mineru.py):**
-1. `fix_notes(md_text)` — стр. 1083-1114
-2. `fix_ocr_artifacts(md_text)` — стр. 1117-1140
-
-**Зависимости:** Unit 0 (re)
-
-**Приёмка:**
-- «Примечание — ...» → `> Примечание — ...`
-- «п р и м е ч а н и е» → `> п р и м е ч а н и е`
-- «раз-\\nбитое» → «разбитое»
-
----
-
-## Unit 9: Full Script Postprocess
-
-**Цель:** Собрать все функции постобработки в один пайплайн.
-
-**Строки:** ~30
-
-**Функция:**
+**Algorithm (deterministic, no markers):**
 ```python
-def run_script_postprocess(md_text: str, img_dir: str | Path) -> str:
-```
-Копируется из Create_Markdown_mineru.py:1147-1178, НО:
-- **Убрать** вызов `wrap_equations()` (стр. 1157)
-- Сохранить порядок: HTML-таблицы → merge → LaTeX → изображения → подписи → примечания → OCR
+def stitch_tables(doc: Document) -> None:
+    """
+    Single-pass stitching using explicit continuation captions as
+    the authoritative signal. Geometry used ONLY for caption-less tables.
+    """
+    # Order tables by page, then table_index
+    ordered_tables = sorted(doc.tables, key=lambda t: (t.page, t.table_index))
 
-**Зависимости:** Units 5, 6, 7, 8
+    current_head: Optional[Table] = None
+    current_num: Optional[str] = None  # table_num of head (authoritative)
 
-**Приёмка:**
-- Интеграционный тест: сырой Markdown → обработанный Markdown
+    for table in ordered_tables:
+        has_caption = bool(table.caption)
+        is_cont = table.is_continuation
 
----
+        if has_caption and not is_cont:
+            # NEW TABLE with its own caption → starts a new group
+            current_head = table
+            current_num = table.table_num
 
-## Unit 10: AI Postprocess
+        elif is_cont and current_num is not None and table.table_num == current_num:
+            # EXPLICIT CONTINUATION: caption contains
+            # "Продолжение/Окончание таблицы N" with MATCHING number.
+            # This is the AUTHORITATIVE signal — geometry is NOT used.
+            # The continuation belongs to current_head's group.
+            table.caption = current_head.caption  # propagate caption
+            if current_head.component_images is None:
+                current_head.component_images = []
+            # No explicit group storage needed; we propagate caption
+            # and will regroup in populate_component_images()
 
-**Цель:** AI-постобработка через Provod API (опционально, флаг `--ai`).
+        elif (not has_caption) and current_head is not None \
+             and geometry_says_same_table(doc.pages[current_head.page],
+                                          current_head, table):
+            # CAPTION-LESS table: only structural/geometric evidence.
+            # Conservative: column count match + horizontal overlap
+            # + vertical adjacency. On uncertainty → new group + warn.
+            table.caption = current_head.caption
 
-**Строки:** ~100
-
-**Функции (скопировать из Create_Markdown_mineru.py):**
-1. `AI_CLEANUP_DEFAULT_PROMPT` — константа (стр. 1635-1655)
-2. `_chunk_text(text, max_chars)` — стр. 1658-1746
-3. `_call_ai_api(text, config, context)` — стр. 1749-1828
-4. `ai_postprocess(md_text, config, file_label)` — стр. 1831-1888
-
-**Адаптация:**
-- Чекпойнты в `tmp/.ai_checkpoints/` (как в оригинале)
-- `_call_ai_api()`: PROVOD_API_KEY из os.environ
-- Ретраи и fallback без изменений
-
-**Зависимости:** Unit 0, Unit 1 (config loading)
-
-**Приёмка:**
-- `_chunk_text()`: Markdown с таблицами разбит на чанки, таблицы не разорваны
-- `_call_ai_api()`: API отвечает → обработанный текст (нужен реальный ключ)
-- `ai_postprocess()`: чекпойнт создаётся/читается/удаляется
-
----
-
-## Unit 10b: Fix — Section-aware chunking + prompt table immobility
-
-**Цель:** Устранить дублирование таблиц в конце документа при AI-постобработке больших файлов.
-
-**Спецификация:** [ADR-007](decision-records/adr-007-section-aware-chunking.md)
-
-**Строки:** ~50 новых, ~30 изменённых
-
-### 10b.1 `_chunk_text()` — section-aware chunking
-
-**Алгоритм (двухфазный):**
-
-```
-ФАЗА 1: Партиционирование на логические секции
-
-SECTION_BOUNDARY_RE = r'^(?:#{1,4}\s+\d+(?:\.\d+)*\s|\*\*\d+(?:\.\d+)*\s+[^*]+?\*\*)'
-
-1. Разбить текст на строки
-2. Найти индексы строк, совпадающих с SECTION_BOUNDARY_RE
-3. Если границ не найдено → fallback на старую логику
-4. Сформировать секции:
-   - preamble = строки 0..first_boundary
-   - sections[i] = строки boundary[i]..boundary[i+1]
-5. Каждая секция — строка (join lines через "\n")
-
-ФАЗА 2: Сборка чанков из целых секций
-
-chunks = []
-current = ""
-for section in sections:
-    if не умещается в current:
-        if section сама > max_chars:
-            flush current в chunks
-            sub = _split_oversized_section(section, max_chars)
-            добавить sub в chunks
         else:
-            chunks.append(current)
-            current = section
-    else:
-        добавить section к current
-flush current в chunks
+            # Unrelated table → new group
+            current_head = table
+            current_num = table.table_num  # may be None
+
+
+def geometry_says_same_table(page, prev, curr) -> bool:
+    # Conservative check for caption-less tables:
+    # 1. prev.column_count == curr.column_count
+    # 2. horizontal overlap: bbox.x ranges intersect ≥ 50%
+    # 3. curr.page == prev.page + 1 (adjacent pages only)
+    # 4. prev.bbox.bottom / page.height ≥ 0.75 (looser threshold)
+    # All 4 must pass.
+    if curr.page != prev.page + 1:
+        return False
+
+    pc = count_columns(prev)
+    cc = count_columns(curr)
+    if pc != cc:
+        return False
+
+    # Horizontal overlap
+    overlap = min(prev.bbox.x1, curr.bbox.x1) - max(prev.bbox.x0, curr.bbox.x0)
+    if overlap <= 0:
+        return False
+    span = max(prev.bbox.x1 - prev.bbox.x0, curr.bbox.x1 - curr.bbox.x0)
+    if overlap / span < 0.5:
+        return False
+
+    # Vertical: prev must be near bottom
+    if prev.bbox.y1 < page.height * 0.75:
+        return False
+
+    return True
 ```
 
-**`_split_oversized_section()`** — текущая реализация `_chunk_text()` (потоковая разбивка по пустым строкам с сохранением таблиц и кодовых блоков).
+**Configurable threshold:** Read from `rag_config.yaml` → `table_stitching.bottom_threshold_ratio` (default 0.75 for caption-less; explicit continuations ignore geometry)
 
-**Сигнатура (не меняется):**
+### 2.1b Implement `populate_component_images(doc: Document) -> None`
+
+After stitching (caption propagation), group by head caption and populate `component_images`:
+
 ```python
-def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
-    """Разбить текст на части для AI по границам разделов.
-    Если разделов нет — fallback на разбивку по параграфам."""
+def populate_component_images(doc: Document) -> None:
+    # Group by caption (head's caption propagated to all members)
+    groups: dict[str, list[Table]] = {}
+    for t in doc.tables:
+        if t.caption:
+            groups.setdefault(t.caption, []).append(t)
+
+    for caption, group in groups.items():
+        if len(group) > 1:
+            paths = [t.image_path for t in group if t.image_path]
+            for t in group:
+                t.component_images = paths
 ```
 
-### 10b.2 `config_ai.yaml` — фикс промпта
+### 2.2 Implement `extract_table_images_from_model(pdf_path, document, img_dir)`
 
-**Удалить из `ai_postprocess.prompt` секции «ЧТО МОЖНО ДЕЛАТЬ»:**
+```python
+def extract_table_images_from_model(pdf_path, doc, img_dir):
+    import fitz
+    with fitz.open(str(pdf_path)) as pdf:
+        for table in doc.tables:
+            page = pdf[table.page]
+            ta = doc.pages[table.page]  # Page object has width/height
+            sx = page.rect.width / ta.width if ta.width > 0 else 1.0
+            sy = page.rect.height / ta.height if ta.height > 0 else 1.0
 
-- Пункт 13: «Объединить таблицы по следующим признакам...» — **УДАЛИТЬ**
-- Пункт 14: «Примечания и сноски под таблицами...» — **УДАЛИТЬ**
-- Пункт 15: «Форматирование подписей Таблица N» — **УДАЛИТЬ**
+            # Include caption area
+            caption_block = find_caption_block_for_table(doc, table)  # reuse logic
+            y0 = calculate_crop_top(caption_block, table.bbox.y0 * sy, sy)
 
-Удалить потому что: скриптовая постобработка (`merge_tables()`, `fix_notes()`, `fix_table_fig_labels()`) уже выполняет эти операции.
-
-**Добавить в секцию «ЧТО НЕЛЬЗЯ»:**
-
-```yaml
-    - НЕ перемещай таблицы. Каждая таблица должны остаться на своём исходном
-      месте в тексте. НЕ собирай таблицы в конце документа. НЕ меняй
-      порядок следования таблиц. Таблицы НЕЛЬЗЯ выносить из раздела,
-      к которому они относятся.
+            rect = fitz.Rect(
+                table.bbox.x0 * sx - 2,
+                y0,
+                table.bbox.x1 * sx + 2,
+                table.bbox.y1 * sy + 2,
+            )
+            pix = page.get_pixmap(clip=rect, dpi=200)
+            fname = f"table_{table.table_index + 1}.png"  # or global counter
+            pix.save(str(img_dir / fname))
+            table.image_path = fname
 ```
 
-### 10b.3 Тесты
+### 2.3 Implement `extract_pictures_from_model(pdf_path, document, img_dir)`
 
-**Обновить `test_chunk_overlap_table_bbox.py`:**
+Reuse existing `extract_images_from_pdf` logic, but write to `picture.image_path`.
 
-1. **test_section_aware_chunking:** Подать Markdown с bold-заголовками (`**1. Title**`, `**1.1. Sub**`) и `###` — проверить что каждый чанк начинается с границы раздела
-2. **test_no_boundaries_fallback:** Подать текст без заголовков — проверить что отрабатывает старая логика
-3. **test_oversized_section:** Подать секцию > max_chars — проверить что разбивается по параграфам, таблицы не разорваны
-4. **test_preamble:** Подать текст с преамбулой перед первым заголовком — преамбула в первом чанке
+### 2.4 Populate `component_images` After Extraction
 
-**Зависимости:** Unit 10 (существующий `_chunk_text`)
+```python
+def populate_component_images(doc: Document) -> None:
+    # Group by head table (same caption)
+    groups: dict[str, list[Table]] = {}
+    for t in doc.tables:
+        if t.caption and t.component_images is not None:
+            groups.setdefault(t.caption, []).append(t)
 
-**Приёмка:**
-- `_chunk_text()` на тестовом документе СО153-34.21.122-2003 (1465 строк) создаёт чанки, начинающиеся с границ разделов
-- Промпт `ai_postprocess` не содержит пп. 13-15, содержит запрет на перемещение таблиц
-- Повторный `ai_postprocess()` на тестовом документе не дублирует таблицы
-- Все существующие тесты проходят
-- Fallback-логика работает для текстов без разделов
+    for caption, group in groups.items():
+        if len(group) > 1:
+            paths = [t.image_path for t in group if t.image_path]
+            for t in group:
+                t.component_images = paths
+```
+
+### 2.5 Validation
+
+```bash
+# Test on СП 52 (Table 4.1 = 4 pages)
+python3 -c "
+from pipeline import parse_yandex_json_to_model, stitch_tables, extract_table_images_from_model
+doc = parse_yandex_json_to_model(pages)
+stitch_tables(doc)
+extract_table_images_from_model('SP52.pdf', doc, Path('image'))
+t41 = [t for t in doc.tables if t.table_num == '4.1']
+print(f'Table 4.1 parts: {len(t41)}')
+print(f'component_images: {t41[0].component_images}')
+"
+# Expected: 4 parts, component_images = [table_1.png, table_2.png, table_3.png, table_4.png]
+```
 
 ---
 
-## Unit 12: RAG JSONL Converter
+## Phase 3: Single-Pass Markdown Render
 
-**Цель:** Конвертировать структурированный Markdown (c `##`/`###`/`####`/`#####` заголовками) в JSONL для RAG-индексации.
+### 3.1 Implement `render_document_to_md(document: Document) -> str`
 
-**Строки:** ~150
+```python
+def render_document_to_md(doc: Document) -> str:
+    page_parts = []
+    line_counter = 0
 
-**Спецификация:** [ADR-009](decision-records/adr-009-md-to-rag-jsonl.md), [architecture.md §5.5b](../architecture.md#55b-rag-jsonl-converter)
+    for page in doc.pages:
+        page_lines = []
+        # Merge blocks + tables + pictures by Y
+        elements = []
 
-**Функции:**
+        for block in page.blocks:
+            elements.append((block.y, 'block', block))
+        for ti in page.table_indices:
+            table = doc.tables[ti]
+            elements.append((table.bbox.y0, 'table', table))
+        for pi in page.picture_indices:
+            pic = doc.pictures[pi]
+            elements.append((pic.bbox.y0, 'picture', pic))
 
-1. `load_rag_config(config_path)` — загрузить `rag_config.yaml`
-2. `_extract_heading_number(heading_text)` — извлечь номер `"3.2.1"` из текста заголовка; regex `^(\d+(?:\.\d+)*)\.\s`
-3. `_build_ancestors(headings, idx)` — построить `{chapter, section, clause}` для heading по ближайшим предкам меньшего уровня
-4. `parse_md_structure(md_text)` — разобрать MD на список clause; regex `^(#{2,5})\s+(.+)$`; вернуть `[{level, number, heading_text, line_num, next_line_num}]`
-5. `extract_clause_text(md_text, heading_line, next_heading_line)` — извлечь текст между заголовками; строки `[heading_line+1 : next_heading_line]`
-6. `extract_references(text, patterns)` — regexp-извлечение кросс-ссылок с дедупликацией
-7. `_get_page_for_heading(number, json_headings)` — индекс `{number: page}` из `_extract_headings_from_json()` результата
-8. `_split_oversized_clause(text, max_chars)` — разбить по параграфам, не разрывая таблицы/код-блоки
-9. `build_rag_jsonl(md_text, json_headings, rag_config, doc_key)` — собрать JSONL
+        elements.sort(key=lambda x: x[0])
 
-**Алгоритм `build_rag_jsonl()`:**
+        for y, etype, elem in elements:
+            if etype == 'block':
+                if elem.heading_level:
+                    page_lines.append('#' * (elem.heading_level + 1) + ' ' + elem.full_text)
+                elif elem.layout_type == 'LAYOUT_TYPE_LIST':
+                    page_lines.append('- ' + elem.text)
+                else:
+                    page_lines.append(elem.text)
+
+            elif etype == 'table':
+                table = elem
+                md_table = table_cells_to_md(table.cells)
+                if table.caption:
+                    page_lines.append(f'*{table.caption}*')
+                start_line = len(page_lines)
+                page_lines.append(md_table)
+                end_line = len(page_lines)
+                table.md_lines = (line_counter + start_line, line_counter + end_line)
+
+            elif etype == 'picture':
+                pic = elem
+                caption = f"Рис. {pic.page + 1}"  # or extract from nearby blocks
+                page_lines.append(f'![{caption}](image/{pic.image_path})')
+
+        page_text = '\n\n'.join(page_lines).strip()
+        if page_text:
+            page_parts.append(page_text)
+            line_counter += page_text.count('\n') + 1
+
+    return '\n\n'.join(page_parts)
 ```
-1. doc_meta = rag_config['documents'][doc_key]
-2. max_chars = defaults.get('max_chunk_chars', 1500)
-3. patterns = rag_config['references']['patterns'] (если extract_references)
-4. ignore = doc_meta.get('ignore_sections', [])
-5. headings = parse_md_structure(md_text)
-6. Для каждого heading:
-   a. Пропустить если в ignore_sections (с подразделами: skip_until_level)
-   b. text = extract_clause_text(); пропустить если пустой
-   c. ancestors = _build_ancestors(headings, i)
-   d. page = _get_page_for_heading(number, json_headings)
-   e. refs = extract_references(text, patterns)
-   f. Подчанки = _split_oversized_clause(text, max_chars)
-      Для каждого: JSON record с суффиксом «(ч. N)» в clause
-7. Вернуть "\n".join(json_lines) + "\n"
+
+### 3.2 Helper: `table_cells_to_md(cells) -> str`
+
+Reuse existing `_matrix_to_md_table` logic.
+
+### 3.3 Validation
+
+```bash
+# Diff against current pipeline output
+python3 pipeline.py -i "SP52.pdf" --json-native  # new
+python3 pipeline.py -i "SP52.pdf"                # old
+diff Markdown/SP52/SP52.md Markdown/SP52/SP52.md.old
+# Should show only formatting differences, no structural changes
 ```
-
-**Зависимости:** Unit 0 (json, re, yaml, log), Unit 3b (`_extract_headings_from_json`)
-
-**Приёмка:**
-- `parse_md_structure()` на тестовом MD (СО153-34, 1465 строк) → ~50-80 heading
-- `_build_ancestors()` для `#### 3.2.1.` → `{chapter: "3", section: "3.2", clause: "3.2.1"}`
-- `extract_references("см. п. 3.2.1, табл. 3.1")` → `["п. 3.2.1", "табл. 3.1"]`
-- `_split_oversized_clause(2500 chars)` → 2 чанка, таблицы не разорваны
-- `_get_page_for_heading("3.2.1", json_headings)` → 7
-- `build_rag_jsonl()` → валидный JSONL, каждая строка `json.loads()`
-- `ignore_sections: ["Содержание"]` → heading + подразделы пропущены
-- Oversized clause → подчанки с «(ч. 1)», «(ч. 2)»
-- `source.page = null` когда `json_headings` пуст
-
-
-## Unit 11 (updated): CLI & Main — RAG Integration
 
 ---
 
+## Phase 4: Remove ID Marker Mechanics
 
-## Unit 11: CLI & Main — Интеграция
+### 4.1 Delete `_inject_table_ids()` Entirely
 
-**Цель:** Собрать все юниты в рабочий пайплайн.
+Remove function (≈lines 2711-2802 in current pipeline.py).
 
-**Строки:** ~120
+### 4.2 Remove Marker Emission from Parse
 
-**Функции:**
-1. `parse_args(argv)` — argparse (адаптировать из Create_Markdown_mineru.py:1891-1925)
-   - `-i/--input` (required)
-   - `--ai` (flag)
-   - `--rag` (flag) — **новый: генерация JSONL**
-   - `--rag-config` (default: `./rag_config.yaml`) — **новый: путь к rag_config.yaml**
-   - `--config` (default: `./config_ai.yaml`)
-   - **Убрать** `--backend` (в Yandex один backend)
+In `parse_yandex_json_to_model`: **do not** emit `<!-- t_pN_M -->` markers.  
+Keep `table.table_index` as authoritative ID source.
 
-2. `process_file(input_path, use_ai, use_rag, config, rag_config, api_key, folder_id, output_base, tmp_base)` — обновлённый оркестратор
+### 4.3 Update `run_script_postprocess()`
 
-3. `main()` — обновлённая точка входа
-
-**Алгоритм `process_file()`:**
-```
-1. Определить file_stem из input_path
-2. Если DOCX/DOC → convert_docx_to_pdf() → pdf_path
-   Иначе pdf_path = input_path
-3. send_to_yandex_ocr(pdf_path, ...) → pages
-   Сохранить pages как tmp/<file>/yandex_result.json
-4. parse_yandex_json_to_md(json_path, pages) → (md_text, pictures, page_boundaries)
-   Сохранить md_text как tmp/<file>/raw.md
-4b. _extract_headings_from_json(pages) → headings
-    Если headings не пуст: _apply_headings_to_md(md_text, headings) → md_text
-5. Если есть pictures → extract_images_from_pdf(pdf_path, pictures, image_dir)
-   Вставить ссылки ![Рис. N](image/fig_N.ext) в md_text
-6. run_script_postprocess(md_text, image_dir) → md_text
-7. Если --ai → ai_postprocess(md_text, config, file_stem) → md_text
-8. safe_write(Markdown/<file>/<file>.md, md_text)
-9. Если --rag:                                                      ← НОВОЕ
-   a. doc_key = _find_doc_key(input_path, rag_config)
-   b. Если doc_key найден:
-      jsonl = build_rag_jsonl(md_text, headings, rag_config, doc_key)
-      safe_write(Markdown/<file>/rag_chunks.jsonl, jsonl)
-   c. Иначе: log.warning(f"Документ не найден в rag_config: {file_stem}")
-10. Переместить промежуточные файлы в tmp/<file>/
+**Signature change:**
+```python
+def run_script_postprocess(
+    md_text: str,
+    img_dir: str | Path,
+    table_images: list[dict] | None = None,  # keep for component_images
+    # REMOVE: page_boundaries parameter
+) -> str:
 ```
 
-**Алгоритм `main()`:**
-```
-1. parse_args()
-2. load_env() → YANDEX_API_KEY, YANDEX_FOLDER_ID, PROVOD_API_KEY
-3. load_config() → ai_config (если --ai)
-4. load_rag_config() → rag_config (если --rag)                        ← НОВОЕ
-5. setup_logging(tmp/Create_Markdown_VisionOCR.log)
-6. find_input_files() → список файлов
-7. Для каждого файла:
-     try: process_file()
-     except Exception: log.error(), failed++
-8. Вывести статистику: успешно N, ошибок M
-9. exit(1) если были ошибки
+**Body changes:**
+- Delete step 2b (call to `_inject_table_ids`)
+- Keep step 2c (`_merge_by_component_images`) — now uses `table.component_images` from model
+- Update docstring
+
+### 4.4 Update `_merge_by_component_images()`
+
+Currently reads `table_images[].component_images`. Change to read from `Document.tables` or pass `table_images` built from model.
+
+```python
+# In process_file, after extraction:
+table_images_for_stitch = [
+    {"id": f"t_p{t.page+1}_{t.table_index}", "component_images": t.component_images, "path": t.image_path}
+    for t in doc.tables if t.component_images
+]
+md_text = _merge_by_component_images(md_text, table_images_for_stitch)
 ```
 
-**Зависимости:** Все юниты 1–12
+### 4.5 Validation
 
-**Приёмка:**
-- `python3 pipeline.py -i test.pdf` → создаёт `Markdown/test/test.md` + `image/`
-- `python3 pipeline.py -i test.docx` → конвертирует, обрабатывает
-- `python3 pipeline.py -i dir/` → обрабатывает все файлы в папке
-- `python3 pipeline.py -i test.pdf --ai` → включает AI-постобработку
-- `python3 pipeline.py -i test.pdf --rag` → создаёт `Markdown/test/rag_chunks.jsonl`
-- `python3 pipeline.py -i test.pdf --ai --rag` → AI + RAG вместе
-- Лог пишется в `tmp/Create_Markdown_VisionOCR.log`
+```bash
+# No markers in output
+python3 pipeline.py -i "SP52.pdf" --json-native
+grep -c '<!-- t_p' Markdown/SP52/SP52.md
+# Expected: 0
+
+# Full regression
+cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py
+# Expected: 312 passed
+```
 
 ---
 
-## Порядок реализации
+## Phase 5: Simplify AI Stage
 
+### 5.1 New Function: `ai_postprocess_json_native()`
+
+```python
+def ai_postprocess_json_native(
+    md_text: str,
+    config: dict,
+    file_label: str,
+    vision_tables: list[dict],  # [{"caption", "table_num", "markdown"}, ...]
+) -> str:
+    """
+    AI postprocess without ID markers.
+    vision_tables: structured references from vision extraction.
+    """
+    # Build vision context by caption/table_num
+    vision_by_caption = {v['caption']: v['markdown'] for v in vision_tables if v.get('caption')}
+    vision_by_num = {v['table_num']: v['markdown'] for v in vision_tables if v.get('table_num')}
+
+    # Chunk text (reuse _chunk_text)
+    chunks = _chunk_text(md_text, AI_MAX_CHARS)
+
+    # For each chunk, find relevant vision tables
+    for i, chunk in enumerate(chunks):
+        # Match by caption mention in chunk
+        relevant = []
+        for caption, vmd in vision_by_caption.items():
+            if caption in chunk:
+                relevant.append(vmd)
+        for num, vmd in vision_by_num.items():
+            if f'Таблица {num}' in chunk or f'Table {num}' in chunk:
+                relevant.append(vmd)
+
+        if relevant:
+            prompt = build_prompt_with_vision(chunk, relevant)
+        else:
+            prompt = chunk
+
+        result = _call_ai_api(prompt, config, f"{file_label} [ч.{i+1}]")
+        chunks[i] = result or chunk
+
+    return '\n\n'.join(chunks)
 ```
-Фаза 1 (фундамент):  Unit 0 → Unit 1
-Фаза 2 (OCR):        Unit 2 → Unit 3 → Unit 3b → Unit 4
-                      (2 и 3+3b+4 можно параллельно)
-Фаза 3 (постобр):    Unit 5 → Unit 6 → Unit 7 → Unit 8 → Unit 9
-                      (5,6,7,8 могут параллельно после прототипа Unit 9)
-Фаза 4 (AI):         Unit 10 → Unit 10b
-Фаза 5 (сборка):     Unit 11
-Фаза 6 (RAG):        Unit 12
+
+### 5.2 Update `process_file()` for JSON-Native Path
+
+```python
+def process_file(...):
+    if use_json_native:
+        # New path
+        pages = send_to_yandex_ocr(...)
+        doc = parse_yandex_json_to_model(pages)
+        stitch_tables(doc)
+        extract_table_images_from_model(pdf_path, doc, img_dir)
+        extract_pictures_from_model(pdf_path, doc, img_dir)
+        md_text = render_document_to_md(doc)
+        md_text = run_script_postprocess(md_text, img_dir, table_images_from_model(doc))
+        if use_ai:
+            vision_tables = load_vision_tables(doc, tmp_dir)  # read table_N.md files
+            md_text = ai_postprocess_json_native(md_text, config, file_stem, vision_tables)
+        # --reg, --rag as before
+        return save_and_finish(md_text, doc, ...)
+    else:
+        # Old path (unchanged)
+        ...
 ```
 
-### Приоритеты
+### 5.3 Validation
 
-| Приоритет | Юнит | Причина |
-|-----------|------|---------|
-| P0 | Unit 2 | Ключевая интеграция с Yandex — без неё ничего не работает |
-| P0 | Unit 3 | Парсинг JSON — определяет качество выходного Markdown |
-| P1 | Unit 3b | Заголовки → RAG-индексация, структурная целостность |
-| P0 | Unit 11 | Интеграция — нужна для E2E-тестирования |
-| P1 | Unit 4 | Извлечение изображений — критично для ГОСТ-документов |
-| P1 | Unit 5,6 | LaTeX и таблицы — основные артефакты |
-| P2 | Unit 1 | Утилиты — нужны всем, но тривиальны |
-| P2 | Unit 7,8 | Подписи и примечания — улучшение читаемости |
-| P3 | Unit 10 | AI — опциональный флаг |
-| P1 | Unit 10b | Фикс дублирования таблиц — критический баг |
-| P2 | Unit 12 | RAG JSONL — новый функционал, зависит от Unit 3b |
+```bash
+# AI run on SP52 with --json-native --ai
+python3 pipeline.py -i "SP52.pdf" --json-native --ai
+# Verify: tables corrected, no marker warnings in log
+```
 
 ---
 
-## Оценка трудозатрат
+## Phase 6: Cleanup & Integration
 
-| Юнит | Строки | Сложность | Часов |
-|------|--------|-----------|-------|
-| 0 | 20 | низкая | 0.3 |
-| 1 | 80 | низкая (копирование) | 0.5 |
-| 2 | 120 | средняя (API, ретраи) | 2.0 |
-| 3 | 200 | высокая (парсинг, несколько источников) | 3.0 |
-| **3b** | 60 | средняя (алгоритм + regex) | 1.0 |
-| 4 | 80 | высокая (PyMuPDF, сопоставление) | 2.5 |
-| 5 | 80 | низкая (копирование) | 0.5 |
-| 6 | 180 | низкая (копирование) | 0.5 |
-| 7 | 60 | низкая (копирование + замена путей) | 0.5 |
-| 8 | 60 | низкая (копирование) | 0.3 |
-| 9 | 30 | низкая (сборка) | 0.3 |
-| 10 | 100 | низкая (копирование) | 0.5 |
-| **10b** | 80 | средняя (алгоритм + тесты) | 1.5 |
-| **12** | 150 | средняя (алгоритм, regex, JSONL) | 2.5 |
-| 11 | 120 | средняя (интеграция) | 2.0 |
-| **Всего** | **~1420** | | **~17.9 ч** |
+### 6.1 Add `--json-native` Flag
 
-> Оценка выше 800 строк из-за копирования вспомогательных функций таблиц (Unit 6 — 180 строк вспомогательных). Целевой размер основного кода (без вспомогательных) — ~800 строк.
+```python
+# In parse_args()
+parser.add_argument(
+    '--json-native',
+    action='store_true',
+    help='Использовать новую JSON-native архитектуру (без raw.md, без ID-маркеров)'
+)
+```
+
+### 6.2 Remove `raw.md` Writes
+
+In `process_file`: delete `safe_write(file_tmp_dir / "raw.md", md_text)` for JSON-native path.
+
+### 6.3 Remove Unused Parameters
+
+- `page_boundaries` from `run_script_postprocess` signature and calls
+- `page_boundaries` from `_stitch_continuation_tables` if no longer used (check)
+- `table_raw_index` logic from old parse (replaced by model)
+
+### 6.4 Update Tests
+
+- Delete tests for `_inject_table_ids` (table-id-marker-contract §10.1)
+- Update `test_table_id_markers.py` → test new model-based ID correspondence
+- Add integration test for `--json-native` flag
+
+### 6.5 Full Regression
+
+```bash
+cd firmware
+python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py
+# 312 passed
+
+# Test all 3 corpus documents
+for doc in "SP52.pdf" "SP89.pdf" "GOST18410.pdf"; do
+    python3 pipeline.py -i "$doc" --json-native --ai --rag
+    # Verify outputs
+done
+```
+
+---
+
+## File Changes Summary
+
+**Only `firmware/src/pipeline.py` modified:**
+
+| Region | Change |
+|--------|--------|
+| Lines 35-50 | Add dataclasses (Document, Page, Block, Table, Picture, Heading, BBox, Cell) |
+| After parse section | Add `parse_yandex_json_to_model()` |
+| After extract_table_images | Add `stitch_tables()`, `extract_table_images_from_model()`, `extract_pictures_from_model()`, `populate_component_images()` |
+| After postprocess section | Add `render_document_to_md()`, `table_cells_to_md()` |
+| AI section | Add `ai_postprocess_json_native()` |
+| `run_script_postprocess` | Remove `page_boundaries` param, delete `_inject_table_ids` call |
+| `_inject_table_ids` | **DELETE ENTIRELY** |
+| `process_file` | Add `use_json_native` branch |
+| `parse_args` | Add `--json-native` flag |
+| `main` | Pass flag to `process_file` |
+
+---
+
+## Rollback Plan
+
+If any phase breaks regression:
+
+1. `git stash` → revert to working pipeline
+2. Fix on branch → re-test
+3. Each phase committed separately for bisectability
+
+---
+
+## Timeline Estimate
+
+| Phase | Effort | Dependencies |
+|-------|--------|--------------|
+| 1 | 2-3 hours | None |
+| 2 | 2-3 hours | Phase 1 |
+| 3 | 1-2 hours | Phase 2 |
+| 4 | 1 hour | Phase 3 |
+| 5 | 1-2 hours | Phase 4 |
+| 6 | 1 hour | Phase 5 |
+| **Total** | **8-12 hours** | Sequential |
+
+---
+
+## Deliverables
+
+1. ✅ `docs/architecture/json-native-pipeline.md` (architecture document)
+2. This file → `workflows/t_f82ca6a2/implementation-plan.md`
+3. Branch `refactor/json-pipeline` with `firmware/src/pipeline.py` changes
+4. Updated `table-id-marker-contract.md` (mark superseded)
+5. Implementation report after coder completes
+
+---
+
+*End of Implementation Plan*
