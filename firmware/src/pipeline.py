@@ -3613,6 +3613,81 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
     return None
 
 
+def load_vision_tables_from_model(doc: Document, tmp_dir: str | Path) -> list[dict]:
+    """Загрузить vision-эталоны и связать их со структурными таблицами.
+
+    Имя PNG, записанное в ``Table.image_path``, является стабильным ключом
+    для OCR-результата ``table_N.md``. Отсутствующие картинки или результаты
+    Vision не считаются ошибкой: соответствующая таблица просто пропускается.
+    """
+    tmp_path = Path(tmp_dir)
+    result: list[dict] = []
+    for table in doc.tables:
+        if not table.image_path:
+            continue
+        crop_path = tmp_path / f"{Path(table.image_path).stem}.md"
+        if not crop_path.is_file():
+            continue
+        try:
+            markdown = crop_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning("Не удалось прочитать vision-таблицу %s: %s", crop_path, exc)
+            continue
+        result.append({
+            "caption": table.caption,
+            "table_num": table.table_num,
+            "markdown": markdown,
+        })
+    return result
+
+
+def ai_postprocess_json_native(
+    md_text: str,
+    config: dict,
+    file_label: str = "",
+    vision_tables: list[dict] | None = None,
+) -> str:
+    """AI-постобработка JSON-native Markdown без ID-маркеров.
+
+    Эталонные таблицы добавляются только в те чанки, где встречается их
+    подпись или номер. Это сохраняет старый API AI и не загрязняет unrelated
+    chunks большими Vision-ответами.
+    """
+    vision_tables = vision_tables or []
+    vision_by_caption = {
+        value["caption"]: value["markdown"]
+        for value in vision_tables
+        if value.get("caption") and value.get("markdown")
+    }
+    vision_by_num = {
+        str(value["table_num"]): value["markdown"]
+        for value in vision_tables
+        if value.get("table_num") and value.get("markdown")
+    }
+    chunks = _chunk_text(md_text, max_chars=AI_MAX_CHARS)
+    results: list[str] = []
+    for index, chunk in enumerate(chunks):
+        relevant: list[str] = []
+        for caption, markdown in vision_by_caption.items():
+            if caption in chunk and markdown not in relevant:
+                relevant.append(markdown)
+        for number, markdown in vision_by_num.items():
+            pattern = rf"(?:Таблица|Table)\s+{re.escape(number)}(?:\b|\.)"
+            if re.search(pattern, chunk, flags=re.IGNORECASE) and markdown not in relevant:
+                relevant.append(markdown)
+        prompt = chunk
+        if relevant:
+            prompt = (
+                "=== Markdown-файл ===\n"
+                f"{chunk}\n\n"
+                "=== Эталонные таблицы ===\n"
+                + "\n\n".join(relevant)
+            )
+        response = _call_ai_api(prompt, config, f"{file_label} [ч.{index + 1}]")
+        results.append(response if response is not None else chunk)
+    return "\n\n".join(results)
+
+
 def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
     """AI-постобработка Markdown через Provod с чекпойнтингом."""
     log.info(f"AI-постобработка ({file_label})")
