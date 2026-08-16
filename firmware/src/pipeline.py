@@ -373,35 +373,43 @@ def table_cells_to_md(cells: list[Cell]) -> str:
 
 def render_document_to_md(document: Document) -> str:
     """Render a fully populated structured document in one Markdown pass."""
-    rendered_pages = []
+    lines: list[str] = []
     for page in sorted(document.pages, key=lambda item: item.index):
+        page_lines: list[str] = []
+        page_ranges: list[tuple[Table, int, int]] = []
         elements = [(block.y, 0, block) for block in page.blocks]
         elements += [(document.tables[index].bbox.y0, 1, document.tables[index]) for index in page.table_indices]
         elements += [(document.pictures[index].bbox.y0, 2, document.pictures[index]) for index in page.picture_indices]
-        lines = []
         for _, _, element in sorted(elements, key=lambda item: (item[0], item[1])):
             if isinstance(element, Block):
                 if element.is_table_caption or element.is_continuation_caption or not element.text:
                     continue
                 if element.heading_level is not None:
-                    lines.append("#" * (element.heading_level + 1) + " " + element.text)
+                    page_lines.append("#" * (element.heading_level + 1) + " " + element.text)
                 elif element.layout_type == "LIST":
-                    lines.append("- " + element.text)
+                    page_lines.append("- " + element.text)
                 else:
-                    lines.append(element.text)
+                    page_lines.append(element.text)
             elif isinstance(element, Table):
-                start = len(lines)
+                start = len(page_lines)
                 if element.caption:
-                    lines.append("*" + element.caption + "*")
+                    page_lines.append("*" + element.caption + "*")
                 table_md = table_cells_to_md(element.cells)
                 if table_md:
-                    lines.extend(table_md.splitlines())
-                element.md_lines = (start, len(lines))
+                    page_lines.extend(table_md.splitlines())
+                page_ranges.append((element, start, len(page_lines)))
             elif element.image_path:
                 ordinal = document.pictures.index(element) + 1
-                lines.append(f"![Рис. {ordinal}](image/{Path(element.image_path).name})")
-        rendered_pages.append("\n".join(lines))
-    return "\n\n".join(page for page in rendered_pages if page)
+                page_lines.append(f"![Рис. {ordinal}](image/{Path(element.image_path).name})")
+        if not page_lines:
+            continue
+        if lines:
+            lines.append("")
+        page_offset = len(lines)
+        lines.extend(page_lines)
+        for element, start, end in page_ranges:
+            element.md_lines = (page_offset + start, page_offset + end)
+    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3232,10 +3240,66 @@ def _merge_by_component_images(md_text: str, table_images: list[dict] | None) ->
     return "\n".join(lines)
 
 
+def merge_tables_by_model(md_text: str, doc: Document) -> str:
+    """Merge structured table blocks using global ``Table.md_lines`` ranges."""
+    if not md_text or not doc:
+        return md_text
+    lines = md_text.split("\n")
+    groups: dict[int, list[Table]] = {}
+    for table in doc.tables:
+        table_range = table.md_lines
+        if table.stitch_group_id is not None and table_range is not None and table_range[1] > table_range[0]:
+            groups.setdefault(table.stitch_group_id, []).append(table)
+
+    def row(line: str) -> bool:
+        value = line.strip()
+        return value.startswith("|") and "|" in value[1:]
+
+    def separator(line: str) -> bool:
+        return row(line) and "---" in line
+
+    replacements: list[tuple[int, int, list[str]]] = []
+    for tables in groups.values():
+        if len(tables) < 2:
+            continue
+        tables.sort(key=lambda table: table.md_lines[0] if table.md_lines else 0)
+        first_range = tables[0].md_lines
+        if first_range is None:
+            continue
+        start, end = first_range
+        first = lines[start:end]
+        sep = next((idx for idx, line in enumerate(first) if separator(line)), None)
+        if sep is None:
+            continue
+        merged = first[:sep + 1] + first[sep + 1:]
+        seen = {line.strip() for line in first[sep + 1:] if row(line)}
+        for table in tables[1:]:
+            table_range = table.md_lines
+            if table_range is None:
+                continue
+            part = lines[table_range[0]:table_range[1]]
+            part_sep = next((idx for idx, line in enumerate(part) if separator(line)), None)
+            for line in part[part_sep + 1:] if part_sep is not None else part:
+                if row(line) and line.strip() in seen:
+                    continue
+                if row(line):
+                    seen.add(line.strip())
+                merged.append(line)
+        replacements.append((start, end, merged))
+        replacements.extend(
+            (table.md_lines[0], table.md_lines[1], [])
+            for table in tables[1:] if table.md_lines is not None
+        )
+    for start, end, replacement in sorted(replacements, reverse=True):
+        lines[start:end] = replacement
+    return "\n".join(lines)
+
+
 def run_script_postprocess(
     md_text: str,
     img_dir: str | Path,
     table_images: list[dict] | None = None,
+    doc: Document | None = None,
 ) -> str:
     """Выполнить всю скриптовую постобработку.
 
@@ -3270,7 +3334,10 @@ def run_script_postprocess(
     md_text = merge_tables(md_text)
     log.info("  2. Таблицы: объединение")
 
-    if table_images:
+    if doc is not None:
+        md_text = merge_tables_by_model(md_text, doc)
+        log.info("  2c. Таблицы: структурная склейка")
+    elif table_images:
         md_text = _merge_by_component_images(md_text, table_images)
         log.info("  2c. Таблицы: склейка по component_images")
 

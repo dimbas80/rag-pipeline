@@ -3,7 +3,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from pipeline import BBox, Block, Cell, Document, Page, Picture, Table, render_document_to_md, table_cells_to_md
+from pipeline import (
+    BBox, Block, Cell, Document, Page, Picture, Table,
+    merge_tables_by_model, render_document_to_md, table_cells_to_md,
+)
 
 
 def _doc(blocks=None, tables=None, pictures=None):
@@ -70,3 +73,37 @@ def test_table_cells_to_md_handles_empty_cells_and_rowspan():
     ])
     assert "| head |  |" in result
     assert "| head | tail |" in result
+
+
+def test_render_document_table_ranges_are_global_across_pages():
+    first = Table(0, 0, BBox(0, 100, 500, 150), [Cell(0, 0, 1, 1, "h"), Cell(1, 0, 1, 1, "a")], "Таблица 1")
+    second = Table(1, 0, BBox(0, 100, 500, 150), [Cell(0, 0, 1, 1, "h"), Cell(1, 0, 1, 1, "b")], "Таблица 1")
+    doc = Document([
+        Page(0, 1000, 1000, [], [0], []),
+        Page(1, 1000, 1000, [Block(50, "TEXT", "after", BBox(0, 50, 1, 60))], [1], []),
+    ], [], [first, second], [])
+    rendered = render_document_to_md(doc)
+    assert rendered.splitlines()[first.md_lines[0]] == "*Таблица 1*"
+    assert second.md_lines[0] > first.md_lines[1]
+
+
+def test_merge_tables_by_model_keeps_one_header_and_deduplicates_rows():
+    first = Table(0, 0, BBox(0, 100, 500, 150), [], "Таблица 4.1", md_lines=(0, 4), stitch_group_id=1)
+    second = Table(1, 0, BBox(0, 100, 500, 150), [], "Таблица 4.1", md_lines=(5, 9), stitch_group_id=1)
+    doc = Document([], [], [first, second], [])
+    md = (
+        "*Таблица 4.1*\n| H |\n| :---: |\n| I |\n\n"
+        "*Таблица 4.1*\n| H |\n| :---: |\n| I |\n"
+    )
+    out = merge_tables_by_model(md, doc)
+    assert out.count("*Таблица 4.1*") == 1
+    assert out.count("| H |") == 1
+    assert out.count("| I |") == 1
+
+
+def test_merge_tables_by_model_does_not_merge_different_groups():
+    one = Table(0, 0, BBox(0, 0, 1, 1), [], "A", md_lines=(0, 3), stitch_group_id=1)
+    two = Table(0, 1, BBox(0, 0, 1, 1), [], "B", md_lines=(4, 7), stitch_group_id=2)
+    doc = Document([], [], [one, two], [])
+    md = "*A*\n| a |\n| --- |\n| 1 |\n\n*B*\n| b |\n| --- |\n| 2 |\n"
+    assert merge_tables_by_model(md, doc) == md
