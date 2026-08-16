@@ -356,6 +356,54 @@ def populate_component_images(doc: Document) -> None:
                 table.component_images = list(paths)
 
 
+def table_cells_to_md(cells: list[Cell]) -> str:
+    """Convert structured table cells to a Markdown table."""
+    if not cells:
+        return ""
+    max_row = max(cell.row + cell.rowspan for cell in cells)
+    max_col = max(cell.col + cell.colspan for cell in cells)
+    matrix = [["" for _ in range(max_col)] for _ in range(max_row)]
+    for cell in sorted(cells, key=lambda item: (item.row, item.col)):
+        for row in range(cell.row, min(max_row, cell.row + cell.rowspan)):
+            for col in range(cell.col, min(max_col, cell.col + cell.colspan)):
+                if not matrix[row][col]:
+                    matrix[row][col] = cell.text
+    return _matrix_to_md_table(matrix)
+
+
+def render_document_to_md(document: Document) -> str:
+    """Render a fully populated structured document in one Markdown pass."""
+    rendered_pages = []
+    for page in sorted(document.pages, key=lambda item: item.index):
+        elements = [(block.y, 0, block) for block in page.blocks]
+        elements += [(document.tables[index].bbox.y0, 1, document.tables[index]) for index in page.table_indices]
+        elements += [(document.pictures[index].bbox.y0, 2, document.pictures[index]) for index in page.picture_indices]
+        lines = []
+        for _, _, element in sorted(elements, key=lambda item: (item[0], item[1])):
+            if isinstance(element, Block):
+                if element.is_table_caption or element.is_continuation_caption or not element.text:
+                    continue
+                if element.heading_level is not None:
+                    lines.append("#" * (element.heading_level + 1) + " " + element.text)
+                elif element.layout_type == "LIST":
+                    lines.append("- " + element.text)
+                else:
+                    lines.append(element.text)
+            elif isinstance(element, Table):
+                start = len(lines)
+                if element.caption:
+                    lines.append("*" + element.caption + "*")
+                table_md = table_cells_to_md(element.cells)
+                if table_md:
+                    lines.extend(table_md.splitlines())
+                element.md_lines = (start, len(lines))
+            elif element.image_path:
+                ordinal = document.pictures.index(element) + 1
+                lines.append(f"![Рис. {ordinal}](image/{Path(element.image_path).name})")
+        rendered_pages.append("\n".join(lines))
+    return "\n\n".join(page for page in rendered_pages if page)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 0. Секция импортов и констант
 # ═══════════════════════════════════════════════════════════════════════════
