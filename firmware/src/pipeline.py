@@ -1169,7 +1169,10 @@ def _find_table_caption_block(
         layout_type = block.get("layoutType", "")
         block_text = _block_text(block)
         is_caption_block = layout_type == "LAYOUT_TYPE_CAPTION"
-        has_table_word = bool(_TABLE_WORD_RE.search(block_text))
+        has_table_word = bool(
+            _TABLE_WORD_RE.search(block_text)
+            or _CONTINUATION_CAPTION_RE.search(block_text)
+        )
 
         if is_caption_block or has_table_word:
             y_diff = table_y - by
@@ -1185,7 +1188,8 @@ def _caption_block_to_text(block: dict | None) -> str:
     if not block:
         return ""
     block_text = _block_text(block)
-    if _TABLE_WORD_RE.search(block_text):
+    if (_TABLE_WORD_RE.search(block_text)
+            or _CONTINUATION_CAPTION_RE.search(block_text)):
         caption = _normalize_spaced_text(block_text)
         return re.sub(r"\s+", " ", caption)
     return block_text
@@ -1563,15 +1567,22 @@ def _stitch_continuation_tables(
         is_continuation = False
         if i > 0:
             prev = tables_info[i - 1]
-            # Способ 1: явный маркер "Окончание/Продолжение" в тексте + совпадение номеров
+            # Способ 1: явный маркер "Окончание/Продолжение" в тексте + совпадение номеров.
+            # Для уже склеенной группы сверяемся с номером её головы, а не
+            # с номером непосредственного (возможно captionless) предшественника.
+            prev_head_num = prev.get("head_table_num", prev["table_num"])
             if (t["has_continuation"] and t["table_num"]
-                    and prev["table_num"] == t["table_num"]):
+                    and prev_head_num == t["table_num"]):
                 is_continuation = True
             # Способ 2: page-level контекст — таблица на другой странице,
-            #          на той странице есть блок "Окончание/Продолжение",
-            #          и предыдущая таблица имеет номер (продолжение без caption)
+            # на этой странице есть continuation-блок, а номер ТЕКУЩЕЙ таблицы
+            # явно совпадает с номером головы активной группы. Отсутствующий
+            # номер не является совпадением: это предотвращает false-stitch
+            # независимых captionless-таблиц на continuation-помеченной странице.
             elif (page_boundaries and page_has_continuation
-                  and prev["table_num"] is not None):
+                  and prev_head_num is not None
+                  and t["table_num"] is not None
+                  and t["table_num"] == prev_head_num):
                 t_page = _page_of_line(t["start"])
                 prev_page = _page_of_line(prev["start"])
                 if (t_page is not None and prev_page is not None
@@ -1582,6 +1593,7 @@ def _stitch_continuation_tables(
 
         if is_continuation and i > 0:
             prev = tables_info[i - 1]
+            t["head_table_num"] = prev.get("head_table_num", prev["table_num"])
             # Нашли пару — склеиваем: данные из t добавляем к result
             t_lines = t["lines"]
             sep_idx = -1
@@ -1603,6 +1615,7 @@ def _stitch_continuation_tables(
             continue
 
         # Не продолжение — добавляем как есть
+        t["head_table_num"] = t["table_num"]
         prev_end = tables_info[i - 1]["end"] if i > 0 else 0
         result.extend(lines[prev_end:t["start"]])
         result.extend(t["lines"])
@@ -1614,6 +1627,88 @@ def _stitch_continuation_tables(
         result.extend(lines[last_end:])
 
     return "\n".join(result)
+
+
+_TABLE_ID_MARKER_RE = re.compile(r"<!--\s*(t_p\d+_\d+)\s*-->")
+
+
+def _normalize_inline_latex_delimiters(text: str) -> str:
+    """Привести единственный поддерживаемый inline-делимитер к ``$...$``."""
+    return re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
+
+
+def _markdown_table_signature(text: str) -> tuple[int, int] | None:
+    """Вернуть (число строк, число колонок) для первой Markdown-таблицы."""
+    lines = text.splitlines()
+    table_lines = [line for line in lines if line.strip().startswith("|")]
+    if not table_lines:
+        return None
+    separator = next((line for line in table_lines if re.search(r"\|\s*:?-{3,}", line)), None)
+    if separator is None:
+        return None
+    columns = len(separator.strip().strip("|").split("|"))
+    return len(table_lines), columns
+
+
+def _table_blocks_by_marker(text: str) -> dict[str, str]:
+    matches = list(_TABLE_ID_MARKER_RE.finditer(text))
+    return {
+        match.group(1): text[match.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+        for i, match in enumerate(matches)
+    }
+
+
+def _markdown_table_blocks(text: str) -> list[tuple[int, int, str]]:
+    """Найти Markdown-таблицы и их offsets для безмаркерного ответа AI."""
+    lines = text.splitlines(keepends=True)
+    blocks = []
+    offset = 0
+    start = None
+    for line in lines + [""]:
+        stripped = line.strip()
+        is_table_line = stripped.startswith("|") and "|" in stripped[1:]
+        if is_table_line and start is None:
+            start = offset
+        elif not is_table_line and start is not None:
+            blocks.append((start, offset, text[start:offset]))
+            start = None
+        offset += len(line)
+    return blocks
+
+
+def _restore_invalid_ai_tables(original: str, processed: str) -> str:
+    """Откатить таблицы, если AI потерял строки или изменил число колонок."""
+    original_blocks = _table_blocks_by_marker(original)
+    processed_blocks = _table_blocks_by_marker(processed)
+    restored = processed
+    if not processed_blocks:
+        original_tables = list(original_blocks.values())
+        processed_tables = _markdown_table_blocks(processed)
+        replacements = []
+        for original_block, (start, end, processed_block) in zip(original_tables, processed_tables):
+            expected = _markdown_table_signature(original_block)
+            actual = _markdown_table_signature(processed_block)
+            if expected != actual:
+                log.warning("AI table guard: restoring unmarked table (expected %s, got %s)", expected, actual)
+                marker = _TABLE_ID_MARKER_RE.search(original_block)
+                replacement = original_block[marker.end():] if marker else original_block
+                replacements.append((start, end, replacement))
+        for start, end, replacement in reversed(replacements):
+            restored = restored[:start] + replacement + restored[end:]
+        return restored
+    for table_id, original_block in original_blocks.items():
+        processed_block = processed_blocks.get(table_id, "")
+        expected = _markdown_table_signature(original_block)
+        actual = _markdown_table_signature(processed_block)
+        if expected != actual:
+            log.warning("AI table guard: restoring %s (expected %s, got %s)", table_id, expected, actual)
+            if processed_block:
+                restored = restored.replace(processed_block, original_block, 1)
+            else:
+                marker = _TABLE_ID_MARKER_RE.search(restored)
+                if marker:
+                    restored = restored[:marker.end()] + "\n" + original_block + restored[marker.end():]
+    return restored
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2210,10 +2305,7 @@ def extract_table_images(
                 continue
             previous = previous_tables[-1]
             _, _, bottom, page_height = table_geometry[id(previous)]
-            if bottom < page_height * 0.9:
-                if is_continuation:
-                    current_group = item
-                    current_group_members = [item]
+            if bottom < page_height * 0.9 and not is_continuation:
                 continue
 
             # Для подписи-продолжения номер обязан совпасть с головой группы:
@@ -6585,7 +6677,9 @@ def process_file(
 
                 log.info(f"  Часть {i + 1}/{len(md_chunks)} ({len(chunk_input)} символов)")
                 result = _call_ai_api(chunk_input, ai_cfg, f"{file_stem} [ч.{i + 1}]")
-                results[i] = result if result else chunk
+                candidate = result if result else chunk
+                candidate = _restore_invalid_ai_tables(chunk, candidate)
+                results[i] = _normalize_inline_latex_delimiters(candidate)
                 try:
                     ckpt_path.write_text(
                         json.dumps(results, ensure_ascii=False),
@@ -6596,7 +6690,10 @@ def process_file(
 
             md_text = "\n\n".join(r for r in results if r)
 
-            # Логировать покрытие
+            # Marker lifecycle is deterministic: strip IDs only after guard.
+            md_text = _TABLE_ID_MARKER_RE.sub("", md_text)
+
+            # Пост-проверка: остались ли неснятые ID-маркеры
             log.info(f"  Чанков с эталонами: {chunks_with_tables}/{len(md_chunks)}")
 
             # Пост-проверка: остались ли неснятые ID-маркеры

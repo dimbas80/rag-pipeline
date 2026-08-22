@@ -483,7 +483,7 @@ def test_t16_bare_table_2_not_continuation(tmp_path):
 
 
 def test_t17_continuation_caption_geometry_fail(tmp_path):
-    """T17: голова НЕ упирается в низ (bottom < 90%) — «Продолжение таблицы Б.1» НЕ склеено."""
+    """T17: явное продолжение с номером склеивается независимо от геометрии."""
     p1 = _page(
         [_table(200, bottom=300)],
         [_caption_block(150, "Таблица Б.1 — Допустимые токи")],
@@ -501,9 +501,7 @@ def test_t17_continuation_caption_geometry_fail(tmp_path):
         result = extract_table_images(str(pdf_path), pages, img_dir)
 
     assert len(result) == 2
-    for item in result:
-        ci = item.get("component_images")
-        assert ci is None or ci == [item["path"]], f"геометрия нарушена, но склеено: {ci}"
+    assert result[0].get("component_images") == [result[0]["path"], result[1]["path"]]
 
 
 def test_t18_continuation_caption_not_first_on_page(tmp_path):
