@@ -252,14 +252,14 @@ def test_t6_stitch_continuation_keeps_first_marker():
     out = _stitch_continuation_tables(md)
 
     markers = _markers_in_order(out)
-    assert markers == ["t_p1_0"]
+    assert markers == ["t_p1_0", "t_p2_0"]
     assert "| 3 | 4 |" in out  # строки продолжения влиты
     assert "| 1 | 2 |" in out
     assert "Продолжение таблицы 1" not in out  # подпись продолжения съедена
 
 
-def test_t7_merge_tables_keeps_first_marker():
-    """T7: merge_tables — одна таблица, маркер первого компонента, второй удалён."""
+def test_t7_merge_tables_keeps_all_component_markers():
+    """T7: merge_tables сохраняет стек маркеров всех поглощённых таблиц."""
     md = (
         "<!-- t_p1_0 -->\n*Таблица 1*\n"
         "| A | B |\n| --- | --- |\n| 1 | 2 |\n\n"
@@ -269,7 +269,7 @@ def test_t7_merge_tables_keeps_first_marker():
     out = merge_tables(md)
 
     markers = _markers_in_order(out)
-    assert markers == ["t_p1_0"]
+    assert markers == ["t_p1_0", "t_p2_0"]
     assert out.count("| A | B |") == 1
     assert "| 3 | 4 |" in out
 
@@ -292,7 +292,7 @@ def test_t8_merge_by_component_images_from_parse_markers():
     ]
     out = _merge_by_component_images(md, table_images)
 
-    assert _markers_in_order(out) == ["t_p1_0"]
+    assert _markers_in_order(out) == ["t_p1_0", "t_p2_0", "t_p3_0"]
     assert "| 1 | 2 |" in out and "| 3 | 4 |" in out and "| 5 | 6 |" in out
 
 

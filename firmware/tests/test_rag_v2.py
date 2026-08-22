@@ -265,6 +265,24 @@ def v2_md():
 
 
 class TestBuildRagJsonlV2:
+    def test_marker_comments_are_excluded_from_rag_text(self, rag_config):
+        """RAG chunks omit internal table/WARN comments while input remains usable."""
+        md = (
+            "## 3. Раздел\n"
+            "Перед таблицей <!-- t_p2_7 --> <!-- WARN_3.1 -->\n"
+            "Полезный текст.\n"
+        )
+        jsonl = pipeline.build_rag_jsonl_v2(
+            md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
+        )
+        rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
+        assert rows
+        for row in rows:
+            assert "t_p2_7" not in row["text"]
+            assert "WARN_3.1" not in row["text"]
+            assert "t_p2_7" not in row["embedding_text"]
+            assert "WARN_3.1" not in row["embedding_text"]
+
     def test_basic_schema(self, v2_md, rag_config):
         """JSONL v2: обязательные поля, нет source.page, chunk_id стабильный."""
         jh = [

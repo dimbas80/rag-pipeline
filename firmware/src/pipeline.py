@@ -1603,6 +1603,32 @@ def _stitch_continuation_tables(
                     break
             if sep_idx >= 0 and sep_idx + 1 < len(t_lines):
                 data_lines = t_lines[sep_idx + 1:]
+                # Маркеры продолжений должны быть частью стека перед итоговой
+                # таблицей. Комментарий между строками Markdown-таблицы
+                # завершает таблицу и поэтому недопустим.
+                continuation_markers = [
+                    line.strip()
+                    for line in lines[prev["end"]:t["start"]]
+                    if _TABLE_ID_MARKER_RE.match(line.strip())
+                ]
+                if continuation_markers:
+                    marker_positions = [
+                        index for index, line in enumerate(result)
+                        if _TABLE_ID_MARKER_RE.match(line.strip())
+                    ]
+                    insert_at = marker_positions[-1] + 1 if marker_positions else len(result)
+                    result[insert_at:insert_at] = continuation_markers
+                # Пропускаем только повторяющийся префикс шапки; данные не
+                # дедуплицируются (одинаковые строки rowspan легитимны).
+                prev_sep = next(
+                    (idx for idx, line in enumerate(prev["lines"])
+                     if ":--" in line or "---" in line),
+                    -1,
+                )
+                if prev_sep >= 0:
+                    data_lines = _trim_repeated_header_prefix(
+                        prev["lines"][prev_sep + 1:], data_lines,
+                    )
                 # Пропускаем первую строку данных, если она дублирует
                 # последнюю строку предыдущей таблицы
                 if prev["lines"] and data_lines:
@@ -1630,85 +1656,27 @@ def _stitch_continuation_tables(
 
 
 _TABLE_ID_MARKER_RE = re.compile(r"<!--\s*(t_p\d+_\d+)\s*-->")
+_WARN_MARKER_RE = re.compile(r"<!--\s*WARN_([0-9A-Za-zА-Яа-я.]+)\s*-->")
+
+
+def _extract_warn_tables(md_text: str) -> list[str]:
+    """Вернуть номера таблиц, помеченных AI как требующие проверки.
+
+    Номера сохраняются в порядке появления, повторные маркеры одной таблицы
+    сворачиваются. Детекция выполняется по итоговому тексту независимо от
+    наличия ID-маркеров и от границ AI-чанков.
+    """
+    found: list[str] = []
+    for match in _WARN_MARKER_RE.finditer(md_text):
+        number = match.group(1).strip()
+        if number and number not in found:
+            found.append(number)
+    return found
 
 
 def _normalize_inline_latex_delimiters(text: str) -> str:
     """Привести единственный поддерживаемый inline-делимитер к ``$...$``."""
     return re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
-
-
-def _markdown_table_signature(text: str) -> tuple[int, int] | None:
-    """Вернуть (число строк, число колонок) для первой Markdown-таблицы."""
-    lines = text.splitlines()
-    table_lines = [line for line in lines if line.strip().startswith("|")]
-    if not table_lines:
-        return None
-    separator = next((line for line in table_lines if re.search(r"\|\s*:?-{3,}", line)), None)
-    if separator is None:
-        return None
-    columns = len(separator.strip().strip("|").split("|"))
-    return len(table_lines), columns
-
-
-def _table_blocks_by_marker(text: str) -> dict[str, str]:
-    matches = list(_TABLE_ID_MARKER_RE.finditer(text))
-    return {
-        match.group(1): text[match.end():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-        for i, match in enumerate(matches)
-    }
-
-
-def _markdown_table_blocks(text: str) -> list[tuple[int, int, str]]:
-    """Найти Markdown-таблицы и их offsets для безмаркерного ответа AI."""
-    lines = text.splitlines(keepends=True)
-    blocks = []
-    offset = 0
-    start = None
-    for line in lines + [""]:
-        stripped = line.strip()
-        is_table_line = stripped.startswith("|") and "|" in stripped[1:]
-        if is_table_line and start is None:
-            start = offset
-        elif not is_table_line and start is not None:
-            blocks.append((start, offset, text[start:offset]))
-            start = None
-        offset += len(line)
-    return blocks
-
-
-def _restore_invalid_ai_tables(original: str, processed: str) -> str:
-    """Откатить таблицы, если AI потерял строки или изменил число колонок."""
-    original_blocks = _table_blocks_by_marker(original)
-    processed_blocks = _table_blocks_by_marker(processed)
-    restored = processed
-    if not processed_blocks:
-        original_tables = list(original_blocks.values())
-        processed_tables = _markdown_table_blocks(processed)
-        replacements = []
-        for original_block, (start, end, processed_block) in zip(original_tables, processed_tables):
-            expected = _markdown_table_signature(original_block)
-            actual = _markdown_table_signature(processed_block)
-            if expected != actual:
-                log.warning("AI table guard: restoring unmarked table (expected %s, got %s)", expected, actual)
-                marker = _TABLE_ID_MARKER_RE.search(original_block)
-                replacement = original_block[marker.end():] if marker else original_block
-                replacements.append((start, end, replacement))
-        for start, end, replacement in reversed(replacements):
-            restored = restored[:start] + replacement + restored[end:]
-        return restored
-    for table_id, original_block in original_blocks.items():
-        processed_block = processed_blocks.get(table_id, "")
-        expected = _markdown_table_signature(original_block)
-        actual = _markdown_table_signature(processed_block)
-        if expected != actual:
-            log.warning("AI table guard: restoring %s (expected %s, got %s)", table_id, expected, actual)
-            if processed_block:
-                restored = restored.replace(processed_block, original_block, 1)
-            else:
-                marker = _TABLE_ID_MARKER_RE.search(restored)
-                if marker:
-                    restored = restored[:marker.end()] + "\n" + original_block + restored[marker.end():]
-    return restored
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2830,6 +2798,29 @@ def _same_table_caption(lines: list[str], t1_start: int, t2_start: int) -> bool:
     return True
 
 
+def _row_norm_sig(line: str) -> tuple[str, ...]:
+    """Нормализованная сигнатура строки таблицы для common-prefix среза."""
+    if not line.strip().startswith("|"):
+        return ()
+    return tuple(
+        re.sub(r"\\s+", " ", cell).strip().lower()
+        for cell in line.strip().strip("|").split("|")
+        if cell.strip()
+    )
+
+
+def _trim_repeated_header_prefix(previous: list[str], incoming: list[str]) -> list[str]:
+    """Удалить только повторяющийся ведущий префикс, сохранив строки данных."""
+    count = 0
+    while count < len(previous) and count < len(incoming):
+        previous_sig = _row_norm_sig(previous[count])
+        incoming_sig = _row_norm_sig(incoming[count])
+        if not previous_sig or previous_sig != incoming_sig:
+            break
+        count += 1
+    return incoming[count:]
+
+
 def merge_tables(md_text: str) -> str:
     """Объединить смежные Markdown-таблицы."""
     lines = md_text.split("\n")
@@ -2861,6 +2852,7 @@ def merge_tables(md_text: str) -> str:
             continue
 
         current_data = list(table_lines[sep_idx + 1:])
+        absorbed_markers: list[str] = []
 
         j = i + 1
         while j < len(tables):
@@ -2887,7 +2879,15 @@ def merge_tables(md_text: str) -> str:
             if not can_merge:
                 break
 
+            absorbed_markers.extend(
+                line.strip() for line in between_lines
+                if _TABLE_ID_MARKER_RE.match(line.strip())
+            )
+
             next_data = next_lines[next_sep + 1:] if next_sep >= 0 else next_lines
+            # При реальном слиянии удаляем только общий префикс повторной шапки;
+            # одинаковые строки данных из разных rowspan-групп сохраняем.
+            next_data = _trim_repeated_header_prefix(current_data, next_data)
             current_data.extend(next_data)
             t_end = n_end
             prev_end = t_end
@@ -2895,12 +2895,16 @@ def merge_tables(md_text: str) -> str:
 
         header_part = table_lines[:sep_idx + 1]
         merged_lines = list(header_part)
-        seen = {header.strip()}
-        for dl in current_data:
-            s = dl.strip()
-            if s and s not in seen:
-                merged_lines.append(dl)
-                seen.add(s)
+        if absorbed_markers:
+            marker_positions = [
+                index for index, line in enumerate(result)
+                if _TABLE_ID_MARKER_RE.match(line.strip())
+            ]
+            insert_at = marker_positions[-1] + 1 if marker_positions else len(result)
+            result[insert_at:insert_at] = absorbed_markers
+        # Данные могут быть байт-идентичны в разных rowspan-группах — это
+        # легитимные строки, поэтому глобальная дедупликация запрещена.
+        merged_lines.extend(current_data)
 
         result.extend(merged_lines)
         i = j
@@ -3307,7 +3311,7 @@ def _merge_by_component_images(md_text: str, table_images: list[dict] | None) ->
         if separator_index is None:
             continue
         merged = list(first_lines)
-        seen = {line.strip() for line in merged[separator_index + 1:] if line.strip()}
+        first_data = first_lines[separator_index + 1:]
         for _, _, row_start, row_end in parts[1:]:
             continuation_rows = lines[row_start:row_end]
             continuation_separator = next(
@@ -3317,10 +3321,14 @@ def _merge_by_component_images(md_text: str, table_images: list[dict] | None) ->
             )
             if continuation_separator is not None:
                 continuation_rows = continuation_rows[continuation_separator + 1:]
-            for row in continuation_rows:
-                if row.strip() and row.strip() not in seen:
-                    merged.append(row)
-                    seen.add(row.strip())
+            continuation_rows = _trim_repeated_header_prefix(first_data, continuation_rows)
+            merged.extend(continuation_rows)
+            first_data = continuation_rows
+        # Переносим ID каждого компонента в стек перед подписью итоговой таблицы.
+        component_markers = [f"<!-- {part[0]} -->" for part in parts[1:]]
+        if component_markers:
+            insertion = 1 if merged and marker_re.match(merged[0]) else 0
+            merged[insertion:insertion] = component_markers
         replacements.append((first_marker, first_end, merged))
         for _, marker, _, end in parts[1:]:
             replacements.append((marker, end, []))
@@ -3861,21 +3869,29 @@ _REF_LABEL_HINTS: list[tuple[str, str]] = [
 ]
 
 
-def load_rag_config(config_path: str | Path) -> dict:
-    """Загрузить rag_config.yaml.
+def _derive_reg_path(input_path: str | Path, output_dir: str | Path | None = None) -> Path:
+    """Вернуть per-document конфиг рядом с исходным/итоговым Markdown."""
+    path = Path(input_path)
+    directory = Path(output_dir) if output_dir is not None else path.parent
+    return directory / f"{path.stem}_reg.yaml"
 
-    Returns:
-        Полный словарь конфига с секциями defaults, references, documents.
 
-    Raises:
-        FileNotFoundError: файл не найден.
-        yaml.YAMLError: ошибка парсинга YAML.
-    """
+def load_rag_config(
+    config_path: str | Path,
+    reg_path: str | Path | None = None,
+) -> dict:
+    """Загрузить глобальный RAG-конфиг и наложить per-document запись."""
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"rag_config не найден: {config_path}")
     with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
+
+    if reg_path and Path(reg_path).exists():
+        with open(reg_path, encoding="utf-8") as f:
+            per_doc = yaml.safe_load(f) or {}
+        documents = per_doc.get("documents", {})
+        config.setdefault("documents", {}).update(documents)
 
     # Валидация (ADR-010b): warnings при ошибках, конфиг продолжает работать
     for err in validate_rag_config(config):
@@ -4553,41 +4569,10 @@ def build_rag_jsonl_v2(
     tokenize: Callable[[str], int],
     chunking_method: str = "qwen3",
 ) -> str:
-    """Построить JSONL-строку для RAG-индексации (v2, ADR-010).
+    """Построить JSONL для RAG v2, исключив служебные Markdown-маркеры."""
+    md_text_for_rag = _TABLE_ID_MARKER_RE.sub("", md_text)
+    md_text_for_rag = _WARN_MARKER_RE.sub("", md_text_for_rag)
 
-    Отличия от v1 (ADR-9):
-      - Лимит чанка — в токенах (max_chunk_tokens, по умолчанию 7000)
-      - source.page удалён из публичной схемы; остаётся _source_page
-      - Поля status / status_reason / replaced_by_document_id
-      - Стабильный chunk_id без страниц: {doc_slug}/{clause_number}[/part_{N}];
-        повторные numbered top-level блоки получают /occurrence_{N}
-      - section_path, heading_texts, chunk_tokens, chunking_method
-      - embedding_text / embedding_tokens: заголовки (chapter/section/clause)
-        + исходный text для embedding-модели (text не изменяется)
-      - assets: пустой список (заполняется _link_assets_to_chunks)
-
-    Алгоритм:
-      1. doc_meta = rag_config['documents'][doc_key] (ValueError если нет)
-      2. defaults = rag_config['defaults']
-      3. status: doc_meta.status или defaults.default_status (warning если нет)
-      4. ignore_sections = doc_meta.get('ignore_sections', [])
-      5. clauses = parse_md_structure(md_text)
-      6. Для каждого clause:
-         a. ignore_sections → пропустить секцию и её подразделы
-         b. text = extract_clause_text(); пустой → пропустить
-         c. chapter/section/clause = _build_ancestors()
-         d. heading_texts = _build_heading_texts()
-         e. section_path = _build_section_path()
-         f. chunk_id = {doc_slug}/{clause_number} (или /_h{idx} без номера)
-         g. _source_page = _get_page_for_heading()
-         h. references = extract_references()
-         i. chunk_tokens = tokenize(text)
-         j. oversized → _split_oversized_clause_tokens() с /part_{N} и «(ч. N)»
-      7. Вернуть JSONL ("\\n".join) + "\\n"
-
-    Returns:
-        JSONL-строка, каждая строка — валидный JSON-объект.
-    """
     documents = rag_config.get("documents", {})
     doc_meta = documents.get(doc_key)
     if doc_meta is None:
@@ -4600,33 +4585,25 @@ def build_rag_jsonl_v2(
     if extract_refs:
         patterns = rag_config.get("references", {}).get("patterns", []) or []
 
-    # Статус документа (ADR-010b): явный или default_status; warning если нет
     status = doc_meta.get("status")
     if status is None:
         status = defaults.get("default_status", "active")
-        log.warning(
-            f"  {doc_key}: status не указан — использую default_status='{status}'"
-        )
+        log.warning(f"  {doc_key}: status не указан — использую default_status='{status}'")
     status_reason = doc_meta.get("status_reason")
     replaced_by_document_id = doc_meta.get("replaced_by_document_id")
     replaced_by_doc_key = doc_meta.get("replaced_by_doc_key")
 
     ignore_sections = doc_meta.get("ignore_sections", []) or []
-    clauses = parse_md_structure(md_text)
-
-    # Отфильтровать игнорируемые секции (и их подразделы): они не попадают
-    # ни в выход, ни в цепочку предков для _build_ancestors()
+    clauses = parse_md_structure(md_text_for_rag)
     active_clauses: list[dict] = []
     skip_until_level: int | None = None
     for clause in clauses:
         level = clause["level"]
         heading_text = clause["heading_text"]
-        # Продолжаем пропуск игнорируемой секции (её подразделы)
         if skip_until_level is not None:
             if level > skip_until_level:
                 continue
             skip_until_level = None
-        # Начало игнорируемой секции
         if any(s and s.lower() in heading_text.lower() for s in ignore_sections):
             skip_until_level = level
             continue
@@ -4634,13 +4611,12 @@ def build_rag_jsonl_v2(
 
     source_file = doc_meta.get("source_file")
     json_lines: list[str] = []
-
-    # Счётчик повторов базового chunk_id: повторные numbered top-level блоки
-    # (напр. «## 1/2/3» в разделе рекомендаций) получают /occurrence_{N}.
     occurrence_counts: dict[str, int] = {}
 
     for i, clause in enumerate(active_clauses):
-        text = extract_clause_text(md_text, clause["line_num"], clause["next_line_num"])
+        text = extract_clause_text(
+            md_text_for_rag, clause["line_num"], clause["next_line_num"]
+        )
         if not text:
             continue
 
@@ -4907,7 +4883,8 @@ def _reg_create_new(
         return None
 
     try:
-        text = Path(rag_config_path).read_text(encoding="utf-8")
+        config_file = Path(rag_config_path)
+        text = config_file.read_text(encoding="utf-8") if config_file.exists() else "documents:\n"
     except Exception as e:
         log.error(f"Не удалось прочитать {rag_config_path}: {e}")
         return None
@@ -5606,21 +5583,18 @@ def _extract_tables_from_md(
 
 
 def _find_table_marker_md(lines: list[str], start: int) -> str | None:
-    """Найти ID-маркер <!-- t_pN_M --> перед таблицей.
-
-    Ищет вверх до 3 непустых строк (маркер вставляется перед строкой-названием,
-    между ним и таблицей может быть подпись/пустые строки).
-    """
+    """Найти верхний ID-маркер перед таблицей в расширенном стеке."""
     j = start - 1
+    found: str | None = None
     scanned = 0
-    while j >= 0 and scanned < 3:
+    while j >= 0 and scanned < 12:
         if lines[j].strip():
             scanned += 1
             m = re.match(r"<!--\s*(t_p\d+_\d+)\s*-->", lines[j].strip())
             if m:
-                return m.group(1)
+                found = m.group(1)
         j -= 1
-    return None
+    return found
 
 
 def _find_table_caption_md(
@@ -5652,10 +5626,10 @@ def _find_table_caption_md(
             return re.sub(r"\s+", " ", line.strip().strip("*"))
         return None
 
-    # Перед таблицей: до 3 непустых строк выше
+    # Перед таблицей: до 12 непустых строк выше (включая стек ID-маркеров)
     j = start - 1
     scanned = 0
-    while j >= 0 and scanned < 3:
+    while j >= 0 and scanned < 12:
         if lines[j].strip():
             scanned += 1
             if j in used_caption_lines:
@@ -5773,16 +5747,18 @@ def _match_table_by_content(
     return None, best_score, second_score
 
 
-def _load_table_image_map(tmp_dir: str | Path | None) -> dict[str, str]:
-    """Загрузить карту id → path из tmp/<file_stem>/table_images.json.
-
-    Карта создаётся extract_table_images() и персистится в process_file(),
-    чтобы --rag работал и при повторном запуске без OCR.
-    """
-    if not tmp_dir:
-        return {}
-    p = Path(tmp_dir) / "table_images.json"
-    if not p.exists():
+def _load_table_image_map(
+    tmp_dir: str | Path | None,
+    asset_dir: str | Path | None = None,
+) -> dict[str, str]:
+    """Загрузить карту сначала рядом с итоговым MD, затем из legacy tmp."""
+    candidates = []
+    if asset_dir:
+        candidates.append(Path(asset_dir) / "table_images.json")
+    if tmp_dir:
+        candidates.append(Path(tmp_dir) / "table_images.json")
+    p = next((candidate for candidate in candidates if candidate.exists()), None)
+    if p is None:
         return {}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -5797,7 +5773,10 @@ def _load_table_image_map(tmp_dir: str | Path | None) -> dict[str, str]:
     return {}
 
 
-def _load_table_components(tmp_dir: str | Path | None) -> dict[str, list[str]]:
+def _load_table_components(
+    tmp_dir: str | Path | None,
+    asset_dir: str | Path | None = None,
+) -> dict[str, list[str]]:
     """Загрузить компоненты таблиц по ID и имени изображения.
 
     Для таблиц, объединённых на нескольких страницах, ``component_images``
@@ -5806,10 +5785,13 @@ def _load_table_components(tmp_dir: str | Path | None) -> dict[str, list[str]]:
     имени каждой входящей картинки: это позволяет восстановить компоненты
     после привязки итоговой таблицы по содержимому.
     """
-    if not tmp_dir:
-        return {}
-    path = Path(tmp_dir) / "table_images.json"
-    if not path.exists():
+    candidates = []
+    if asset_dir:
+        candidates.append(Path(asset_dir) / "table_images.json")
+    if tmp_dir:
+        candidates.append(Path(tmp_dir) / "table_images.json")
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -5896,6 +5878,7 @@ def _build_asset_registry(
     document_type: str | None = None,
     domain: str | None = None,
     tmp_dir: str | Path | None = None,
+    asset_dir: str | Path | None = None,
 ) -> dict:
     """Построить реестр активов rag_assets.json.
 
@@ -5911,8 +5894,8 @@ def _build_asset_registry(
     Если img_dir передан и файл изображения не существует — актив
     пропускается с log.warning (архитектура §9 error handling).
     """
-    table_image_map = _load_table_image_map(tmp_dir) if tmp_dir else {}
-    table_components = _load_table_components(tmp_dir) if tmp_dir else {}
+    table_image_map = _load_table_image_map(tmp_dir, asset_dir) if (tmp_dir or asset_dir) else {}
+    table_components = _load_table_components(tmp_dir, asset_dir) if (tmp_dir or asset_dir) else {}
     crop_texts = _load_table_crop_texts(tmp_dir) if tmp_dir else {}
     tables = _extract_tables_from_md(
         md_text,
@@ -6213,6 +6196,7 @@ def run_rag_pipeline(
         md_text, doc_key, img_dir,
         document_id=document_id, document_type=document_type, domain=domain,
         tmp_dir=tmp_dir,
+        asset_dir=out_dir,
     )
     _link_assets_to_chunks(assets, chunks)
 
@@ -6292,8 +6276,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--reg",
         action="store_true",
-        help="После прогона интерактивно зарегистрировать "
-        "документ в rag_config.yaml (требует TTY)",
+        help="После прогона интерактивно зарегистрировать документ "
+        "в per-document <stem>_reg.yaml (требует TTY)",
     )
 
     return parser.parse_args(argv)
@@ -6389,6 +6373,8 @@ def process_file(
         if not (use_rag or use_reg):
             log.error(".md в Markdown/: требуется флаг --rag (или --reg)")
             return False
+        # Per-document config lives beside the source Markdown.
+        document_reg_path = _derive_reg_path(input_path_obj)
         # --reg: регистрация по готовому .md (до RAG-индексации)
         if use_reg:
             if rag_config is None:
@@ -6396,7 +6382,7 @@ def process_file(
                 return False
             md_reg_text = input_path_obj.read_text(encoding="utf-8")
             new_config = run_registration(
-                input_path_obj, md_reg_text, rag_config_path, rag_config, config,
+                input_path_obj, md_reg_text, document_reg_path, rag_config, config,
             )
             if new_config is None:
                 return False
@@ -6421,6 +6407,7 @@ def process_file(
     ensure_dir(img_dir)
     ensure_dir(file_tmp_dir)
 
+    document_reg_path = _derive_reg_path(input_path_obj, out_dir)
     # Режим: .md вне Markdown/ → только постобработка, без OCR и скриптов
     ext = input_path_obj.suffix.lower()
     if ext == ".md":
@@ -6443,7 +6430,7 @@ def process_file(
                     log.error("--reg требует загруженного rag_config")
                     return False
                 new_config = run_registration(
-                    input_path_obj, md_text, rag_config_path, rag_config, config,
+                    input_path_obj, md_text, document_reg_path, rag_config, config,
                 )
                 if new_config is None:
                     return False
@@ -6494,7 +6481,7 @@ def process_file(
                     log.error("--reg требует загруженного rag_config")
                     return False
                 rag_config = run_registration(
-                    input_path_obj, md_text, rag_config_path, rag_config, config,
+                    input_path_obj, md_text, document_reg_path, rag_config, config,
                 )
                 if rag_config is None:
                     return False
@@ -6559,6 +6546,12 @@ def process_file(
                     map_payload.append(entry)
                 safe_write(
                     file_tmp_dir / "table_images.json",
+                    json.dumps(map_payload, ensure_ascii=False, indent=2),
+                )
+                # Карта является производным артефактом документа и должна
+                # переживать удаление tmp для повторного --rag.
+                safe_write(
+                    out_dir / "table_images.json",
                     json.dumps(map_payload, ensure_ascii=False, indent=2),
                 )
             except Exception as e:
@@ -6678,7 +6671,6 @@ def process_file(
                 log.info(f"  Часть {i + 1}/{len(md_chunks)} ({len(chunk_input)} символов)")
                 result = _call_ai_api(chunk_input, ai_cfg, f"{file_stem} [ч.{i + 1}]")
                 candidate = result if result else chunk
-                candidate = _restore_invalid_ai_tables(chunk, candidate)
                 results[i] = _normalize_inline_latex_delimiters(candidate)
                 try:
                     ckpt_path.write_text(
@@ -6690,8 +6682,18 @@ def process_file(
 
             md_text = "\n\n".join(r for r in results if r)
 
-            # Marker lifecycle is deterministic: strip IDs only after guard.
-            md_text = _TABLE_ID_MARKER_RE.sub("", md_text)
+            warn_tables = _extract_warn_tables(md_text)
+            if warn_tables:
+                for table_number in warn_tables:
+                    log.warning(
+                        "⚠ Требует ручной проверки таблица %s — файл %s",
+                        table_number,
+                        out_dir / f"{file_stem}.md",
+                    )
+            else:
+                log.info("  AI не пометила ни одну таблицу как изменённую")
+
+            # ID-маркеры сохраняются в итоговом Markdown по политике B.
 
             # Пост-проверка: остались ли неснятые ID-маркеры
             log.info(f"  Чанков с эталонами: {chunks_with_tables}/{len(md_chunks)}")
@@ -6726,7 +6728,7 @@ def process_file(
                 log.error("--reg требует загруженного rag_config")
                 return False
             new_config = run_registration(
-                input_path_obj, md_text, rag_config_path, rag_config, config,
+                input_path_obj, md_text, document_reg_path, rag_config, config,
             )
             if new_config is None:
                 return False
@@ -6803,7 +6805,14 @@ def main() -> None:
     rag_config = None
     if args.rag or args.reg:
         try:
-            rag_config = load_rag_config(args.rag_config)
+            # PDF/DOCX output is written under Markdown/<stem>/; registration
+            # overlays must be resolved beside that generated Markdown.
+            reg_path = _derive_reg_path(
+                input_file,
+                None if input_file.suffix.lower() == ".md"
+                else Path(output_base) / input_file.stem,
+            )
+            rag_config = load_rag_config(args.rag_config, reg_path=reg_path)
             log.info(f"RAG-конфиг загружен: {args.rag_config}")
         except Exception as e:
             log.error(f"Не удалось загрузить rag_config: {e}")

@@ -7,7 +7,7 @@ from pipeline import (
     _CONTINUATION_CAPTION_RE,
     _find_table_caption_block,
     _normalize_inline_latex_delimiters,
-    _restore_invalid_ai_tables,
+    _extract_warn_tables,
     _stitch_continuation_tables,
 )
 
@@ -47,31 +47,21 @@ def test_page_context_does_not_stitch_unrelated_captionless_table():
     assert "| 9 | z |" in result
 
 
-def test_invalid_ai_table_is_restored_when_rows_are_lost(caplog):
-    original = "<!-- t_p1_0 -->\nТаблица\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"
-    processed = "<!-- t_p1_0 -->\nТаблица\n| A | B |\n|---|---|\n| 1 | 2 |"
-    result = _restore_invalid_ai_tables(original, processed)
-    assert result == original
-    assert "t_p1_0" in caplog.text
+def test_extract_warn_tables_single():
+    assert _extract_warn_tables("<!-- t_p27_0 -->\n<!-- WARN_7.1 -->\n| table |") == ["7.1"]
 
 
-def test_invalid_ai_table_is_restored_when_columns_change():
-    original = "<!-- t_p1_0 -->\n| A | B |\n|---|---|\n| 1 | 2 |"
-    processed = "<!-- t_p1_0 -->\n| A |\n|---|\n| 1 |"
-    assert _restore_invalid_ai_tables(original, processed) == original
+def test_extract_warn_tables_multiple_dedup():
+    text = "<!-- WARN_7.1 -->\n<!-- WARN_4.1 -->\n<!-- WARN_7.1 -->"
+    assert _extract_warn_tables(text) == ["7.1", "4.1"]
 
 
-def test_valid_ai_table_is_kept():
-    original = "<!-- t_p1_0 -->\n| A | B |\n|---|---|\n| 1 | 2 |"
-    processed = "<!-- t_p1_0 -->\n| A | B |\n|---|---|\n| 1 | improved |"
-    assert _restore_invalid_ai_tables(original, processed) == processed
+def test_extract_warn_tables_appendix_number():
+    assert _extract_warn_tables("<!-- WARN_Б.1 -->") == ["Б.1"]
 
 
-def test_invalid_ai_table_is_restored_when_marker_is_removed():
-    original = "<!-- t_p1_0 -->\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"
-    processed = "| A | B |\n|---|---|\n| 1 | 2 |"
-    result = _restore_invalid_ai_tables(original, processed)
-    assert "| 3 | 4 |" in result
+def test_extract_warn_tables_none():
+    assert _extract_warn_tables("обычный Markdown без маркеров") == []
 
 
 def test_inline_latex_delimiter_is_normalized():

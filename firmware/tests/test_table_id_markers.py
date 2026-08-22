@@ -43,10 +43,11 @@ def test_component_image_stitch_merges_continuations_and_keeps_first_marker():
     out = _merge_by_component_images(md, table_images)
 
     assert out.count("| Header A | Header B |") == 1
-    assert out.count("| first | row |") == 1
+    # Repeated byte-identical data rows are legitimate and must be retained.
+    assert out.count("| first | row |") == 2
     assert "| second | row |" in out
-    assert out.count("<!-- t_p") == 1
-    assert "<!-- t_p1_0 -->" in out
+    assert out.count("<!-- t_p") == 2
+    assert "<!-- t_p1_0 -->" in out and "<!-- t_p2_0 -->" in out
 
 
 def test_component_image_stitch_does_not_merge_single_image_tables():
@@ -86,8 +87,7 @@ def test_component_image_stitch_three_parts_from_parse_markers():
 
     out = _merge_by_component_images(md, table_images)
 
-    assert out.count("<!-- t_p") == 1
-    assert "<!-- t_p1_0 -->" in out
+    assert out.count("<!-- t_p") == 3
     assert out.count("| A | B |") == 1
     for row in ("| 1 | 2 |", "| 3 | 4 |", "| 5 | 6 |"):
         assert row in out
@@ -175,7 +175,7 @@ def test_run_script_postprocess_stitches_component_images(tmp_path):
     assert out.count("| Header A | Header B |") == 1
     assert out.count("| --- | --- |") == 1
     assert "| second | row |" in out
-    assert out.count("<!-- t_p") == 1
+    assert out.count("<!-- t_p") == 2
     assert "<!-- t_p1_0 -->" in out
 
 

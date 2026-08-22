@@ -373,7 +373,7 @@ class TestWrite:
         """Гейт: дубль slug → None, файл не изменён (§6.1)."""
         text = real_config_text()
         cfg = write_config(tmp_path, text)
-        new_text = pipeline._reg_append_record(text, "GOST_18410_kabel", base_fields())
+        new_text = pipeline._reg_append_record(text, "GOST_18410", base_fields())
         assert new_text is None
         assert cfg.read_text(encoding="utf-8") == text
 
@@ -670,7 +670,13 @@ class TestRegression:
             use_reg=True, rag_config=pipeline.load_rag_config(cfg), rag_config_path=str(cfg),
         )
         assert ok is True
-        assert "GOST_839_kabel" in yaml.safe_load(cfg.read_text(encoding="utf-8"))["documents"]
+        global_config = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+        assert "GOST_839_kabel" not in global_config["documents"]
+        document_config = tmp_path / "out" / "doc" / "doc_reg.yaml"
+        assert document_config.exists()
+        assert "GOST_839_kabel" in yaml.safe_load(
+            document_config.read_text(encoding="utf-8")
+        )["documents"]
 
     def test_md_rag_requires_flag(self, tmp_path):
         """.md внутри Markdown/ без --rag/--reg → False (гейт расширен §2)."""
