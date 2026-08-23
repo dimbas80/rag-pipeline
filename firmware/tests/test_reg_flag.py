@@ -415,6 +415,39 @@ class TestWrite:
 
 
 class TestIdempotence:
+    def test_legacy_record_creates_complete_per_document_config(
+        self, tmp_path, monkeypatch, tty
+    ):
+        """Legacy-only incomplete record is copied before null-fill is written."""
+        global_cfg = write_config(tmp_path, real_config_text())
+        per_doc_cfg = tmp_path / "so153_molniezashita_reg.yaml"
+        rag = pipeline.load_rag_config(global_cfg)
+        md = "# ИНСТРУКЦИЯ ПО МОЛНИЕЗАЩИТЕ\nСО 153-34.21.122-2003\n"
+
+        # document_type and domain are the only missing dialog fields here.
+        queue_input(monkeypatch, ["", "", "Молниезащита", "", "", "y"])
+        res = pipeline.run_registration(
+            "СО153-34_21_122-2003 Молниезащита.pdf",
+            md,
+            per_doc_cfg,
+            rag,
+            None,
+        )
+
+        assert res is not None
+        assert per_doc_cfg.exists()
+        per_doc = yaml.safe_load(per_doc_cfg.read_text(encoding="utf-8"))
+        doc = per_doc["documents"]["so153_molniezashita"]
+        assert doc["document_id"] == "СО 153-34.21.122-2003"
+        assert doc["title"] == (
+            "Инструкция по устройству молниезащиты зданий, сооружений и "
+            "промышленных коммуникаций"
+        )
+        assert doc["edition"] == "2003"
+        assert doc["document_type"] == "СО"
+        assert doc["domain"] == "Молниезащита"
+        assert global_cfg.read_bytes() == Path(RAG_CONFIG).read_bytes()
+
     def test_second_run_skips_without_prompts(self, tmp_path, monkeypatch, tty):
         """После записи повторный прогон — полный skip, ни одного input()."""
         cfg = write_config(tmp_path, real_config_text())

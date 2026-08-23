@@ -4931,12 +4931,19 @@ def _reg_fill_existing(
         print("Регистрация отменена, конфиг не изменён")
         return None
 
-    try:
-        text = Path(rag_config_path).read_text(encoding="utf-8")
-    except Exception as e:
-        log.error(f"Не удалось прочитать {rag_config_path}: {e}")
-        return None
-    new_text = _reg_fill_nulls(text, doc_key, filled)
+    config_path = Path(rag_config_path)
+    if config_path.exists():
+        try:
+            text = config_path.read_text(encoding="utf-8")
+        except Exception as e:
+            log.error(f"Не удалось прочитать {rag_config_path}: {e}")
+            return None
+        new_text = _reg_fill_nulls(text, doc_key, filled)
+    else:
+        # A legacy record may exist only in the global config.  Materialize the
+        # complete merged record in the new per-document overlay; writing only
+        # ``filled`` would discard legacy fields when overlays are merged.
+        new_text = _reg_append_record("documents:\n", doc_key, fields)
     if new_text is None:
         return None
     safe_write(rag_config_path, new_text)
