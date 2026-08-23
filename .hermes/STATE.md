@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-22 — by: orchestrator — backlog п.1-4 (tmp-независимость, per-doc --reg, маркеры сшитых таблиц, дефекты СП52) закрыт и подтверждён живым прогоном
+_Last updated: 2026-08-23 — by: orchestrator — найден и заделегирован фикс регрессии `--reg` (per-doc `<stem>_reg.yaml` не создаётся для legacy-документа)
 
 ## Working functionality
 
@@ -27,6 +27,7 @@ _Last updated: 2026-08-22 — by: orchestrator — backlog п.1-4 (tmp-неза�
 
 ## Known issues
 
+- **`--reg` не создаёт per-doc `<stem>_reg.yaml` для документа с legacy-записью в общем `rag_config.yaml`:** `_reg_fill_existing()` безусловно читает несуществующий per-doc файл (`Path(rag_config_path).read_text()`) → `FileNotFoundError` → `return None`. Живой кейс: `so153_molniezashita` (`document_type`/`domain`=null → запись «неполная» → ветка fill-existing). Фикс в t_65899657 (coder) → t_f159695e (reviewer).
 - `firmware/tests/test_gap_filling.py` содержит 8 предсуществующих падений; полный регрессионный прогон выполняется с `--ignore=tests/test_gap_filling.py`.
 - Порог Jaccard `0.10` для fallback-привязки таблиц подобран на СП89; на других документах может потребоваться калибровка. Слабая уверенность логируется WARNING, но не блокирует результат.
 - `test_gemini_full_pdf.py` падает на `import fitz` в изолированной среде coder-воркера (не в рабочем окружении проекта) — окружение, не дефект кода.
@@ -39,7 +40,7 @@ _Last updated: 2026-08-22 — by: orchestrator — backlog п.1-4 (tmp-неза�
 
 ## In progress
 
-- Нет активных задач. Живой прогон СП52 подтверждён пользователем (2026-08-22, после фиксов п.1-4). Регрессия СП89/ГОСТ18410 — пользователь выполняет сам, когда готов.
+- **Фикс регрессии `--reg` (t_65899657 coder → t_f159695e reviewer):** `_reg_fill_existing()` должен при отсутствии per-doc `<stem>_reg.yaml` создавать его заново с ПОЛНОЙ записью (`_reg_append_record("documents:\n", doc_key, fields)`), а не читать несуществующий файл; при существовании файла — прежний `_reg_fill_nulls`. Legacy-запись в общем `rag_config.yaml` не трогается.
 
 ## Planned / backlog
 
