@@ -8,7 +8,7 @@
 
 # Project State
 
-_Last updated: 2026-08-23 — by: orchestrator — найден и заделегирован фикс регрессии `--reg` (per-doc `<stem>_reg.yaml` не создаётся для legacy-документа)
+_Last updated: 2026-08-23 — by: orchestrator — регрессия `--reg` (per-doc `<stem>_reg.yaml` для legacy-документа) исправлена, review PASS
 
 ## Working functionality
 
@@ -21,13 +21,13 @@ _Last updated: 2026-08-23 — by: orchestrator — найден и заделе�
 - **Флаг `--reg`**: после прогона интерактивно регистрирует документ в `rag_config.yaml` (авто-поля «определено: X» с подтверждением, поля пользователя пошагово с комментарием+примером; идемпотентно; требует TTY). Связка `--ai --reg --rag` регистрирует и индексирует за один запуск.
 - **tmp/-независимость (п.1, 2026-08-22):** `table_images.json` персистится рядом с итоговым `.md` (в папке документа), fallback на `tmp/<stem>/` только если персистентной копии нет; `--rag` не требует существования `tmp/`. ID-маркеры `<!-- t_pN_M -->` и `<!-- WARN_N -->` больше не зачищаются из `.md` после AI-постобработки — остаются видимыми (Вариант B), но исключаются in-memory из `{stem}_chunks.jsonl` при `--rag`.
 - **Пер-документная регистрация (п.2, 2026-08-22):** `--reg` пишет `<stem>_reg.yaml` (секция `documents.<slug>` только) в папку с `.md`, а не в общий `rag_config.yaml`; `load_rag_config` при `--rag` сливает пер-документный конфиг с общими defaults/references; старые записи в `rag_config.yaml` остаются как legacy fallback.
+- **Legacy→per-doc материализация (2026-08-23, коммит `6233341`):** `--reg` для документа, чья запись есть только в общем `rag_config.yaml` (legacy), создаёт `<stem>_reg.yaml` с ПОЛНОЙ записью — `_reg_fill_existing()` ветвится по существованию файла; legacy-запись не трогается.
 - **Маркеры сшитых/поглощённых таблиц (п.3, 2026-08-22):** `_stitch_continuation_tables()` и `merge_tables()` сохраняют маркеры ВСЕХ компонентов сшитой таблицы (не только головы) — стеком перед итоговой таблицей; AI-постобработка получает vision-эталоны всех кусков, не только первого.
 - **Дедупликация служебных строк шапки (п.4, 2026-08-22):** глобальная `seen`-дедупликация `merge_tables()`, удалявшая легитимные байт-идентичные строки разных rowspan-групп, заменена common-prefix-срезом повторов шапки — устранены и дубли заголовков, и ложные потери строк.
 - **Живой прогон СП52 после фиксов п.1-4 подтверждён пользователем (2026-08-22):** все таблицы корректны, большие таблицы склеены хорошо, дублирующихся заголовков и смещений нет; одна таблица помечена `WARN_N`, при ручной проверке — корректна.
 
 ## Known issues
 
-- **`--reg` не создаёт per-doc `<stem>_reg.yaml` для документа с legacy-записью в общем `rag_config.yaml`:** `_reg_fill_existing()` безусловно читает несуществующий per-doc файл (`Path(rag_config_path).read_text()`) → `FileNotFoundError` → `return None`. Живой кейс: `so153_molniezashita` (`document_type`/`domain`=null → запись «неполная» → ветка fill-existing). Фикс в t_65899657 (coder) → t_f159695e (reviewer).
 - `firmware/tests/test_gap_filling.py` содержит 8 предсуществующих падений; полный регрессионный прогон выполняется с `--ignore=tests/test_gap_filling.py`.
 - Порог Jaccard `0.10` для fallback-привязки таблиц подобран на СП89; на других документах может потребоваться калибровка. Слабая уверенность логируется WARNING, но не блокирует результат.
 - `test_gemini_full_pdf.py` падает на `import fitz` в изолированной среде coder-воркера (не в рабочем окружении проекта) — окружение, не дефект кода.
@@ -40,7 +40,7 @@ _Last updated: 2026-08-23 — by: orchestrator — найден и заделе�
 
 ## In progress
 
-- **Фикс регрессии `--reg` (t_65899657 coder → t_f159695e reviewer):** `_reg_fill_existing()` должен при отсутствии per-doc `<stem>_reg.yaml` создавать его заново с ПОЛНОЙ записью (`_reg_append_record("documents:\n", doc_key, fields)`), а не читать несуществующий файл; при существовании файла — прежний `_reg_fill_nulls`. Legacy-запись в общем `rag_config.yaml` не трогается.
+- Нет активных задач.
 
 ## Planned / backlog
 
@@ -52,6 +52,7 @@ _Last updated: 2026-08-23 — by: orchestrator — найден и заделе�
 
 ## Recent decisions
 
+- **Регрессия `--reg` исправлена (2026-08-23, коммит `6233341`, review PASS t_f159695e):** `_reg_fill_existing()` при отсутствии per-doc `<stem>_reg.yaml` (legacy-запись только в общем `rag_config.yaml`) материализует ПОЛНУЮ запись через `_reg_append_record("documents:\n", doc_key, fields)` + `safe_write`; при существовании файла — прежний `_reg_fill_nulls`. Живой кейс `so153_molniezashita` закрыт. Тесты: 43 focused passed / 372 passed, 2 pre-existing (`old_snip`).
 - **Backlog п.1-4 закрыт и подтверждён живым прогоном (2026-08-22, коммит `540cf49`):** цепочка t_9a087978 (coder) → t_eb9f7c3d (review, CHANGES_REQUESTED, 6 находок) → t_f6138157 (rework, 6/6 исправлено) → t_8940fa6e (review, PASS, независимая проверка реальным прогоном + full suite). Регрессия: 371 passed / 2 failed (оба pre-existing `old_snip`, было 369/4 на baseline). Пользователь подтвердил живой прогон СП52: все таблицы корректны, дублей заголовков и смещений нет, большие таблицы склеены хорошо, `WARN_N`-таблица при ручной проверке корректна.
 - **Фиксы А.1-А.3/B.1-B.2 для СП52 реализованы, review PASS, коммит закончен (2026-08-22):** цепочка architect (t_de63f7f5, диагностика) → coder (t_9187901b) → review CHANGES_REQUESTED (t_50b6c220: B.1 marker lifecycle, A.3 deviation, T17 red, dead code) → rework (t_1683d444, закрыл 3/4) → orchestrator нашёл остаточный false-stitch в A.3 самостоятельно → rework #2 (t_5fbb2ba0, закрыл A.3 полностью — page-context ветка теперь требует `t["table_num"] == prev_head_num`) → re-review PASS (t_6793a4ae). Итог: A.1 распознаёт подпись «Продолжение/Окончание таблицы N» независимо от падежа/layoutType; A.2 явная подпись перебивает порог `bottom<0.9*page_height`; A.3 номер головы группы переносится по цепочке слияний с явной сверкой (не false-stitch); B.1 детерминированный guard восстанавливает таблицу, если AI потерял строки/колонки, работает независимо от того, удалил ли AI ID-маркер (правило 13 промпта теперь просит СОХРАНИТЬ маркер, Python зачищает его после guard); B.2 нормализует `\(...\)`→`$...$`. Полный набор: 369 passed, 3 pre-existing RAG/reg failures. Живой прогон на реальном документе — за пользователем.
 - **Модели воркеров переведены на provod (2026-08-22):** anymodel.org лежит (HTTP 000) — coder/reviewer на cx-моделях не работали. Решение пользователя: architect=provod/glm-5.2, coder=provod/gpt-5.6-luna, reviewer=provod/glm-5.2; fallback у всех deepseek-v4-pro. Все модели проверены живым запросом /chat/completions.
