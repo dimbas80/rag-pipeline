@@ -125,6 +125,27 @@ import yaml
 log = logging.getLogger("create-md-ya")
 
 
+_RECOGNITION_FAILURE_RE = re.compile(
+    r"(?:"
+    r"не\s+(?:смо?г(?:ла)?|могу|удалось|удаётся|получилось)\s+(?:распознать|прочитать|обработать)"
+    r"|не\s+распознал(?:а)?"
+    r"|не\s+является\s+таблицей"
+    r"|нет\s+таблицы"
+    r"|извините[^\n]*не\s+(?:могу|смог(?:ла)?)"
+    r"|(?:cannot|could\s*not|can't|unable\s+to)\s+(?:recognize|recognise|read|process|identify|parse)"
+    r"|i['\s]?m\s+(?:sorry|unable)"
+    r"|i\s+am\s+(?:sorry|unable)"
+    r"|(?:no\s+table|not\s+a\s+table)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_recognition_failure(content: str | None) -> bool:
+    """Вернуть True для пустого ответа или явного отказа распознать содержимое."""
+    return not content or not content.strip() or _RECOGNITION_FAILURE_RE.search(content) is not None
+
+
 def _model_bbox(value: dict | None) -> BBox:
     vertices = (value or {}).get("vertices", [])
     if not vertices:
@@ -2350,16 +2371,22 @@ def _call_vision_api(
                             "Content-Type": "application/json",
                         },
                     )
+                if resp.status_code in (400, 401, 403):
+                    log.warning(f"  {mdl}: HTTP {resp.status_code}, primary недоступен — переход к fallback")
+                    return None
                 if resp.status_code == 503:
                     log.warning(f"  {mdl}: 503, попытка {attempt + 1}/3")
                     time.sleep(5)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                content = data["choices"][0]["message"]["content"].strip()
+                content = data["choices"][0]["message"].get("content") or ""
                 # Убираем возможные markdown-обёртки
                 content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
                 content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
+                if _is_recognition_failure(content):
+                    log.warning(f"  {mdl}: модель сообщила о невозможности распознать — переход к fallback")
+                    return None
                 return content
             except Exception as e:
                 log.warning(f"  {mdl}: {e}, попытка {attempt + 1}/3")
@@ -3672,15 +3699,21 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
                         json=payload,
                         headers=headers,
                     )
+                if resp.status_code in (400, 401, 403):
+                    log.warning(f"  {prv}/{mdl}: HTTP {resp.status_code}, primary недоступен — переход к fallback")
+                    return None
                 if resp.status_code == 503:
                     log.warning(f"  {prv}/{mdl}: 503, попытка {attempt + 1}/3")
                     time.sleep(5)
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                content = data["choices"][0]["message"]["content"].strip()
+                content = data["choices"][0]["message"].get("content") or ""
                 content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
                 content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
+                if _is_recognition_failure(content):
+                    log.warning(f"  {prv}/{mdl}: модель сообщила о невозможности распознать — переход к fallback")
+                    return None
                 return content
             except Exception as e:
                 log.warning(f"  {prv}/{mdl}: {e}, попытка {attempt + 1}/3")
