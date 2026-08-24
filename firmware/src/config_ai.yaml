@@ -8,17 +8,22 @@ table_vision:
   model: glm-4.5v
   api_key_env: PROVOD_API_KEY
   base_url: https://api.provod.ai/v1
+  #provider: zai-custom
+  #model: glm-4.6v-flash
+  #api_key_env: Z_AI_API_KEY
+  #base_url: https://api.z.ai/api/paas/v4
+  
 
   # Резервный провайдер для vision-распознавания
   fallback:
-    #provider: anymodel
-    #model: gc/gemini-2.5-flash
-    #api_key_env: ANYMODEL_API_KEY
-    #base_url: https://anymodel.org/v1
-    provider: deepseek
-    model: deepseek-v4-flash-vision-exp
-    api_key_env: DEEPSEEK_API_KEY
-    base_url: https://api.deepseek.com/v1
+    provider: anymodel
+    model: glm/glm-4.6v
+    api_key_env: ANYMODEL_API_KEY
+    base_url: https://anymodel.org/v1
+    #provider: deepseek
+    #model: deepseek-v4-flash-vision-exp
+    #api_key_env: DEEPSEEK_API_KEY
+    #base_url: https://api.deepseek.com/v1
 
   # Промпт для vision-модели (картинка + промпт)
   prompt: |
@@ -45,7 +50,7 @@ table_vision:
 ai_postprocess:
   # Провайдер по умолчанию: deepseek или provod
   provider: deepseek
-  model: deepseek-v4-pro
+  model: deepseek-v4-pro  
   # Имя переменной окружения с API-ключом
   api_key_env: DEEPSEEK_API_KEY
   #Базовый URL API (OpenAI-совместимый)
@@ -57,10 +62,10 @@ ai_postprocess:
 
   # Резервный провайдер (если primary не отвечает или ключ не задан)
   fallback:
-    provider: anymodel
-    model: glm/glm-5.2
-    api_key_env: ANYMODEL_API_KEY
-    base_url: https://anymodel.org/v1
+        provider: provod
+        model: deepseek-v4-pro
+        api_key_env: PROVOD_API_KEY
+        base_url: https://api.provod.ai/v1
 
   # Объединённый промпт: постобработка + сверка таблиц с vision-эталоном.
   # Правила 1–13 — постобработка, 14–20 — сверка таблиц.
