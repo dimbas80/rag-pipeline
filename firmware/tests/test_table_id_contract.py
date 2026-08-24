@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-from pipeline import (  # noqa: E402
+from create_markdown import (  # noqa: E402
     _merge_by_component_images,
     _stitch_continuation_tables,
     _table_id_sort_key,

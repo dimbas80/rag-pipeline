@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 
 @pytest.fixture
@@ -46,19 +46,19 @@ def _run_process_file(fake_env, config, use_ai=True,
         if order is not None:
             order.append(name)
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md",
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md",
                return_value=(md_text, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.extract_table_images", return_value=[]), \
-         patch("pipeline.recognize_tables_vision", return_value=0), \
-         patch("pipeline.run_script_postprocess",
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.extract_table_images", return_value=[]), \
+         patch("create_markdown.recognize_tables_vision", return_value=0), \
+         patch("create_markdown.run_script_postprocess",
                side_effect=lambda md, img, **kw: md), \
-         patch("pipeline.ai_postprocess",
+         patch("create_markdown.ai_postprocess",
                side_effect=lambda md, cfg, label: (record("ai_postprocess"), md)[1]), \
-         patch("pipeline._call_ai_api",
+         patch("create_markdown._call_ai_api",
                side_effect=lambda *a, **k: (record("gap_filling"), "GAP RESULT")[1]) as mock_call:
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             fake_env["pdf"],
             use_ai,
             config,
@@ -131,7 +131,7 @@ def test_gap_filling_single_call_context(fake_env):
 def test_gap_filling_chunks_large_input(fake_env):
     """Большой gap_input (> AI_MAX_CHARS) разбивается на чанки, результаты склеиваются."""
     big_md = "\n\n".join(f"Параграф {i} " + "x" * 500 for i in range(200))
-    assert len(big_md) > pipeline.AI_MAX_CHARS
+    assert len(big_md) > create_markdown.AI_MAX_CHARS
     cfg = {"ai_table": {"prompt": "p"}}
     ok, mock_call = _run_process_file(fake_env, cfg, md_text=big_md)
     assert ok is True
@@ -141,7 +141,7 @@ def test_gap_filling_chunks_large_input(fake_env):
     all_chunks = ""
     for i, call in enumerate(mock_call.call_args_list):
         assert call.args[2] == f"input [gap ч.{i + 1}]"
-        assert len(call.args[0]) <= pipeline.AI_MAX_CHARS
+        assert len(call.args[0]) <= create_markdown.AI_MAX_CHARS
         all_chunks += call.args[0]
     # Содержимое не теряется: все параграфы и заголовки секций есть в чанках
     assert "=== Markdown-файл ===" in all_chunks
@@ -170,15 +170,15 @@ def test_gap_filling_chunk_partial_results(fake_env):
 
     pages = [{"result": {"textAnnotation": {"width": 10, "height": 10,
                                              "blocks": [], "tables": [], "pictures": []}}}]
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(big_md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.extract_table_images", return_value=[]), \
-         patch("pipeline.recognize_tables_vision", return_value=0), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda md, img, **kw: md), \
-         patch("pipeline.ai_postprocess", side_effect=lambda md, cfg, label: md), \
-         patch("pipeline._call_ai_api", side_effect=fake_gap) as mock_call:
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(big_md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.extract_table_images", return_value=[]), \
+         patch("create_markdown.recognize_tables_vision", return_value=0), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda md, img, **kw: md), \
+         patch("create_markdown.ai_postprocess", side_effect=lambda md, cfg, label: md), \
+         patch("create_markdown._call_ai_api", side_effect=fake_gap) as mock_call:
+        ok = create_markdown.process_file(
             fake_env["pdf"], True,
             {"ai_table": {"prompt": "p"}},
             api_key="key", folder_id="folder",
@@ -212,15 +212,15 @@ def test_gap_filling_output_feeds_ai_postprocess(fake_env):
 
     pages = [{"result": {"textAnnotation": {"width": 10, "height": 10,
                                              "blocks": [], "tables": [], "pictures": []}}}]
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=("# md\n", [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.extract_table_images", return_value=[]), \
-         patch("pipeline.recognize_tables_vision", return_value=0), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda md, img, **kw: md), \
-         patch("pipeline.ai_postprocess", side_effect=fake_post), \
-         patch("pipeline._call_ai_api", return_value="GAP RESULT"):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=("# md\n", [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.extract_table_images", return_value=[]), \
+         patch("create_markdown.recognize_tables_vision", return_value=0), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda md, img, **kw: md), \
+         patch("create_markdown.ai_postprocess", side_effect=fake_post), \
+         patch("create_markdown._call_ai_api", return_value="GAP RESULT"):
+        ok = create_markdown.process_file(
             fake_env["pdf"], True,
             {"ai_table": {"prompt": "p"}},
             api_key="key", folder_id="folder",

@@ -1,7 +1,7 @@
 import os, sys
 from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from pipeline import BBox, Cell, Table, Page, Document, stitch_tables, geometry_says_same_table, populate_component_images, count_columns
+from create_markdown import BBox, Cell, Table, Page, Document, stitch_tables, geometry_says_same_table, populate_component_images, count_columns
 
 
 def _doc(tables):

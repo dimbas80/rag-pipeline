@@ -11,13 +11,13 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from pipeline import (
+from create_markdown import (
     extract_table_images,
     _call_vision_api,
     recognize_tables_vision,
     process_file,
 )
-import pipeline
+import create_markdown
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -93,7 +93,7 @@ def temp_dirs():
 
 def test_cli_flag_ai_table_removed():
     """Флаг --ai-table удалён: парсер его отвергает, --ai парсится."""
-    from pipeline import parse_args
+    from create_markdown import parse_args
 
     # --ai-table больше не существует
     with pytest.raises(SystemExit):
@@ -211,7 +211,7 @@ def test_call_vision_api_no_key():
     assert result is None
 
 
-@patch("pipeline.httpx.Client")
+@patch("create_markdown.httpx.Client")
 def test_call_vision_api_success(mock_client):
     """Успешный ответ от vision API."""
     mock_resp = MagicMock()
@@ -233,7 +233,7 @@ def test_call_vision_api_success(mock_client):
     assert "1" in result
 
 
-@patch("pipeline.httpx.Client")
+@patch("create_markdown.httpx.Client")
 def test_call_vision_api_retry(mock_client):
     """503 → retry → success."""
     mock_resp_503 = MagicMock()
@@ -317,7 +317,7 @@ def test_recognize_tables_vision_missing_file(temp_dirs):
     assert result == 0
 
 
-@patch("pipeline._call_vision_api")
+@patch("create_markdown._call_vision_api")
 def test_recognize_tables_vision_writes_id_marker(mock_vision, temp_dirs):
     """table_N.md начинается с ID-маркера <!-- id --> первой строкой."""
     img_dir, tmp_dir = temp_dirs
@@ -389,13 +389,13 @@ def test_process_file_ai_prompt_fallback_to_table_vision(tmp_path):
         captured["prompt"] = cfg.get("prompt")
         return md
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=_ai_pages()), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.extract_table_images", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m), \
-         patch("pipeline._call_ai_api", side_effect=_fake_call_ai):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=_ai_pages()), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.extract_table_images", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m), \
+         patch("create_markdown._call_ai_api", side_effect=_fake_call_ai):
+        ok = create_markdown.process_file(
             str(pdf), use_ai=True, config=config,
             api_key="key", folder_id="folder",
             output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -412,13 +412,13 @@ def test_process_file_ai_prompt_missing_exits(tmp_path):
     md = "## 1. ТЕКСТ\nТекст.\n"
     config = {"ai_postprocess": {"api_key_env": "DEEPSEEK_API_KEY"}}
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=_ai_pages()), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.extract_table_images", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+    with patch("create_markdown.send_to_yandex_ocr", return_value=_ai_pages()), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.extract_table_images", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
         with pytest.raises(SystemExit):
-            pipeline.process_file(
+            create_markdown.process_file(
                 str(pdf), use_ai=True, config=config,
                 api_key="key", folder_id="folder",
                 output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),

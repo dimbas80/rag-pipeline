@@ -3,7 +3,7 @@
 **Статус:** спроектировано (этап проектирования, реализация — отдельная задача)
 **Задача:** t_d778c08b
 **Связанные:** ADR-010 (RAG v2), `docs/architecture/rag-v2-architecture.md`
-**Файлы:** `firmware/src/pipeline.py`, `firmware/src/rag_config.yaml`, `firmware/src/config_ai.yaml`
+**Файлы:** `firmware/src/create_markdown.py`, `firmware/src/rag_config.yaml`, `firmware/src/config_ai.yaml`
 
 ---
 
@@ -361,7 +361,7 @@ Enter/Y/y → запись (§6); n/иное → «Регистрация отм
 | Введённое значение содержит `"`/`\` | экранирование при генерации YAML (§6.3) |
 | `--ai` без `--reg` | код-путь не меняется вообще (инвариант) |
 
-## 10. Интеграция в pipeline.py (для кодера)
+## 10. Интеграция в create_markdown.py (для кодера)
 
 Новые функции (раздел рядом с RAG-секцией, ~после `_write_rag_jsonl`):
 
@@ -396,7 +396,7 @@ def _reg_fill_nulls(text: str, slug: str, fields: dict) -> str:  # null-fill + �
 ## 11. Тест-план (firmware/tests/test_reg_flag.py)
 
 Вход по образцу существующих тестов: `sys.path.insert(0, .../src)`,
-`import pipeline`; интерактивность мокать `monkeypatch.setattr("builtins.input", ...)`;
+`import create_markdown`; интерактивность мокать `monkeypatch.setattr("builtins.input", ...)`;
 LLM мокать патчем `_call_ai_api`; TTY — патчем `sys.stdin.isatty`.
 
 1. **Slug:** префикс-карта; первая группа цифр; транслит; коллизия → `_2`;

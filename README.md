@@ -4,7 +4,7 @@
 
 ## Назначение
 
-Скрипт `pipeline.py` распознаёт текст, таблицы, формулы и изображения из документов, собирает структурированный Markdown и улучшает результат с помощью AI (DeepSeek / Gemini через Provod). Таблицы проходят двойную обработку: OCR из текстового слоя + vision-распознавание из картинок, после чего AI сверяет обе версии по ID-маркерам и выдаёт исправленную таблицу на исходном месте в тексте.
+Скрипт `create_markdown.py` распознаёт текст, таблицы, формулы и изображения из документов, собирает структурированный Markdown и улучшает результат с помощью AI (DeepSeek / Gemini через Provod). Таблицы проходят двойную обработку: OCR из текстового слоя + vision-распознавание из картинок, после чего AI сверяет обе версии по ID-маркерам и выдаёт исправленную таблицу на исходном месте в тексте.
 
 ## Быстрый старт
 
@@ -15,13 +15,13 @@ cd firmware/src
 pip install httpx pyyaml pymupdf beautifulsoup4
 
 # Базовое распознавание (без AI)
-python3 pipeline.py -i document.pdf
+python3 create_markdown.py -i document.pdf
 
 # Полный цикл с AI
-python3 pipeline.py -i document.pdf --ai
+python3 create_markdown.py -i document.pdf --ai
 
 # Только AI-постобработка готового .md (без OCR)
-python3 pipeline.py -i result.md --ai
+python3 create_markdown.py -i result.md --ai
 ```
 
 ## Опции командной строки
@@ -120,9 +120,9 @@ DOCX → PDF (LibreOffice)
 ### Использование
 
 ```bash
-python3 pipeline.py -i file.pdf --rag                # только JSONL
-python3 pipeline.py -i file.pdf --ai --rag           # AI + JSONL
-python3 pipeline.py -i file.pdf --rag --rag-config my_rag.yaml
+python3 create_markdown.py -i file.pdf --rag                # только JSONL
+python3 create_markdown.py -i file.pdf --ai --rag           # AI + JSONL
+python3 create_markdown.py -i file.pdf --rag --rag-config my_rag.yaml
 ```
 
 ### Формат выхода

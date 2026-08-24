@@ -83,9 +83,9 @@
 
 **Rationale:** Структура уже специфицирована в `docs/software/rag_config_spec.yaml`. Соответствует подходу `config_ai.yaml` (ADR-5).
 
-### ADR-9e: Интеграция в pipeline.py как секция 12
+### ADR-9e: Интеграция в create_markdown.py как секция 12
 
-**Решение:** Добавить секцию `12. RAG JSONL Converter` в `pipeline.py` (~120 строк). Активируется флагом `--rag`.
+**Решение:** Добавить секцию `12. RAG JSONL Converter` в `create_markdown.py` (~120 строк). Активируется флагом `--rag`.
 
 **Позиция в pipeline:**
 ```
@@ -119,5 +119,5 @@
 ## Последствия
 
 - **Положительные:** RAG-индексация интегрирована в pipeline, JSONL генерируется атомарно с конвертацией MD. Повторное использование `_extract_headings_from_json()` исключает дублирование.
-- **Отрицательные:** `pipeline.py` вырастет ещё на ~120 строк (до ~3170). Зависимость от `_extract_headings_from_json()` означает, что RAG требует наличия Yandex JSON (pages).
+- **Отрицательные:** `create_markdown.py` вырастет ещё на ~120 строк (до ~3170). Зависимость от `_extract_headings_from_json()` означает, что RAG требует наличия Yandex JSON (pages).
 - **Риски:** Если Yandex JSON недоступен (режим .md + --rag) — `source.page` будет null, но JSONL всё равно генерируется. Regexp для извлечения номеров chapter/section/clause из текста заголовка должен быть устойчив к нестандартным форматам нумерации (римские цифры, буквы).

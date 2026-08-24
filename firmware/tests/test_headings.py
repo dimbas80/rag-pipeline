@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 # Путь к тестовому JSON ГОСТ СО153-34.21.122-2003 (29 стр., 1022 блока)
 TEST_JSON = "/mnt/sdb/!База_ГОСТ/tmp/СО153-34_21_122-2003 Молниезащита/yandex_result.json"
@@ -63,7 +63,7 @@ def _page(blocks, width=2481, height=3508):
 def test_extract_headings_simple_heading():
     """Правило 1+5: «3. ЗАЩИТА...» → level 1, number 3."""
     pages = [_page([_block("3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ", x=100, y=100)])]
-    headings = pipeline._extract_headings_from_json(pages)
+    headings = create_markdown._extract_headings_from_json(pages)
     assert len(headings) == 1
     h = headings[0]
     assert h["level"] == 1
@@ -76,7 +76,7 @@ def test_extract_headings_simple_heading():
 def test_extract_headings_deep_levels():
     """Правило 5: глубина номера → уровень (3.2.1.1 → level 4)."""
     pages = [_page([_block("3.2.1.1. Общие соображения", x=200, y=100)])]
-    headings = pipeline._extract_headings_from_json(pages)
+    headings = create_markdown._extract_headings_from_json(pages)
     assert len(headings) == 1
     h = headings[0]
     assert h["number"] == "3.2.1.1"
@@ -87,13 +87,13 @@ def test_extract_headings_deep_levels():
 def test_extract_headings_regex_number_requires_dot():
     """Правило 1b: «200 кА» без точки — однобуквенный номер > 2 цифр, НЕ заголовок."""
     pages = [_page([_block("200 кА", x=100, y=100)])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_regex_number_with_trailing_dot():
     """Правило 1: «3 ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ» — точка после номера не обязательна."""
     pages = [_page([_block("3 ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ", x=100, y=100)])]
-    found = pipeline._extract_headings_from_json(pages)
+    found = create_markdown._extract_headings_from_json(pages)
     assert len(found) == 1
     assert found[0]["number"] == "3"
     assert found[0]["text"] == "ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ"
@@ -103,25 +103,25 @@ def test_extract_headings_length_rule():
     """Правило 2: длинный текст (>= 100 символов) — НЕ заголовок."""
     long_text = "1. " + "очень длинный заголовок " * 10  # ~210 символов
     pages = [_page([_block(long_text, x=100, y=100)])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_word_count_rule():
     """Правило 2: > 10 слов — НЕ заголовок."""
     many_words = "1. слово " * 12  # 24 слова
     pages = [_page([_block(many_words, x=100, y=100)])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_rel_x_rule():
     """Правило 3: x_left / width >= 0.50 — НЕ заголовок (центр/право)."""
     # Страница шириной 1000, блок на x=600 → rel_x = 0.60
     pages = [_page([_block("3. ЗАЩИТА", x=600, y=100)], width=1000)]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
     # x=450 → rel_x = 0.45 < 0.50 → заголовок
     pages = [_page([_block("3. ЗАЩИТА", x=450, y=100)], width=1000)]
-    assert len(pipeline._extract_headings_from_json(pages)) == 1
+    assert len(create_markdown._extract_headings_from_json(pages)) == 1
 
 
 def test_extract_headings_one_block_per_line_rule():
@@ -130,7 +130,7 @@ def test_extract_headings_one_block_per_line_rule():
         _block("1. Входящие линии", x=100, y=200),
         _block("2. Антенны", x=400, y=210),  # в пределах 15px по Y
     ])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_y_tolerance_boundary():
@@ -139,20 +139,20 @@ def test_extract_headings_y_tolerance_boundary():
         _block("1. Один", x=100, y=200),
         _block("2. Два", x=100, y=250),  # разница 50px > 15px
     ])]
-    headings = pipeline._extract_headings_from_json(pages)
+    headings = create_markdown._extract_headings_from_json(pages)
     assert len(headings) == 2
 
 
 def test_extract_headings_empty_pages():
     """pages=None или [] → []."""
-    assert pipeline._extract_headings_from_json(None) == []
-    assert pipeline._extract_headings_from_json([]) == []
+    assert create_markdown._extract_headings_from_json(None) == []
+    assert create_markdown._extract_headings_from_json([]) == []
 
 
 def test_extract_headings_no_blocks():
     """Страница без blocks[] → []."""
     pages = [_page([])]
-    assert pipeline._extract_headings_from_json(pages) == []
+    assert create_markdown._extract_headings_from_json(pages) == []
 
 
 def test_extract_headings_real_json_finds_68_plus():
@@ -161,7 +161,7 @@ def test_extract_headings_real_json_finds_68_plus():
         pytest.skip(f"Тестовый JSON не найден: {TEST_JSON}")
     with open(TEST_JSON, encoding="utf-8") as f:
         pages = json.load(f)
-    headings = pipeline._extract_headings_from_json(pages)
+    headings = create_markdown._extract_headings_from_json(pages)
     assert len(headings) >= 68
     # Глубина до 4 уровней
     assert max(h["level"] for h in headings) >= 4
@@ -176,7 +176,7 @@ def test_apply_headings_basic():
     """**3. ЗАЩИТА** → ## 3. ЗАЩИТА (level 1 → ##)."""
     md = "Текст до\n\n**3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ**\n\nТекст после"
     headings = [{"level": 1, "full_text": "3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ"}]
-    result = pipeline._apply_headings_to_md(md, headings)
+    result = create_markdown._apply_headings_to_md(md, headings)
     assert "## 3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ" in result
     assert "**3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ**" not in result
 
@@ -195,7 +195,7 @@ def test_apply_headings_level_mapping():
         {"level": 3, "full_text": "3.2.1. Молниеприемники"},
         {"level": 4, "full_text": "3.2.1.1. Общие соображения"},
     ]
-    result = pipeline._apply_headings_to_md(md, headings)
+    result = create_markdown._apply_headings_to_md(md, headings)
     assert "## 1. ВВЕДЕНИЕ" in result
     assert "### 3.2. Внешняя молниезащитная система" in result
     assert "#### 3.2.1. Молниеприемники" in result
@@ -209,7 +209,7 @@ def test_apply_headings_count_one_keeps_duplicates():
         "Раздел: **3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ**\n"
     )
     headings = [{"level": 1, "full_text": "3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ"}]
-    result = pipeline._apply_headings_to_md(md, headings)
+    result = create_markdown._apply_headings_to_md(md, headings)
     # Первое вхождение (оглавление) заменено
     assert "## 3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ" in result
     # Второе (в тексте) осталось жирным
@@ -220,22 +220,22 @@ def test_apply_headings_special_chars_escaped():
     """full_text со спецсимволами — re.escape() защищает."""
     md = "**3.2. Формула a+b (важно!)**\n"
     headings = [{"level": 2, "full_text": "3.2. Формула a+b (важно!)"}]
-    result = pipeline._apply_headings_to_md(md, headings)
+    result = create_markdown._apply_headings_to_md(md, headings)
     assert "### 3.2. Формула a+b (важно!)" in result
 
 
 def test_apply_headings_empty_list():
     """headings пуст → md без изменений."""
     md = "**3. ЗАЩИТА**\n"
-    assert pipeline._apply_headings_to_md(md, []) == md
-    assert pipeline._apply_headings_to_md(md, None) == md
+    assert create_markdown._apply_headings_to_md(md, []) == md
+    assert create_markdown._apply_headings_to_md(md, None) == md
 
 
 def test_apply_headings_no_match_no_change():
     """full_text не найден в md — текст не меняется."""
     md = "Просто текст\n"
     headings = [{"level": 1, "full_text": "9. НЕТ ТАКОГО ЗАГОЛОВКА"}]
-    assert pipeline._apply_headings_to_md(md, headings) == md
+    assert create_markdown._apply_headings_to_md(md, headings) == md
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -266,11 +266,11 @@ def test_process_file_applies_headings(tmp_path):
     out_base = tmp_path / "out"
     tmp_base = tmp_path / "tmp"
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", side_effect=fake_parse), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=fake_postprocess):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", side_effect=fake_parse), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=fake_postprocess):
+        ok = create_markdown.process_file(
             str(pdf), use_ai=False, config={},
             api_key="key", folder_id="folder",
             output_base=str(out_base), tmp_base=str(tmp_base),
@@ -302,11 +302,11 @@ def test_process_file_no_headings_md_unchanged(tmp_path):
     out_base = tmp_path / "out"
     tmp_base = tmp_path / "tmp"
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", side_effect=fake_parse), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=fake_postprocess):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", side_effect=fake_parse), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=fake_postprocess):
+        ok = create_markdown.process_file(
             str(pdf), use_ai=False, config={},
             api_key="key", folder_id="folder",
             output_base=str(out_base), tmp_base=str(tmp_base),

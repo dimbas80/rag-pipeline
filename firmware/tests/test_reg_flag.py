@@ -31,7 +31,7 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
 
@@ -44,13 +44,13 @@ RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src
 @pytest.fixture()
 def tty(monkeypatch):
     """stdin.isatty() → True (интерактивный терминал)."""
-    monkeypatch.setattr(pipeline.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(create_markdown.sys.stdin, "isatty", lambda: True)
 
 
 @pytest.fixture()
 def non_tty(monkeypatch):
     """stdin.isatty() → False (cron/бот/</dev/null)."""
-    monkeypatch.setattr(pipeline.sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(create_markdown.sys.stdin, "isatty", lambda: False)
 
 
 def queue_input(monkeypatch, answers):
@@ -134,38 +134,38 @@ NEW_RECORD_QUEUE = [
 class TestSlug:
     def test_prefix_map_uppercase(self):
         """Префикс — ВЕРХНИЙ регистр (правка Orchestrator: §5.1 п.4)."""
-        assert pipeline._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", set()) == "GOST_18410_kabel"
-        assert pipeline._reg_make_slug("СП 89.13330.2016", "СП", "Котельные", set()) == "SP_89_kotelnye"
-        assert pipeline._reg_make_slug("СО 153-34.21.122-2003", "СО", "Молниезащита", set()) == "SO_153_molniezashita"
-        assert pipeline._reg_make_slug("СНиП 2.04.05-86", "СНиП", "Отопление", set()) == "SNIP_2_otoplenie"
-        assert pipeline._reg_make_slug("ПУЭ 7", "ПУЭ", None, set()) == "PUE_7"
+        assert create_markdown._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", set()) == "GOST_18410_kabel"
+        assert create_markdown._reg_make_slug("СП 89.13330.2016", "СП", "Котельные", set()) == "SP_89_kotelnye"
+        assert create_markdown._reg_make_slug("СО 153-34.21.122-2003", "СО", "Молниезащита", set()) == "SO_153_molniezashita"
+        assert create_markdown._reg_make_slug("СНиП 2.04.05-86", "СНиП", "Отопление", set()) == "SNIP_2_otoplenie"
+        assert create_markdown._reg_make_slug("ПУЭ 7", "ПУЭ", None, set()) == "PUE_7"
 
     def test_first_digit_group(self):
         """Номер — первая группа цифр document_id (§5.1 п.2)."""
-        assert pipeline._reg_make_slug("ГОСТ 31996—2012", "ГОСТ", "Кабели", set()) == "GOST_31996_kabel"
-        assert pipeline._reg_make_slug("ГОСТ 18410—73", "ГОСТ", None, set()) == "GOST_18410"
+        assert create_markdown._reg_make_slug("ГОСТ 31996—2012", "ГОСТ", "Кабели", set()) == "GOST_31996_kabel"
+        assert create_markdown._reg_make_slug("ГОСТ 18410—73", "ГОСТ", None, set()) == "GOST_18410"
 
     def test_no_number_omits_part(self):
         """«ПУЭ» без номера → PUE (§5.1 п.2)."""
-        assert pipeline._reg_make_slug("ПУЭ", "ПУЭ", None, set()) == "PUE"
+        assert create_markdown._reg_make_slug("ПУЭ", "ПУЭ", None, set()) == "PUE"
 
     def test_translit_contract_examples(self):
         """§5.1 п.3: Кабели→kabel, Молниезащита→molniezashita."""
-        assert pipeline._reg_translit("Кабели") == "kabel"
-        assert pipeline._reg_translit("Молниезащита") == "molniezashita"
-        assert pipeline._reg_translit("Котельные") == "kotelnye"
-        assert pipeline._reg_translit("Отопление") == "otoplenie"
+        assert create_markdown._reg_translit("Кабели") == "kabel"
+        assert create_markdown._reg_translit("Молниезащита") == "molniezashita"
+        assert create_markdown._reg_translit("Котельные") == "kotelnye"
+        assert create_markdown._reg_translit("Отопление") == "otoplenie"
 
     def test_unknown_type_defaults_to_doc(self):
         """Тип не распознан → префикс doc (§5.1 п.1)."""
-        assert pipeline._reg_make_slug("ФО 12-345", None, "Кабели", set()) == "doc_12_kabel"
+        assert create_markdown._reg_make_slug("ФО 12-345", None, "Кабели", set()) == "doc_12_kabel"
 
     def test_collision_suffix(self):
         """Коллизия с существующим ключом → _2, _3 (§5.1 п.5)."""
         existing = {"GOST_18410_kabel"}
-        assert pipeline._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", existing) == "GOST_18410_kabel_2"
+        assert create_markdown._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", existing) == "GOST_18410_kabel_2"
         existing2 = {"GOST_18410_kabel", "GOST_18410_kabel_2"}
-        assert pipeline._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", existing2) == "GOST_18410_kabel_3"
+        assert create_markdown._reg_make_slug("ГОСТ 18410—73", "ГОСТ", "Кабели", existing2) == "GOST_18410_kabel_3"
 
     def test_manual_slug_invalid_chars_reprompt(self, monkeypatch):
         """Ручной slug с недопустимыми символами → переспрос (§5.1)."""
@@ -176,7 +176,7 @@ class TestSlug:
             "bad-slug!",  # не [A-Za-z0-9_]+ → переспрос
             "good_slug",
         ])
-        result = pipeline._reg_interactive_fill(extracted, "x.pdf", set(), None, None)
+        result = create_markdown._reg_interactive_fill(extracted, "x.pdf", set(), None, None)
         assert result is not None
         assert result[0] == "good_slug"
 
@@ -189,7 +189,7 @@ class TestSlug:
             "gost_18410_kabel",  # коллизия (регистр не важен)
             "my_slug",
         ])
-        result = pipeline._reg_interactive_fill(
+        result = create_markdown._reg_interactive_fill(
             extracted, "x.pdf", {"GOST_18410_kabel"}, None, None,
         )
         assert result is not None
@@ -203,21 +203,21 @@ class TestSlug:
 
 class TestEdition:
     def test_two_digit_19xx(self):
-        assert pipeline._reg_edition_from_id("ГОСТ 18410—73") == "1973"
-        assert pipeline._reg_edition_from_id("СНиП 2.04.05-86") == "1986"
+        assert create_markdown._reg_edition_from_id("ГОСТ 18410—73") == "1973"
+        assert create_markdown._reg_edition_from_id("СНиП 2.04.05-86") == "1986"
 
     def test_two_digit_20xx(self):
-        assert pipeline._reg_edition_from_id("ГОСТ 123—16") == "2016"
+        assert create_markdown._reg_edition_from_id("ГОСТ 123—16") == "2016"
 
     def test_four_digit(self):
-        assert pipeline._reg_edition_from_id("СП 89.13330.2016") == "2016"
-        assert pipeline._reg_edition_from_id("СО 153-34.21.122-2003") == "2003"
+        assert create_markdown._reg_edition_from_id("СП 89.13330.2016") == "2016"
+        assert create_markdown._reg_edition_from_id("СО 153-34.21.122-2003") == "2003"
 
     def test_garbage(self):
-        assert pipeline._reg_edition_from_id("ПУЭ 7") is None
-        assert pipeline._reg_edition_from_id("мусор") is None
-        assert pipeline._reg_edition_from_id("") is None
-        assert pipeline._reg_edition_from_id(None) is None
+        assert create_markdown._reg_edition_from_id("ПУЭ 7") is None
+        assert create_markdown._reg_edition_from_id("мусор") is None
+        assert create_markdown._reg_edition_from_id("") is None
+        assert create_markdown._reg_edition_from_id(None) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -229,7 +229,7 @@ class TestExtraction:
     def test_head_with_em_dash_and_caps_title(self):
         """Обозначение с —, КАПС-заголовок."""
         head = "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ\nГОСТ 18410—73\n"
-        r = pipeline._reg_extract_fields(head, None)
+        r = create_markdown._reg_extract_fields(head, None)
         assert r["document_id"] == "ГОСТ 18410—73"
         assert r["document_type"] == "ГОСТ"
         assert r["edition"] == "1973"
@@ -238,7 +238,7 @@ class TestExtraction:
     def test_head_with_hash_title(self):
         """#-заголовок берётся как title."""
         head = "# Котельные установки\n\nСП 89.13330.2016\n"
-        r = pipeline._reg_extract_fields(head, None)
+        r = create_markdown._reg_extract_fields(head, None)
         assert r["document_id"] == "СП 89.13330.2016"
         assert r["document_type"] == "СП"
         assert r["title"] == "Котельные установки"
@@ -246,7 +246,7 @@ class TestExtraction:
     def test_head_with_en_dash_snip(self):
         """Обозначение с – (en dash)."""
         head = "СНиП 2.04.05–86\nОтопление, вентиляция и кондиционирование\n"
-        r = pipeline._reg_extract_fields(head, None)
+        r = create_markdown._reg_extract_fields(head, None)
         assert r["document_id"] == "СНиП 2.04.05–86"
         assert r["document_type"] == "СНиП"
         assert r["edition"] == "1986"
@@ -254,7 +254,7 @@ class TestExtraction:
     def test_head_with_minus_dash(self):
         """Обозначение с обычным дефисом."""
         head = "СО 153-34.21.122-2003\nИнструкция по молниезащите\n"
-        r = pipeline._reg_extract_fields(head, None)
+        r = create_markdown._reg_extract_fields(head, None)
         assert r["document_id"] == "СО 153-34.21.122-2003"
         assert r["document_type"] == "СО"
         assert r["edition"] == "2003"
@@ -262,21 +262,21 @@ class TestExtraction:
     def test_no_designation(self):
         """Обозначение не извлеклось → document_id None, без падения."""
         head = "# Просто документ\nТекст без обозначений\n"
-        r = pipeline._reg_extract_fields(head, None)
+        r = create_markdown._reg_extract_fields(head, None)
         assert r["document_id"] is None
         assert r["title"] == "Просто документ"
 
     def test_llm_valid_json(self, monkeypatch):
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         with patch(
-            "pipeline._call_ai_api",
+            "create_markdown._call_ai_api",
             return_value=(
                 '{"document_id": "ГОСТ 18410—73", '
                 '"title": "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ", '
                 '"domain_hint": "Кабели"}'
             ),
         ):
-            r = pipeline._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
         assert r["document_id"] == "ГОСТ 18410—73"
         assert r["title"] == "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ"
         assert r["domain_hint"] == "Кабели"
@@ -285,24 +285,24 @@ class TestExtraction:
         """JSON в ```json fences — парсится (re.search {..})."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         with patch(
-            "pipeline._call_ai_api",
+            "create_markdown._call_ai_api",
             return_value='```json\n{"document_id": "ГОСТ 18410—73"}\n```',
         ):
-            r = pipeline._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
         assert r["document_id"] == "ГОСТ 18410—73"
 
     def test_llm_broken_falls_back_to_regex(self, monkeypatch):
         """LLM вернул не-JSON → regex-слой."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
-        with patch("pipeline._call_ai_api", return_value="не понял"):
-            r = pipeline._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+        with patch("create_markdown._call_ai_api", return_value="не понял"):
+            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
         assert r["document_id"] == "ГОСТ 18410—73"
 
     def test_llm_override_recomputes_edition(self, monkeypatch):
         """LLM заменил document_id → edition пересчитан по новому id."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
-        with patch("pipeline._call_ai_api", return_value='{"document_id": "ГОСТ 839—80"}'):
-            r = pipeline._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+        with patch("create_markdown._call_ai_api", return_value='{"document_id": "ГОСТ 839—80"}'):
+            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
         assert r["document_id"] == "ГОСТ 839—80"
         assert r["edition"] == "1980"
 
@@ -315,8 +315,8 @@ class TestExtraction:
             raise SystemExit(1)
 
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
-        with patch("pipeline._call_ai_api", side_effect=boom):
-            r = pipeline._reg_extract_fields(head, {"reg_extract": {"prompt": ""}})
+        with patch("create_markdown._call_ai_api", side_effect=boom):
+            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": ""}})
         assert called == []
         assert r["document_id"] == "ГОСТ 18410—73"
 
@@ -324,10 +324,10 @@ class TestExtraction:
         """Секции reg_extract нет → regex-слой, без вызова API."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         with patch(
-            "pipeline._call_ai_api",
+            "create_markdown._call_ai_api",
             side_effect=AssertionError("не должен вызываться"),
         ):
-            r = pipeline._reg_extract_fields(head, {})
+            r = create_markdown._reg_extract_fields(head, {})
         assert r["document_id"] == "ГОСТ 18410—73"
 
 
@@ -341,7 +341,7 @@ class TestWrite:
         """Append на копии настоящего rag_config.yaml: safe_load равен ожиданию,
         исходные записи/комментарии не изменены (байтовый префикс)."""
         text = real_config_text()
-        new_text = pipeline._reg_append_record(text, "GOST_839_kabel", base_fields())
+        new_text = create_markdown._reg_append_record(text, "GOST_839_kabel", base_fields())
         assert new_text is not None
         parsed = yaml.safe_load(new_text)
         doc = parsed["documents"]["GOST_839_kabel"]
@@ -359,7 +359,7 @@ class TestWrite:
 
     def test_append_block_format(self):
         """§6.3: 2 пробела slug, 4 — поля, двойные кавычки, status без кавычек."""
-        block = pipeline._reg_render_record_block("GOST_839_kabel", base_fields())
+        block = create_markdown._reg_render_record_block("GOST_839_kabel", base_fields())
         assert "  # ── ГОСТ 839—80 — добавлено --reg" in block
         assert "  GOST_839_kabel:" in block
         assert '    document_id: "ГОСТ 839—80"' in block
@@ -373,14 +373,14 @@ class TestWrite:
         """Гейт: дубль slug → None, файл не изменён (§6.1)."""
         text = real_config_text()
         cfg = write_config(tmp_path, text)
-        new_text = pipeline._reg_append_record(text, "GOST_18410", base_fields())
+        new_text = create_markdown._reg_append_record(text, "GOST_18410", base_fields())
         assert new_text is None
         assert cfg.read_text(encoding="utf-8") == text
 
     def test_null_fill_changes_only_target_fields(self):
         """null-fill меняет только строки целевой записи (§6.1)."""
         text = real_config_text()
-        new_text = pipeline._reg_fill_nulls(
+        new_text = create_markdown._reg_fill_nulls(
             text, "so153_molniezashita",
             {"document_type": "СО", "domain": "Молниезащита"},
         )
@@ -403,7 +403,7 @@ class TestWrite:
     def test_yaml_escaping(self):
         """Кавычки и бэкслеш в значениях экранируются (§6.3)."""
         f = base_fields(title='Скажи "привет" \\ ок')
-        new_text = pipeline._reg_append_record(real_config_text(), "GOST_esc_test", f)
+        new_text = create_markdown._reg_append_record(real_config_text(), "GOST_esc_test", f)
         assert new_text is not None
         parsed = yaml.safe_load(new_text)
         assert parsed["documents"]["GOST_esc_test"]["title"] == 'Скажи "привет" \\ ок'
@@ -421,12 +421,12 @@ class TestIdempotence:
         """Legacy-only incomplete record is copied before null-fill is written."""
         global_cfg = write_config(tmp_path, real_config_text())
         per_doc_cfg = tmp_path / "so153_molniezashita_reg.yaml"
-        rag = pipeline.load_rag_config(global_cfg)
+        rag = create_markdown.load_rag_config(global_cfg)
         md = "# ИНСТРУКЦИЯ ПО МОЛНИЕЗАЩИТЕ\nСО 153-34.21.122-2003\n"
 
         # document_type and domain are the only missing dialog fields here.
         queue_input(monkeypatch, ["", "", "Молниезащита", "", "", "y"])
-        res = pipeline.run_registration(
+        res = create_markdown.run_registration(
             "СО153-34_21_122-2003 Молниезащита.pdf",
             md,
             per_doc_cfg,
@@ -451,11 +451,11 @@ class TestIdempotence:
     def test_second_run_skips_without_prompts(self, tmp_path, monkeypatch, tty):
         """После записи повторный прогон — полный skip, ни одного input()."""
         cfg = write_config(tmp_path, real_config_text())
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ\nГОСТ 839—80\n"
 
         queue_input(monkeypatch, list(NEW_RECORD_QUEUE))
-        res = pipeline.run_registration(
+        res = create_markdown.run_registration(
             "ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None,
         )
         assert res is not None
@@ -468,8 +468,8 @@ class TestIdempotence:
                 AssertionError("не должно быть промптов")
             ),
         )
-        res2 = pipeline.run_registration(
-            "ГОСТ 839-80 Кабели.pdf", md, cfg, pipeline.load_rag_config(cfg), None,
+        res2 = create_markdown.run_registration(
+            "ГОСТ 839-80 Кабели.pdf", md, cfg, create_markdown.load_rag_config(cfg), None,
         )
         assert res2 is not None
         # Дубликата нет
@@ -486,10 +486,10 @@ class TestDialog:
     def test_enters_accept_auto_values(self, tmp_path, monkeypatch, tty):
         """Последовательность Enter'ов = принятые авто-значения; опц. = null."""
         cfg = write_config(tmp_path, real_config_text())
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ\nГОСТ 839—80\n"
         queue_input(monkeypatch, list(NEW_RECORD_QUEUE))
-        res = pipeline.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
         assert res is not None
         doc = res["documents"]["GOST_839_kabel"]
         assert doc["document_id"] == "ГОСТ 839—80"   # авто принято
@@ -504,7 +504,7 @@ class TestDialog:
     def test_typed_value_replaces_auto(self, tmp_path, monkeypatch, tty):
         """Ввод значения заменяет авто; опциональные заполняются."""
         cfg = write_config(tmp_path, real_config_text())
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         queue_input(monkeypatch, [
             "ГОСТ 99999—00",   # document_id: заменить авто
@@ -521,7 +521,7 @@ class TestDialog:
             "",                # slug
             "y",
         ])
-        res = pipeline.run_registration("ГОСТ 18410-73 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 18410-73 Кабели.pdf", md, cfg, rag, None)
         assert res is not None
         doc = res["documents"]["GOST_99999_kabel"]
         assert doc["document_id"] == "ГОСТ 99999—00"
@@ -531,7 +531,7 @@ class TestDialog:
     def test_invalid_status_reprompt(self, tmp_path, monkeypatch, tty):
         """Недопустимый status → переспрос; inactive → обязательный reason."""
         cfg = write_config(tmp_path, real_config_text())
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ\nГОСТ 839—80\n"
         queue_input(monkeypatch, [
             "", "", "", "Кабели", "", "", "1980-01-01", "", "",
@@ -544,7 +544,7 @@ class TestDialog:
             "",                # slug
             "y",
         ])
-        res = pipeline.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
         assert res is not None
         doc = res["documents"]["GOST_839_kabel"]
         assert doc["status"] == "inactive"
@@ -555,7 +555,7 @@ class TestDialog:
     def test_invalid_date_reprompt(self, tmp_path, monkeypatch, tty):
         """Некорректная дата → переспрос до ГГГГ-ММ-ДД."""
         cfg = write_config(tmp_path, real_config_text())
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ\nГОСТ 839—80\n"
         queue_input(monkeypatch, [
             "", "", "", "Кабели", "", "",
@@ -563,7 +563,7 @@ class TestDialog:
             "2020-01-01",      # date_enacted
             "", "", "", "", "", "y",
         ])
-        res = pipeline.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
         assert res is not None
         doc = res["documents"]["GOST_839_kabel"]
         assert doc["date_enacted"] == "2020-01-01"
@@ -572,12 +572,12 @@ class TestDialog:
         """Финальное n → None, конфиг не изменён (§7)."""
         cfg = write_config(tmp_path, real_config_text())
         text_before = cfg.read_text(encoding="utf-8")
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ\nГОСТ 839—80\n"
         q = list(NEW_RECORD_QUEUE)
         q[-1] = "n"
         queue_input(monkeypatch, q)
-        res = pipeline.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
         assert res is None
         assert cfg.read_text(encoding="utf-8") == text_before
 
@@ -604,7 +604,7 @@ class TestDialog:
       - "Содержание"
 """
         cfg = write_config(tmp_path, partial)
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# ТЕСТ ТАЙТЛ ДОКУМЕНТА НОРМАТИВ\nГОСТ 123—45\n"
         prompts = queue_input(monkeypatch, [
             "",                # document_id_alt: пропустить
@@ -615,7 +615,7 @@ class TestDialog:
             "",                # amended_by: пропустить
             "y",
         ])
-        res = pipeline.run_registration("ГОСТ 123-45.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 123-45.pdf", md, cfg, rag, None)
         assert res is not None
         doc = res["documents"]["test_doc"]
         # существующие значения НЕ перезаписаны и НЕ спрашивались
@@ -644,7 +644,7 @@ class TestNonTty:
         """isatty=False → None, input не вызывается, конфиг не изменён."""
         cfg = write_config(tmp_path, real_config_text())
         text_before = cfg.read_bytes()
-        rag = pipeline.load_rag_config(cfg)
+        rag = create_markdown.load_rag_config(cfg)
         md = "# КАБЕЛИ СИЛОВЫЕ\nГОСТ 839—80\n"
         monkeypatch.setattr(
             builtins, "input",
@@ -652,7 +652,7 @@ class TestNonTty:
                 AssertionError("input не должен вызываться без TTY")
             ),
         )
-        res = pipeline.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
+        res = create_markdown.run_registration("ГОСТ 839-80 Кабели.pdf", md, cfg, rag, None)
         assert res is None
         assert cfg.read_bytes() == text_before
 
@@ -665,11 +665,11 @@ class TestNonTty:
 class TestRegression:
     def test_parse_args_reg_flag(self):
         """--reg добавлен без коллизий; --ai без --reg — как раньше."""
-        ns = pipeline.parse_args(["-i", "x.pdf", "--ai", "--reg", "--rag"])
+        ns = create_markdown.parse_args(["-i", "x.pdf", "--ai", "--reg", "--rag"])
         assert ns.reg is True
         assert ns.ai is True
         assert ns.rag is True
-        ns2 = pipeline.parse_args(["-i", "x.pdf", "--ai"])
+        ns2 = create_markdown.parse_args(["-i", "x.pdf", "--ai"])
         assert ns2.reg is False
         assert ns2.ai is True
 
@@ -677,12 +677,12 @@ class TestRegression:
         """--ai без --reg: run_registration не вызывается (инвариант)."""
         md = tmp_path / "x.md"
         md.write_text("# ТЕКСТ ДОКУМЕНТА\n", encoding="utf-8")
-        with patch("pipeline.ai_postprocess", return_value="# ТЕКСТ ДОКУМЕНТА\nОбработано\n"), \
+        with patch("create_markdown.ai_postprocess", return_value="# ТЕКСТ ДОКУМЕНТА\nОбработано\n"), \
              patch(
-                 "pipeline.run_registration",
+                 "create_markdown.run_registration",
                  side_effect=AssertionError("--reg не должен вызываться"),
              ):
-            ok = pipeline.process_file(
+            ok = create_markdown.process_file(
                 str(md), use_ai=True,
                 config={"ai_postprocess": {"prompt": "x"}},
                 api_key="", folder_id="",
@@ -697,10 +697,10 @@ class TestRegression:
         md = tmp_path / "doc.md"
         md.write_text("# КАБЕЛИ СИЛОВЫЕ\nГОСТ 839—80\n", encoding="utf-8")
         queue_input(monkeypatch, list(NEW_RECORD_QUEUE))
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             str(md), use_ai=False, config={}, api_key="", folder_id="",
             output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
-            use_reg=True, rag_config=pipeline.load_rag_config(cfg), rag_config_path=str(cfg),
+            use_reg=True, rag_config=create_markdown.load_rag_config(cfg), rag_config_path=str(cfg),
         )
         assert ok is True
         global_config = yaml.safe_load(cfg.read_text(encoding="utf-8"))
@@ -716,7 +716,7 @@ class TestRegression:
         md = tmp_path / "Markdown" / "x" / "x.md"
         md.parent.mkdir(parents=True)
         md.write_text("# ТЕКСТ\n", encoding="utf-8")
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             str(md), use_ai=False, config={}, api_key="", folder_id="",
             output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
         )
@@ -727,17 +727,17 @@ class TestRegression:
         md = tmp_path / "x.md"
         md.write_text("# ТЕКСТ\n", encoding="utf-8")
         monkeypatch.setattr(
-            pipeline.sys, "argv",
-            ["pipeline.py", "-i", str(md), "--reg",
+            create_markdown.sys, "argv",
+            ["create_markdown.py", "-i", str(md), "--reg",
              "--rag-config", str(tmp_path / "nope.yaml")],
         )
         with pytest.raises(SystemExit) as e:
-            pipeline.main()
+            create_markdown.main()
         assert e.value.code == 1
 
     def test_reg_extract_section_in_config_ai(self):
         """config_ai.yaml содержит секцию reg_extract с промптом (§4.2)."""
-        cfg_path = Path(pipeline.__file__).parent / "config_ai.yaml"
+        cfg_path = Path(create_markdown.__file__).parent / "config_ai.yaml"
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
         reg = cfg.get("reg_extract")
         assert isinstance(reg, dict)

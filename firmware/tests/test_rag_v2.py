@@ -22,14 +22,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
 
 
 @pytest.fixture(scope="module")
 def rag_config():
-    return pipeline.load_rag_config(RAG_CONFIG)
+    return create_markdown.load_rag_config(RAG_CONFIG)
 
 
 def _tok(text: str) -> int:
@@ -57,7 +57,7 @@ class TestInitTokenizer:
             "from_pretrained",
             staticmethod(lambda *a, **k: _FakeTokenizer()),
         )
-        fn, method = pipeline._init_tokenizer({
+        fn, method = create_markdown._init_tokenizer({
             "defaults": {"tokenizer": "Qwen/Qwen3-Embedding-8B", "tokenizer_revision": "main"},
         })
         assert method == "qwen3"
@@ -73,7 +73,7 @@ class TestInitTokenizer:
             "from_pretrained",
             staticmethod(lambda *a, **k: _FakeTokenizer()),
         )
-        fn, _ = pipeline._init_tokenizer({"defaults": {}})
+        fn, _ = create_markdown._init_tokenizer({"defaults": {}})
         assert fn("Привет мир") == len("Привет мир") // 2
 
     def test_init_qwen3_tokenize_empty(self, monkeypatch):
@@ -84,7 +84,7 @@ class TestInitTokenizer:
             "from_pretrained",
             staticmethod(lambda *a, **k: _FakeTokenizer()),
         )
-        fn, _ = pipeline._init_tokenizer({"defaults": {}})
+        fn, _ = create_markdown._init_tokenizer({"defaults": {}})
         assert fn("") == 0
 
     def test_init_no_transformers_no_fallback_raises(self, monkeypatch):
@@ -93,14 +93,14 @@ class TestInitTokenizer:
 
         monkeypatch.setitem(_sys.modules, "transformers", None)
         with pytest.raises(RuntimeError):
-            pipeline._init_tokenizer({"defaults": {"allow_degraded_fallback": False}})
+            create_markdown._init_tokenizer({"defaults": {"allow_degraded_fallback": False}})
 
     def test_init_no_transformers_with_fallback(self, monkeypatch):
         """Без transformers, но allow_degraded_fallback=true → degraded mode."""
         import sys as _sys
 
         monkeypatch.setitem(_sys.modules, "transformers", None)
-        fn, method = pipeline._init_tokenizer({
+        fn, method = create_markdown._init_tokenizer({
             "defaults": {
                 "allow_degraded_fallback": True,
                 "tokenizer_fallback_ratio": 3.5,
@@ -117,7 +117,7 @@ class TestInitTokenizer:
 
         monkeypatch.setitem(_sys.modules, "transformers", None)
         with pytest.raises(RuntimeError):
-            pipeline._init_tokenizer({"defaults": {}})
+            create_markdown._init_tokenizer({"defaults": {}})
 
     def test_init_load_failure_no_fallback_raises(self, monkeypatch):
         """Ошибка загрузки (сеть/HF) при запрещённом fallback → RuntimeError."""
@@ -128,7 +128,7 @@ class TestInitTokenizer:
 
         monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(_boom))
         with pytest.raises(RuntimeError):
-            pipeline._init_tokenizer({"defaults": {"allow_degraded_fallback": False}})
+            create_markdown._init_tokenizer({"defaults": {"allow_degraded_fallback": False}})
 
     def test_init_load_failure_with_fallback(self, monkeypatch):
         """Ошибка загрузки при разрешённом fallback → degraded mode."""
@@ -138,7 +138,7 @@ class TestInitTokenizer:
             raise OSError("HF недоступен")
 
         monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(_boom))
-        fn, method = pipeline._init_tokenizer({
+        fn, method = create_markdown._init_tokenizer({
             "defaults": {"allow_degraded_fallback": True, "tokenizer_fallback_ratio": 4.0},
         })
         assert method == "degraded_chars_per_token"
@@ -152,35 +152,35 @@ class TestInitTokenizer:
 
 class TestSplitOversizedClauseTokens:
     def test_small_text(self):
-        assert pipeline._split_oversized_clause_tokens("маленький", 7000, _tok) == ["маленький"]
+        assert create_markdown._split_oversized_clause_tokens("маленький", 7000, _tok) == ["маленький"]
 
     def test_groups_paragraphs(self):
         paras = [f"Параграф номер {i} " * 3 for i in range(5)]
         text = "\n\n".join(paras)
-        parts = pipeline._split_oversized_clause_tokens(text, 30, _tok)
+        parts = create_markdown._split_oversized_clause_tokens(text, 30, _tok)
         assert len(parts) >= 2
         assert "\n\n".join(parts) == text
 
     def test_table_atomic(self):
         table = "| a | b |\n| 1 | 2 |\n| 3 | 4 |"
         text = "Текст.\n\n" + table + "\n\nЕщё текст"
-        parts = pipeline._split_oversized_clause_tokens(text, 6, _tok)
+        parts = create_markdown._split_oversized_clause_tokens(text, 6, _tok)
         assert any(table in p for p in parts)
 
     def test_giant_table_as_is(self):
         giant = "| " + "x" * 500 + " |"
         text = "До\n\n" + giant + "\n\nПосле"
-        parts = pipeline._split_oversized_clause_tokens(text, 20, _tok)
+        parts = create_markdown._split_oversized_clause_tokens(text, 20, _tok)
         assert giant in parts
 
     def test_code_block_atomic(self):
         code = "```\nline\n\n" * 10 + "```"
-        parts = pipeline._split_oversized_clause_tokens(code, 15, _tok)
+        parts = create_markdown._split_oversized_clause_tokens(code, 15, _tok)
         assert len(parts) >= 1
         assert all("```" in p for p in parts)
 
     def test_empty(self):
-        assert pipeline._split_oversized_clause_tokens("", 10, _tok) == [""]
+        assert create_markdown._split_oversized_clause_tokens("", 10, _tok) == [""]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -190,20 +190,20 @@ class TestSplitOversizedClauseTokens:
 
 class TestValidateRagConfig:
     def test_ok(self, rag_config):
-        assert pipeline.validate_rag_config(rag_config) == []
+        assert create_markdown.validate_rag_config(rag_config) == []
 
     def test_max_tokens_invalid(self):
-        errs = pipeline.validate_rag_config({"defaults": {"max_chunk_tokens": 5}})
+        errs = create_markdown.validate_rag_config({"defaults": {"max_chunk_tokens": 5}})
         assert any("max_chunk_tokens" in e for e in errs)
 
     def test_status_missing(self):
         cfg = {"defaults": {}, "documents": {"d": {"status": None}}}
-        errs = pipeline.validate_rag_config(cfg)
+        errs = create_markdown.validate_rag_config(cfg)
         assert any("status" in e for e in errs)
 
     def test_status_invalid(self):
         cfg = {"defaults": {}, "documents": {"d": {"status": "draft"}}}
-        errs = pipeline.validate_rag_config(cfg)
+        errs = create_markdown.validate_rag_config(cfg)
         assert any("draft" in e for e in errs)
 
     def test_active_with_replaced_by_document_id(self):
@@ -212,7 +212,7 @@ class TestValidateRagConfig:
             "defaults": {"max_chunk_tokens": 7000},
             "documents": {"d": {"status": "active", "replaced_by_document_id": "СП 60"}},
         }
-        errs = pipeline.validate_rag_config(cfg)
+        errs = create_markdown.validate_rag_config(cfg)
         assert any("replaced_by_document_id" in e for e in errs)
 
     def test_active_with_replaced_by_doc_key(self):
@@ -220,7 +220,7 @@ class TestValidateRagConfig:
             "defaults": {"max_chunk_tokens": 7000},
             "documents": {"d": {"status": "active", "replaced_by_doc_key": "sp60"}},
         }
-        errs = pipeline.validate_rag_config(cfg)
+        errs = create_markdown.validate_rag_config(cfg)
         assert any("replaced_by_doc_key" in e for e in errs)
 
     def test_inactive_with_replacement_ok(self):
@@ -236,7 +236,7 @@ class TestValidateRagConfig:
                 }
             },
         }
-        assert pipeline.validate_rag_config(cfg) == []
+        assert create_markdown.validate_rag_config(cfg) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -272,7 +272,7 @@ class TestBuildRagJsonlV2:
             "Перед таблицей <!-- t_p2_7 --> <!-- WARN_3.1 -->\n"
             "Полезный текст.\n"
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
@@ -290,7 +290,7 @@ class TestBuildRagJsonlV2:
             {"page": 8, "number": "3.2"},
             {"page": 9, "number": "3.2.1"},
         ]
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             v2_md, jh, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
@@ -322,7 +322,7 @@ class TestBuildRagJsonlV2:
         assert r2["heading_texts"]["clause"] == "3.2.1. Молниеприемники"
 
     def test_every_line_valid_required_fields(self, v2_md, rag_config):
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             v2_md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         required = {
@@ -338,7 +338,7 @@ class TestBuildRagJsonlV2:
                 assert required <= set(obj.keys())
 
     def test_no_source_page_anywhere(self, v2_md, rag_config):
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             v2_md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -347,7 +347,7 @@ class TestBuildRagJsonlV2:
 
     def test_inactive_status(self, v2_md, rag_config):
         """Неактивный документ: статус и номер преемника в каждой строке."""
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             v2_md, None, rag_config, "old_snip", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -372,7 +372,7 @@ class TestBuildRagJsonlV2:
             "#### 3.2.1. Молниеприемники\n"
             + "\n\n".join(paras)
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, [{"page": 5, "number": "3.2.1"}], cfg, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -389,7 +389,7 @@ class TestBuildRagJsonlV2:
 
     def test_chunking_method_degraded(self, v2_md, rag_config):
         """degraded_chars_per_token проставляется в каждой строке."""
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             v2_md, None, rag_config, "so153_molniezashita", _tok,
             "degraded_chars_per_token",
         )
@@ -400,10 +400,10 @@ class TestBuildRagJsonlV2:
 
     def test_unknown_doc_key(self, v2_md, rag_config):
         with pytest.raises(ValueError):
-            pipeline.build_rag_jsonl_v2(v2_md, None, rag_config, "unknown", _tok)
+            create_markdown.build_rag_jsonl_v2(v2_md, None, rag_config, "unknown", _tok)
 
     def test_empty_md(self, rag_config):
-        jsonl = pipeline.build_rag_jsonl_v2("", None, rag_config, "so153_molniezashita", _tok)
+        jsonl = create_markdown.build_rag_jsonl_v2("", None, rag_config, "so153_molniezashita", _tok)
         assert jsonl == ""
 
     def test_unnumbered_heading_fallback(self, rag_config):
@@ -416,7 +416,7 @@ class TestBuildRagJsonlV2:
             "### Внешняя молниезащитная система\n"
             "Текст раздела без номера.\n"
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -444,7 +444,7 @@ class TestBuildRagJsonlV2:
             "## 2. Порядок приемки устройств молниезащиты в эксплуатацию\n"
             "Текст рекомендаций 2.\n"
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -456,7 +456,7 @@ class TestBuildRagJsonlV2:
         assert "so153_molniezashita/2" in ids
         assert "so153_molniezashita/2/occurrence_2" in ids
         # Детерминированность: повторный запуск даёт те же ID
-        jsonl2 = pipeline.build_rag_jsonl_v2(
+        jsonl2 = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         ids2 = [json.loads(l)["chunk_id"] for l in jsonl2.splitlines() if l.strip()]
@@ -474,7 +474,7 @@ class TestBuildRagJsonlV2:
             "## 1. ТРЕТЬЯ\n"
             "Текст 3.\n"
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -497,7 +497,7 @@ class TestBuildRagJsonlV2:
             "### 2.3. Параметры токов молнии\n"
             "Молния представляет собой импульс тока."
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -528,7 +528,7 @@ class TestBuildRagJsonlV2:
             "#### 3.2.1. Молниеприемники\n"
             + "\n\n".join(paras)
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, [{"page": 5, "number": "3.2.1"}], cfg, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -557,7 +557,7 @@ class TestBuildRagJsonlV2:
             "## 1. Разработка эксплуатационно-технической документации\n"
             "Текст рекомендаций 1.\n"
         )
-        jsonl = pipeline.build_rag_jsonl_v2(
+        jsonl = create_markdown.build_rag_jsonl_v2(
             md, None, rag_config, "so153_molniezashita", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
@@ -596,7 +596,7 @@ ASSET_MD = (
 class TestAssetRegistry:
     SOURCE_STEM = "СО153-34_21_122-2003 Молниезащита"
     def test_extract_tables_from_md(self):
-        tables = pipeline._extract_tables_from_md(ASSET_MD)
+        tables = create_markdown._extract_tables_from_md(ASSET_MD)
         assert len(tables) == 1
         t = tables[0]
         assert t["asset_type"] == "table"
@@ -610,7 +610,7 @@ class TestAssetRegistry:
 
     def test_extract_tables_from_md_no_caption(self):
         md = "Текст\n\n| a | b |\n|---|----|\n| 1 | 2 |\n"
-        tables = pipeline._extract_tables_from_md(md)
+        tables = create_markdown._extract_tables_from_md(md)
         assert len(tables) == 1
         assert tables[0]["caption"] == ""
 
@@ -624,7 +624,7 @@ class TestAssetRegistry:
             "|---|---|\n"
             "| 1 | 2 |\n"
         )
-        tables = pipeline._extract_tables_from_md(
+        tables = create_markdown._extract_tables_from_md(
             md, table_image_map={"t_p1_0": "table_3.png"},
         )
         assert len(tables) == 1
@@ -639,7 +639,7 @@ class TestAssetRegistry:
             "|---|\n"
             "| 1 |\n"
         )
-        tables = pipeline._extract_tables_from_md(
+        tables = create_markdown._extract_tables_from_md(
             md, table_image_map={"t_p1_0": "table_3.png"},
         )
         assert len(tables) == 1
@@ -664,7 +664,7 @@ class TestAssetRegistry:
             "|---|---|\n"
             "| Условный диаметр штуцера | 25 |\n"
         )
-        tables = pipeline._extract_tables_from_md(md)
+        tables = create_markdown._extract_tables_from_md(md)
         assert len(tables) == 2
         # Первая таблица подписи не имеет и чужую не подтягивает
         assert tables[0]["caption"] == ""
@@ -684,7 +684,7 @@ class TestAssetRegistry:
             "|---|\n"
             "| 2 |\n"
         )
-        tables = pipeline._extract_tables_from_md(md)
+        tables = create_markdown._extract_tables_from_md(md)
         assert len(tables) == 2
         # Подпись сразу под первой таблицей — её; вторая остаётся без подписи
         assert tables[0]["caption"] == "Таблица 1"
@@ -697,7 +697,7 @@ class TestAssetRegistry:
             "| *T*_1$ | --- |\n"
             "| а |\n"
         )
-        cells = pipeline._normalize_table_cells(text)
+        cells = create_markdown._normalize_table_cells(text)
         assert "a b" in cells  # пробелы сжаты, регистр lower
         assert "t1" in cells   # сняты *_$
         assert "---" not in cells  # разделители отброшены
@@ -706,21 +706,21 @@ class TestAssetRegistry:
     def test_match_table_by_content(self):
         md_block = "| X | Y |\n|---|---|\n| Alpha | 1 |\n| Beta | 2 |\n"
         crops = {
-            "table_4.png": pipeline._normalize_table_cells(
+            "table_4.png": create_markdown._normalize_table_cells(
                 "| Alpha | 1 |\n| Beta | 2 |\n"
             ),
-            "table_5.png": pipeline._normalize_table_cells(
+            "table_5.png": create_markdown._normalize_table_cells(
                 "| Gamma | 9 |\n"
             ),
         }
-        name, score, _ = pipeline._match_table_by_content(md_block, crops)
+        name, score, _ = create_markdown._match_table_by_content(md_block, crops)
         assert name == "table_4.png"
-        assert score >= pipeline._TABLE_CONTENT_MATCH_THRESHOLD
+        assert score >= create_markdown._TABLE_CONTENT_MATCH_THRESHOLD
 
     def test_match_table_by_content_no_match(self):
         md_block = "| X | Y |\n|---|---|\n| Alpha | 1 |\n"
-        crops = {"table_5.png": pipeline._normalize_table_cells("| Gamma | 9 |\n")}
-        name, _, _ = pipeline._match_table_by_content(md_block, crops)
+        crops = {"table_5.png": create_markdown._normalize_table_cells("| Gamma | 9 |\n")}
+        name, _, _ = create_markdown._match_table_by_content(md_block, crops)
         assert name is None
 
     def test_build_asset_registry_content_binding(self, tmp_path):
@@ -757,7 +757,7 @@ class TestAssetRegistry:
             "| Alpha | 1 |\n"
             "| Beta | 2 |\n"
         )
-        assets = pipeline._build_asset_registry(
+        assets = create_markdown._build_asset_registry(
             md, "doc", img_dir, tmp_dir=tmp_dir,
         )
         tables = assets["assets"]["tables"]
@@ -792,7 +792,7 @@ class TestAssetRegistry:
             "|---|---|\n"
             "| Alpha | 1 |\n"
         )
-        assets = pipeline._build_asset_registry(
+        assets = create_markdown._build_asset_registry(
             md, "doc", img_dir, tmp_dir=tmp_dir,
         )
         tables = assets["assets"]["tables"]
@@ -803,7 +803,7 @@ class TestAssetRegistry:
 
 
     def test_extract_images_from_md(self):
-        images = pipeline._extract_images_from_md(ASSET_MD)
+        images = create_markdown._extract_images_from_md(ASSET_MD)
         assert len(images) == 1
         img = images[0]
         assert img["asset_type"] == "image"
@@ -816,7 +816,7 @@ class TestAssetRegistry:
         img_dir.mkdir()
         (img_dir / "fig_1.png").write_bytes(b"png")
         (img_dir / "table_1.png").write_bytes(b"png")
-        assets = pipeline._build_asset_registry(
+        assets = create_markdown._build_asset_registry(
             ASSET_MD, "so153_molniezashita", img_dir, document_id="СО 153-34.21.122-2003",
         )
         assert assets["document_id"] == "СО 153-34.21.122-2003"
@@ -832,13 +832,13 @@ class TestAssetRegistry:
         img_dir = tmp_path / "image"
         img_dir.mkdir()
         (img_dir / "table_1.png").write_bytes(b"png")  # fig_1.png отсутствует
-        assets = pipeline._build_asset_registry(ASSET_MD, "so153", img_dir)
+        assets = create_markdown._build_asset_registry(ASSET_MD, "so153", img_dir)
         assert len(assets["assets"]["images"]) == 0
         assert len(assets["assets"]["tables"]) == 1
 
     def test_build_asset_registry_no_img_dir(self, tmp_path):
         """image/ не найден → реестр активов пуст (архитектура §9)."""
-        assets = pipeline._build_asset_registry(ASSET_MD, "so153", None)
+        assets = create_markdown._build_asset_registry(ASSET_MD, "so153", None)
         assert assets["assets"]["tables"] == []
         assert assets["assets"]["images"] == []
 
@@ -848,11 +848,11 @@ class TestAssetRegistry:
         (img_dir / "fig_1.png").write_bytes(b"png")
         (img_dir / "table_1.png").write_bytes(b"png")
 
-        assets = pipeline._build_asset_registry(ASSET_MD, "so153_molniezashita", img_dir)
+        assets = create_markdown._build_asset_registry(ASSET_MD, "so153_molniezashita", img_dir)
         chunks = [
             {"chunk_id": "so153_molniezashita/3", "text": ASSET_MD, "assets": []},
         ]
-        pipeline._link_assets_to_chunks(assets, chunks)
+        create_markdown._link_assets_to_chunks(assets, chunks)
 
         assert assets["assets"]["tables"][0]["chunk_ids"] == ["so153_molniezashita/3"]
         assert assets["assets"]["images"][0]["chunk_ids"] == ["so153_molniezashita/3"]
@@ -864,9 +864,9 @@ class TestAssetRegistry:
         img_dir = tmp_path / "image"
         img_dir.mkdir()
         (img_dir / "table_1.png").write_bytes(b"png")
-        assets = pipeline._build_asset_registry(ASSET_MD, "so153", img_dir)
+        assets = create_markdown._build_asset_registry(ASSET_MD, "so153", img_dir)
         out = tmp_path / f"{self.SOURCE_STEM}_assets.json"
-        pipeline.write_rag_assets(assets, out)
+        create_markdown.write_rag_assets(assets, out)
         data = json.loads(out.read_text(encoding="utf-8"))
         assert "_md_block" not in data["assets"]["tables"][0]
         assert "_image_source" not in data["assets"]["tables"][0]
@@ -879,20 +879,20 @@ class TestAssetRegistry:
 
 class TestClassifyInput:
     def test_pdf(self):
-        assert pipeline._classify_input(Path("file.pdf")) == "pdf"
+        assert create_markdown._classify_input(Path("file.pdf")) == "pdf"
 
     def test_docx(self):
-        assert pipeline._classify_input(Path("file.docx")) == "docx"
-        assert pipeline._classify_input(Path("file.doc")) == "docx"
+        assert create_markdown._classify_input(Path("file.docx")) == "docx"
+        assert create_markdown._classify_input(Path("file.doc")) == "docx"
 
     def test_md_standalone(self):
-        assert pipeline._classify_input(Path("/tmp/file.md")) == "md_standalone"
+        assert create_markdown._classify_input(Path("/tmp/file.md")) == "md_standalone"
 
     def test_md_rag(self):
-        assert pipeline._classify_input(Path("/tmp/Markdown/so153/file.md")) == "md_rag"
+        assert create_markdown._classify_input(Path("/tmp/Markdown/so153/file.md")) == "md_rag"
 
     def test_unknown(self):
-        assert pipeline._classify_input(Path("file.txt")) == "unknown"
+        assert create_markdown._classify_input(Path("file.txt")) == "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -928,9 +928,9 @@ class TestRunRagOnly:
         md_path, md, img_dir = self._setup(tmp_path)
         img_hash_before = (img_dir / "table_1.png").read_bytes()
 
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            ok = pipeline._run_rag_only(md_path, rag_config)
+            ok = create_markdown._run_rag_only(md_path, rag_config)
 
         assert ok is True
         assert md_path.read_text(encoding="utf-8") == md
@@ -943,20 +943,20 @@ class TestRunRagOnly:
     def test_rag_only_idempotent(self, tmp_path, rag_config):
         """Повторный запуск --rag даёт идентичный результат."""
         md_path, _, _ = self._setup(tmp_path)
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            assert pipeline._run_rag_only(md_path, rag_config) is True
+            assert create_markdown._run_rag_only(md_path, rag_config) is True
             first = (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").read_text(encoding="utf-8")
-            assert pipeline._run_rag_only(md_path, rag_config) is True
+            assert create_markdown._run_rag_only(md_path, rag_config) is True
             second = (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").read_text(encoding="utf-8")
         assert first == second
 
     def test_rag_only_atomic_no_tmp_left(self, tmp_path, rag_config):
         """Атомарная запись: не остаётся временных .tmp файлов."""
         md_path, _, _ = self._setup(tmp_path)
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            assert pipeline._run_rag_only(md_path, rag_config) is True
+            assert create_markdown._run_rag_only(md_path, rag_config) is True
         leftovers = list(md_path.parent.glob("*.tmp"))
         assert leftovers == []
 
@@ -964,9 +964,9 @@ class TestRunRagOnly:
         md_path = tmp_path / "Markdown" / "unknown" / "unknown.md"
         md_path.parent.mkdir(parents=True)
         md_path.write_text("## 1. ТЕКСТ\nТекст.\n", encoding="utf-8")
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            ok = pipeline._run_rag_only(md_path, rag_config)
+            ok = create_markdown._run_rag_only(md_path, rag_config)
         assert ok is False
         assert not (md_path.parent / f"{self.SOURCE_STEM}_chunks.jsonl").exists()
 
@@ -977,9 +977,9 @@ class TestRunRagOnly:
         md = "## 3. ЗАЩИТА\nТекст.\n"
         md_path = doc_dir / f"{self.SOURCE_STEM}.md"
         md_path.write_text(md, encoding="utf-8")
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            ok = pipeline._run_rag_only(md_path, rag_config)
+            ok = create_markdown._run_rag_only(md_path, rag_config)
         assert ok is True
         assets = json.loads(
             (md_path.parent / f"{self.SOURCE_STEM}_assets.json").read_text(encoding="utf-8")
@@ -1004,9 +1004,9 @@ class TestRunRagPipeline:
             "|---|---|\n"
             "| 1 | 2 |\n"
         )
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            ok = pipeline.run_rag_pipeline(
+            ok = create_markdown.run_rag_pipeline(
                 md, None, rag_config, "so153_molniezashita", img_dir, out_dir,
                 self.SOURCE_STEM,
             )
@@ -1030,7 +1030,7 @@ class TestRunRagPipeline:
 
         monkeypatch.setitem(_sys.modules, "transformers", None)
         with pytest.raises(RuntimeError):
-            pipeline.run_rag_pipeline(
+            create_markdown.run_rag_pipeline(
                 "## 3. ТЕКСТ\nТекст.\n", None, rag_config,
                 "so153_molniezashita", None, tmp_path,
                 self.SOURCE_STEM,
@@ -1061,13 +1061,13 @@ class TestProcessFileTableExtraction:
         pdf.write_bytes(b"%PDF-1.4 fake")
         md = "## 3. ЗАЩИТА\nТекст.\n"
 
-        with patch("pipeline.send_to_yandex_ocr", return_value=self._pages()), \
-             patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-             patch("pipeline.extract_images_from_pdf", return_value=[]), \
-             patch("pipeline.extract_table_images", return_value=[{"path": "table_1.png"}]) as eti, \
-             patch("pipeline.recognize_tables_vision") as rtv, \
-             patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
-            ok = pipeline.process_file(
+        with patch("create_markdown.send_to_yandex_ocr", return_value=self._pages()), \
+             patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+             patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+             patch("create_markdown.extract_table_images", return_value=[{"path": "table_1.png"}]) as eti, \
+             patch("create_markdown.recognize_tables_vision") as rtv, \
+             patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+            ok = create_markdown.process_file(
                 str(pdf), use_ai=False, config={},
                 api_key="key", folder_id="folder",
                 output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -1088,12 +1088,12 @@ class TestProcessFileTableExtraction:
             {"page": 0, "table_idx": 3, "path": "table_3.png", "id": "t_p1_0"},
             {"page": 0, "table_idx": 5, "path": "table_5.png", "id": "t_p1_1"},
         ]
-        with patch("pipeline.send_to_yandex_ocr", return_value=self._pages()), \
-             patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-             patch("pipeline.extract_images_from_pdf", return_value=[]), \
-             patch("pipeline.extract_table_images", return_value=table_images), \
-             patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
-            ok = pipeline.process_file(
+        with patch("create_markdown.send_to_yandex_ocr", return_value=self._pages()), \
+             patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+             patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+             patch("create_markdown.extract_table_images", return_value=table_images), \
+             patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+            ok = create_markdown.process_file(
                 str(pdf), use_ai=False, config={},
                 api_key="key", folder_id="folder",
                 output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -1105,14 +1105,14 @@ class TestProcessFileTableExtraction:
         assert data == table_images
 
     def test_derive_tmp_dir(self):
-        assert pipeline._derive_tmp_dir(
+        assert create_markdown._derive_tmp_dir(
             "/x/Markdown/doc", "doc",
         ) == Path("/x/tmp/doc")
-        assert pipeline._derive_tmp_dir(
+        assert create_markdown._derive_tmp_dir(
             Path("/x/Markdown/doc"), "doc",
         ) == Path("/x/tmp/doc")
         # Короткий путь без двух уровней родителей — None
-        assert pipeline._derive_tmp_dir(Path("/x"), "doc") is None
+        assert create_markdown._derive_tmp_dir(Path("/x"), "doc") is None
 
     def test_pdf_with_ai_triggers_vision_additionally(self, tmp_path):
         """PDF с --ai: вырезка таблиц + vision-распознавание."""
@@ -1124,15 +1124,15 @@ class TestProcessFileTableExtraction:
             "table_vision": {"api_key_env": "PROVOD_API_KEY"},
         }
 
-        with patch("pipeline.send_to_yandex_ocr", return_value=self._pages()), \
-             patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-             patch("pipeline.extract_images_from_pdf", return_value=[]), \
-             patch("pipeline.extract_table_images", return_value=[{"path": "table_1.png"}]), \
+        with patch("create_markdown.send_to_yandex_ocr", return_value=self._pages()), \
+             patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+             patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+             patch("create_markdown.extract_table_images", return_value=[{"path": "table_1.png"}]), \
              patch.dict(os.environ, {"PROVOD_API_KEY": "key"}), \
-             patch("pipeline.recognize_tables_vision", return_value=1) as rtv, \
-             patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m), \
-             patch("pipeline._call_ai_api", return_value=md):
-            ok = pipeline.process_file(
+             patch("create_markdown.recognize_tables_vision", return_value=1) as rtv, \
+             patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m), \
+             patch("create_markdown._call_ai_api", return_value=md):
+            ok = create_markdown.process_file(
                 str(pdf), use_ai=True, config=config,
                 api_key="key", folder_id="folder",
                 output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -1145,7 +1145,7 @@ class TestProcessFileTableExtraction:
         md_file = tmp_path / "Markdown" / "so153" / "so153.md"
         md_file.parent.mkdir(parents=True)
         md_file.write_text("## 1. ТЕКСТ\nТекст.\n", encoding="utf-8")
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             str(md_file), use_ai=False, config={},
             api_key="", folder_id="",
             output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -1162,9 +1162,9 @@ class TestProcessFileTableExtraction:
         md_file = doc_dir / f"{TestRunRagOnly.SOURCE_STEM}.md"
         md_file.write_text(md, encoding="utf-8")
 
-        with patch("pipeline._init_tokenizer",
+        with patch("create_markdown._init_tokenizer",
                    return_value=(lambda t: len(t) // 3, "qwen3")):
-            ok = pipeline.process_file(
+            ok = create_markdown.process_file(
                 str(md_file), use_ai=False, config={},
                 api_key="", folder_id="",
                 output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -1185,19 +1185,19 @@ class TestProcessFileTableExtraction:
 class TestSafeWriteAtomic:
     def test_writes_content(self, tmp_path):
         p = tmp_path / "a" / "b.txt"
-        pipeline.safe_write(p, "hello")
+        create_markdown.safe_write(p, "hello")
         assert p.read_text(encoding="utf-8") == "hello"
 
     def test_no_tmp_left(self, tmp_path):
         p = tmp_path / "x.txt"
-        pipeline.safe_write(p, "data")
+        create_markdown.safe_write(p, "data")
         assert list(tmp_path.glob("*.tmp")) == []
         assert list(tmp_path.glob(".*.tmp")) == []
 
     def test_overwrite(self, tmp_path):
         p = tmp_path / "x.txt"
-        pipeline.safe_write(p, "one")
-        pipeline.safe_write(p, "two")
+        create_markdown.safe_write(p, "one")
+        create_markdown.safe_write(p, "two")
         assert p.read_text(encoding="utf-8") == "two"
 
 

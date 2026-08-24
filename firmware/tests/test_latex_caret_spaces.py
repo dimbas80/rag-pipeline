@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 
 # ── Прямые тесты fix_latex_caret_spaces ──────────────────────────────────────
@@ -42,33 +42,33 @@ import pipeline
     ("| A | B |\n|---|---|\n| 1 | 2 |", "| A | B |\n|---|---|\n| 1 | 2 |"),
 ])
 def test_fix_latex_caret_spaces(text, expected):
-    assert pipeline.fix_latex_caret_spaces(text) == expected
+    assert create_markdown.fix_latex_caret_spaces(text) == expected
 
 
 def test_escaped_caret_untouched():
     """\\^ (литеральный циркумфлекс) вне ^-оператора не трогаем."""
-    assert pipeline.fix_latex_caret_spaces("$x\\^2$") == "$x\\^2$"
-    assert pipeline.fix_latex_caret_spaces("$\\hat{x}^2$") == "$\\hat{x} ^ 2$"
+    assert create_markdown.fix_latex_caret_spaces("$x\\^2$") == "$x\\^2$"
+    assert create_markdown.fix_latex_caret_spaces("$\\hat{x}^2$") == "$\\hat{x} ^ 2$"
 
 
 def test_unicode_text_untouched():
     """Кириллический текст с ^ вне формул не меняется."""
     text = "Формула $x^2$ внутри, а тут^не формула"
-    assert pipeline.fix_latex_caret_spaces(text) == "Формула $x ^ 2$ внутри, а тут^не формула"
+    assert create_markdown.fix_latex_caret_spaces(text) == "Формула $x ^ 2$ внутри, а тут^не формула"
 
 
 # ── Проверка интеграции в run_script_postprocess ─────────────────────────────
 
 def test_run_script_postprocess_includes_step():
     """Этап 9 (пробелы вокруг ^) есть в run_script_postprocess с log.info."""
-    src = Path(pipeline.__file__).read_text(encoding="utf-8")
+    src = Path(create_markdown.__file__).read_text(encoding="utf-8")
     assert "fix_latex_caret_spaces(md_text)" in src
     assert 'log.info("  9. LaTeX: пробелы вокруг ^")' in src
 
 
 def test_run_script_postprocess_applies_caret_spacing(tmp_path):
     """Сквозной прогон: md с формулой проходит постобработку с пробелами вокруг ^."""
-    out = pipeline.run_script_postprocess("Степень $x^2$ готова.", tmp_path)
+    out = create_markdown.run_script_postprocess("Степень $x^2$ готова.", tmp_path)
     assert "Степень $x ^ 2$ готова." == out
 
 

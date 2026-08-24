@@ -4,7 +4,7 @@ PDF/DOCX → Markdown pipeline via Yandex Vision OCR (`math-markdown` model).
 
 ## 1. Overview
 
-Целевой файл: **`firmware/src/pipeline.py`** (~700–800 строк), один Python-модуль.
+Целевой файл: **`firmware/src/create_markdown.py`** (~700–800 строк), один Python-модуль.
 
 Pipeline заменяет MinerU на Yandex Vision OCR. От MinerU (`Create_markdown`) берётся только логика постобработки: LaTeX-чистка, таблицы, изображения, подписи, примечания, AI-постобработка.
 
@@ -54,7 +54,7 @@ libreoffice --headless --convert-to pdf input.docx --outdir tmp/
 
 ### ADR-4: Один файл, секционная структура
 
-**Проблема:** Требование — один файл `pipeline.py`. Но код объёмный (~800 строк).
+**Проблема:** Требование — один файл `create_markdown.py`. Но код объёмный (~800 строк).
 
 **Решение:** Организовать файл секциями с чёткими разделителями-комментариями:
 ```
@@ -144,14 +144,14 @@ run_script_postprocess(md_text)
 
 **Проблема:** После Этапа 1 MD-файлы имеют корректную иерархию заголовков `##`/`###`/`####`/`#####`. Нужно преобразовать их в структурированный JSONL для RAG-индексации, где каждая строка — clause с полным контекстом (метаданные документа, иерархия разделов, номер страницы, кросс-ссылки).
 
-**Решение:** Добавить секцию 12 в `pipeline.py` — `md_to_rag_jsonl` (~150 строк). Активируется флагом `--rag`.
+**Решение:** Добавить секцию 12 в `create_markdown.py` — `md_to_rag_jsonl` (~150 строк). Активируется флагом `--rag`.
 
 Ключевые решения:
 - **ADR-9a:** Clause = каждый заголовок от `##` до `#####`. Текст ограничен следующим заголовком любого уровня.
 - **ADR-9b:** Oversized clause (> max_chunk_chars=1500) разбиваются по границам параграфов с повторением метаданных.
 - **ADR-9c:** Номера страниц берутся из `_extract_headings_from_json()` (ADR-8) — без повторного парсинга JSON.
 - **ADR-9d:** Конфигурация в `rag_config.yaml` с секциями `defaults`, `references.patterns`, `documents.<slug>`.
-- **ADR-9e:** Интеграция как секция 12 в pipeline.py, флаг `--rag`, позиция после всей постобработки.
+- **ADR-9e:** Интеграция как секция 12 в create_markdown.py, флаг `--rag`, позиция после всей постобработки.
 
 Полный текст: [ADR-009](decision-records/adr-009-md-to-rag-jsonl.md)
 
@@ -160,7 +160,7 @@ run_script_postprocess(md_text)
 ## 3. Module Decomposition
 
 ```
-pipeline.py (~800 lines)
+create_markdown.py (~800 lines)
 ├── 0. Imports & Constants          (~15 lines)
 ├── 1. Utilities                    (~80 lines)
 │   ├── setup_logging(log_path)

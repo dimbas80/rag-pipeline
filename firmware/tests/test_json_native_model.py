@@ -2,7 +2,7 @@ import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from pipeline import (
+from create_markdown import (
     BBox, Block, Cell, Document, Heading, Page, Picture, Table,
     parse_yandex_json_to_model,
 )

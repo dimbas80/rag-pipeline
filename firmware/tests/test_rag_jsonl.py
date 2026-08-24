@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Тесты для RAG JSONL Converter (ADR-9, секция 12 pipeline.py).
+"""Тесты для RAG JSONL Converter (ADR-9, секция 12 create_markdown.py).
 
 Проверяют 9 функций модуля md_to_rag_jsonl:
   - load_rag_config()
@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-import pipeline
+import create_markdown
 
 RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
 
@@ -33,7 +33,7 @@ TEST_JSON = "/mnt/sdb/!База_ГОСТ/tmp/СО153-34_21_122-2003 Молние
 
 @pytest.fixture(scope="module")
 def rag_config():
-    return pipeline.load_rag_config(RAG_CONFIG)
+    return create_markdown.load_rag_config(RAG_CONFIG)
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +101,7 @@ def test_load_rag_config_inactive_document(rag_config):
 def test_load_rag_config_missing_file():
     """Отсутствующий файл → FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
-        pipeline.load_rag_config("/nonexistent/rag_config.yaml")
+        create_markdown.load_rag_config("/nonexistent/rag_config.yaml")
 
 
 def test_load_rag_config_invalid_yaml(tmp_path):
@@ -109,7 +109,7 @@ def test_load_rag_config_invalid_yaml(tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("defaults: [unclosed\n", encoding="utf-8")
     with pytest.raises(Exception):
-        pipeline.load_rag_config(bad)
+        create_markdown.load_rag_config(bad)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -119,32 +119,32 @@ def test_load_rag_config_invalid_yaml(tmp_path):
 
 def test_extract_heading_number_basic():
     """'3.2.1. Молниеприемники' → '3.2.1'."""
-    assert pipeline._extract_heading_number("3.2.1. Молниеприемники") == "3.2.1"
+    assert create_markdown._extract_heading_number("3.2.1. Молниеприемники") == "3.2.1"
 
 
 def test_extract_heading_number_chapter():
     """'3. ЗАЩИТА' → '3'."""
-    assert pipeline._extract_heading_number("3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ") == "3"
+    assert create_markdown._extract_heading_number("3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ") == "3"
 
 
 def test_extract_heading_number_deep():
     """'3.2.1.1. Общие соображения' → '3.2.1.1'."""
-    assert pipeline._extract_heading_number("3.2.1.1. Общие соображения") == "3.2.1.1"
+    assert create_markdown._extract_heading_number("3.2.1.1. Общие соображения") == "3.2.1.1"
 
 
 def test_extract_heading_number_no_number():
     """Заголовок без номера → None."""
-    assert pipeline._extract_heading_number("Введение") is None
+    assert create_markdown._extract_heading_number("Введение") is None
 
 
 def test_extract_heading_number_requires_trailing_dot():
     """'3.2.1 Молниеприемники' (без точки после номера) → None."""
-    assert pipeline._extract_heading_number("3.2.1 Молниеприемники") is None
+    assert create_markdown._extract_heading_number("3.2.1 Молниеприемники") is None
 
 
 def test_extract_heading_number_empty():
-    assert pipeline._extract_heading_number("") is None
-    assert pipeline._extract_heading_number(None) is None
+    assert create_markdown._extract_heading_number("") is None
+    assert create_markdown._extract_heading_number(None) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,7 +154,7 @@ def test_extract_heading_number_empty():
 
 def test_parse_md_structure_levels_and_numbers(so153_md):
     """Уровни ##..#####, номера и границы (next_line_num)."""
-    struct = pipeline.parse_md_structure(so153_md)
+    struct = create_markdown.parse_md_structure(so153_md)
     # ## СОДЕРЖАНИЕ (level 2, number None), ## 3. (2), ### (3), #### (4), ##### (5)
     levels = [h["level"] for h in struct]
     assert levels == [2, 3, 3, 2, 3, 4, 5]
@@ -174,34 +174,34 @@ def test_parse_md_structure_levels_and_numbers(so153_md):
 def test_parse_md_structure_ignores_non_headings():
     """Строки без '#' не распознаются как заголовки."""
     md = "Просто текст\n## 2. ЗАГОЛОВОК\nещё текст\n# Один hash — не заголовок\n###### 6 хэшей — не заголовок\n"
-    struct = pipeline.parse_md_structure(md)
+    struct = create_markdown.parse_md_structure(md)
     assert len(struct) == 1
     assert struct[0]["number"] == "2"
 
 
 def test_parse_md_structure_empty():
-    assert pipeline.parse_md_structure("") == []
-    assert pipeline.parse_md_structure("текст без заголовков") == []
+    assert create_markdown.parse_md_structure("") == []
+    assert create_markdown.parse_md_structure("текст без заголовков") == []
 
 
 def test_extract_clause_text_between_headings(so153_md):
     """Текст от заголовка до следующего заголовка."""
-    struct = pipeline.parse_md_structure(so153_md)
+    struct = create_markdown.parse_md_structure(so153_md)
     # Пункт #### 3.2.1. — текст 'Молниеприемники могут быть...'
     i = 5
-    text = pipeline.extract_clause_text(so153_md, struct[i]["line_num"], struct[i]["next_line_num"])
+    text = create_markdown.extract_clause_text(so153_md, struct[i]["line_num"], struct[i]["next_line_num"])
     assert text == "Молниеприемники могут быть естественными или искусственными."
     # Глава ## 3. — вводный абзац
     i = 3
-    text = pipeline.extract_clause_text(so153_md, struct[i]["line_num"], struct[i]["next_line_num"])
+    text = create_markdown.extract_clause_text(so153_md, struct[i]["line_num"], struct[i]["next_line_num"])
     assert text.startswith("Вводный абзац главы")
 
 
 def test_extract_clause_text_empty():
     """Заголовок без текста → пустая строка."""
     md = "## A\n## B\nтекст B"
-    struct = pipeline.parse_md_structure(md)
-    text = pipeline.extract_clause_text(md, struct[0]["line_num"], struct[0]["next_line_num"])
+    struct = create_markdown.parse_md_structure(md)
+    text = create_markdown.extract_clause_text(md, struct[0]["line_num"], struct[0]["next_line_num"])
     assert text == ""
 
 
@@ -211,7 +211,7 @@ def test_extract_clause_text_empty():
 
 
 def _struct(md):
-    return pipeline.parse_md_structure(md)
+    return create_markdown.parse_md_structure(md)
 
 
 def test_build_ancestors_adr_table():
@@ -223,17 +223,17 @@ def test_build_ancestors_adr_table():
         "##### 3.2.1.1. Общие соображения\n"
     )
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 0) == {"chapter": "3", "section": None, "clause": None}
-    assert pipeline._build_ancestors(s, 1) == {"chapter": "3", "section": "3.2", "clause": None}
-    assert pipeline._build_ancestors(s, 2) == {"chapter": "3", "section": "3.2", "clause": "3.2.1"}
-    assert pipeline._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": "3.2.1.1"}
+    assert create_markdown._build_ancestors(s, 0) == {"chapter": "3", "section": None, "clause": None}
+    assert create_markdown._build_ancestors(s, 1) == {"chapter": "3", "section": "3.2", "clause": None}
+    assert create_markdown._build_ancestors(s, 2) == {"chapter": "3", "section": "3.2", "clause": "3.2.1"}
+    assert create_markdown._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": "3.2.1.1"}
 
 
 def test_build_ancestors_no_parents():
     """Первый заголовок без предков."""
     md = "#### 3.2.1. Молниеприемники\n"
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 0) == {"chapter": None, "section": None, "clause": "3.2.1"}
+    assert create_markdown._build_ancestors(s, 0) == {"chapter": None, "section": None, "clause": "3.2.1"}
 
 
 def test_build_ancestors_across_chapters():
@@ -246,7 +246,7 @@ def test_build_ancestors_across_chapters():
     )
     s = _struct(md)
     # ### 3.2. → глава 3 (не 2), раздел 3.2
-    assert pipeline._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": None}
+    assert create_markdown._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": None}
 
 
 def test_build_ancestors_unnumbered_subclause():
@@ -258,7 +258,7 @@ def test_build_ancestors_unnumbered_subclause():
         "##### Общие соображения\n"
     )
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": "3.2.1"}
+    assert create_markdown._build_ancestors(s, 3) == {"chapter": "3", "section": "3.2", "clause": "3.2.1"}
 
 
 def test_build_ancestors_new_chapter_resets_section_clause():
@@ -274,7 +274,7 @@ def test_build_ancestors_new_chapter_resets_section_clause():
     )
     s = _struct(md)
     # Второй top-level ## 1: section/clause сброшены, глава — своя
-    assert pipeline._build_ancestors(s, 2) == {"chapter": "1", "section": None, "clause": None}
+    assert create_markdown._build_ancestors(s, 2) == {"chapter": "1", "section": None, "clause": None}
 
 
 def test_build_ancestors_new_chapter_after_clause_resets():
@@ -286,7 +286,7 @@ def test_build_ancestors_new_chapter_after_clause_resets():
         "## 2. Порядок приемки\n"
     )
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": None}
+    assert create_markdown._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": None}
 
 
 def test_build_ancestors_section_bounded_by_chapter():
@@ -298,7 +298,7 @@ def test_build_ancestors_section_bounded_by_chapter():
         "#### 2.1. Оформление\n"
     )
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": "2.1"}
+    assert create_markdown._build_ancestors(s, 3) == {"chapter": "2", "section": None, "clause": "2.1"}
 
 
 def test_build_ancestors_unnumbered_clause_bounded_by_chapter():
@@ -317,7 +317,7 @@ def test_build_ancestors_unnumbered_clause_bounded_by_chapter():
         "Текст\n"
     )
     s = _struct(md)
-    assert pipeline._build_ancestors(s, 4) == {
+    assert create_markdown._build_ancestors(s, 4) == {
         "chapter": "1",
         "section": None,
         "clause": None,
@@ -335,7 +335,7 @@ def test_build_heading_texts_unnumbered_clause_bounded_by_chapter():
         "Текст\n"
     )
     s = _struct(md)
-    assert pipeline._build_heading_texts(s, 4) == {
+    assert create_markdown._build_heading_texts(s, 4) == {
         "chapter": "1. Новое",
         "section": None,
         "clause": None,
@@ -351,7 +351,7 @@ def test_build_heading_texts_unnumbered_subclause_inherits_text():
         "##### Общие соображения\n"
     )
     s = _struct(md)
-    assert pipeline._build_heading_texts(s, 3) == {
+    assert create_markdown._build_heading_texts(s, 3) == {
         "chapter": "3. ЗАЩИТА",
         "section": "3.2. Внешняя МЗС",
         "clause": "3.2.1. Молниеприемники",
@@ -366,7 +366,7 @@ def test_build_heading_texts_new_chapter_resets():
         "## 1. Разработка эксплуатационно-технической документации\n"
     )
     s = _struct(md)
-    assert pipeline._build_heading_texts(s, 2) == {
+    assert create_markdown._build_heading_texts(s, 2) == {
         "chapter": "1. Разработка эксплуатационно-технической документации",
         "section": None,
         "clause": None,
@@ -386,7 +386,7 @@ def test_build_embedding_text_full():
         "clause": "2.3.1. Амплитуда",
     }
     text = "Исходный текст."
-    assert pipeline._build_embedding_text(ht, text) == (
+    assert create_markdown._build_embedding_text(ht, text) == (
         "Заголовок главы: 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
         "Заголовок раздела: 2.3. Параметры токов молнии\n"
         "Заголовок пункта: 2.3.1. Амплитуда\n"
@@ -403,7 +403,7 @@ def test_build_embedding_text_short_section_only():
         "clause": None,
     }
     text = "Молния представляет собой импульс тока."
-    emb = pipeline._build_embedding_text(ht, text)
+    emb = create_markdown._build_embedding_text(ht, text)
     assert emb == (
         "Заголовок главы: 2. ОБЩИЕ ПОЛОЖЕНИЯ\n"
         "Заголовок раздела: 2.3. Параметры токов молнии\n"
@@ -417,7 +417,7 @@ def test_build_embedding_text_short_section_only():
 def test_build_embedding_text_chapter_only():
     """Только глава (top-level): один заголовок + текст."""
     ht = {"chapter": "1. ВВЕДЕНИЕ", "section": None, "clause": None}
-    assert pipeline._build_embedding_text(ht, "Текст.") == (
+    assert create_markdown._build_embedding_text(ht, "Текст.") == (
         "Заголовок главы: 1. ВВЕДЕНИЕ\n"
         "\n"
         "Текст."
@@ -426,9 +426,9 @@ def test_build_embedding_text_chapter_only():
 
 def test_build_embedding_text_no_headings():
     """Нет заголовков (или None) → только исходный текст."""
-    assert pipeline._build_embedding_text({}, "text") == "text"
-    assert pipeline._build_embedding_text(None, "text") == "text"
-    assert pipeline._build_embedding_text(
+    assert create_markdown._build_embedding_text({}, "text") == "text"
+    assert create_markdown._build_embedding_text(None, "text") == "text"
+    assert create_markdown._build_embedding_text(
         {"chapter": None, "section": None, "clause": None}, "text"
     ) == "text"
 
@@ -445,7 +445,7 @@ def patterns(rag_config):
 
 def test_extract_references_acceptance(patterns):
     """Приёмка плана: 'см. п. 3.2.1, табл. 3.1' → ['п. 3.2.1', 'табл. 3.1']."""
-    refs = pipeline.extract_references("см. п. 3.2.1, табл. 3.1", patterns)
+    refs = create_markdown.extract_references("см. п. 3.2.1, табл. 3.1", patterns)
     assert refs == ["п. 3.2.1", "табл. 3.1"]
 
 
@@ -455,7 +455,7 @@ def test_extract_references_all_patterns(patterns):
         "см. п. 3.2.1; согласно п. 1.2; по пункту 4.5; "
         "таблица 3.1 и табл. 2.2; разд. 5; гл. 1 и глава 7"
     )
-    refs = pipeline.extract_references(text, patterns)
+    refs = create_markdown.extract_references(text, patterns)
     assert "п. 3.2.1" in refs
     assert "п. 1.2" in refs
     assert "п. 4.5" in refs
@@ -468,21 +468,21 @@ def test_extract_references_all_patterns(patterns):
 
 def test_extract_references_dedup(patterns):
     """Дедупликация одинаковых ссылок."""
-    refs = pipeline.extract_references("см. п. 3.2.1 и снова см. п. 3.2.1", patterns)
+    refs = create_markdown.extract_references("см. п. 3.2.1 и снова см. п. 3.2.1", patterns)
     assert refs == ["п. 3.2.1"]
 
 
 def test_extract_references_empty():
     """Нет совпадений / пустой текст / пустые паттерны → []."""
-    assert pipeline.extract_references("просто текст", ["см\\.\\s*п\\.\\s*(\\d+)"]) == []
-    assert pipeline.extract_references("", ["см\\.\\s*п\\.\\s*(\\d+)"]) == []
-    assert pipeline.extract_references("см. п. 3.2.1", []) == []
-    assert pipeline.extract_references("см. п. 3.2.1", None) == []
+    assert create_markdown.extract_references("просто текст", ["см\\.\\s*п\\.\\s*(\\d+)"]) == []
+    assert create_markdown.extract_references("", ["см\\.\\s*п\\.\\s*(\\d+)"]) == []
+    assert create_markdown.extract_references("см. п. 3.2.1", []) == []
+    assert create_markdown.extract_references("см. п. 3.2.1", None) == []
 
 
 def test_extract_references_bad_pattern(patterns):
     """Некорректный regexp не роняет вызов."""
-    refs = pipeline.extract_references("см. п. 3.2.1", patterns + ["("])
+    refs = create_markdown.extract_references("см. п. 3.2.1", patterns + ["("])
     assert "п. 3.2.1" in refs
 
 
@@ -497,18 +497,18 @@ def test_get_page_for_heading():
         {"page": 7, "number": "3.2.1"},
         {"page": 9, "number": "3.2.1"},  # дубликат — берётся первое
     ]
-    assert pipeline._get_page_for_heading("3.2.1", jh) == 7
+    assert create_markdown._get_page_for_heading("3.2.1", jh) == 7
 
 
 def test_get_page_for_heading_not_found():
     jh = [{"page": 0, "number": "1"}]
-    assert pipeline._get_page_for_heading("9.9", jh) is None
+    assert create_markdown._get_page_for_heading("9.9", jh) is None
 
 
 def test_get_page_for_heading_empty_inputs():
-    assert pipeline._get_page_for_heading("1", None) is None
-    assert pipeline._get_page_for_heading("1", []) is None
-    assert pipeline._get_page_for_heading(None, [{"page": 0, "number": "1"}]) is None
+    assert create_markdown._get_page_for_heading("1", None) is None
+    assert create_markdown._get_page_for_heading("1", []) is None
+    assert create_markdown._get_page_for_heading(None, [{"page": 0, "number": "1"}]) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -518,14 +518,14 @@ def test_get_page_for_heading_empty_inputs():
 
 def test_split_oversized_small_text():
     """len(text) <= max_chars → [text]."""
-    assert pipeline._split_oversized_clause("маленький", 1500) == ["маленький"]
+    assert create_markdown._split_oversized_clause("маленький", 1500) == ["маленький"]
 
 
 def test_split_oversized_groups_paragraphs():
     """Параграфы группируются в чанки ≤ max_chars, порядок сохраняется."""
     paras = [f"Параграф номер {i} " * 3 for i in range(5)]  # ~51 символ
     text = "\n\n".join(paras)
-    parts = pipeline._split_oversized_clause(text, 120)
+    parts = create_markdown._split_oversized_clause(text, 120)
     assert len(parts) == 3
     assert all(len(p) <= 120 for p in parts)
     # Склейка сохраняет исходный текст (с точностью до разделителей)
@@ -536,7 +536,7 @@ def test_split_oversized_table_atomic():
     """Таблица (| строки) не разрывается."""
     table = "| a | b |\n| 1 | 2 |\n| 3 | 4 |"
     text = "Текст.\n\n" + table + "\n\nЕщё текст"
-    parts = pipeline._split_oversized_clause(text, 10)
+    parts = create_markdown._split_oversized_clause(text, 10)
     assert any(table in p for p in parts)
 
 
@@ -544,20 +544,20 @@ def test_split_oversized_giant_table_as_is():
     """Одиночный блок > max_chars публикуется как есть (ADR-9b п.5)."""
     giant = "| " + "x" * 500 + " |"
     text = "До\n\n" + giant + "\n\nПосле"
-    parts = pipeline._split_oversized_clause(text, 100)
+    parts = create_markdown._split_oversized_clause(text, 100)
     assert giant in parts
 
 
 def test_split_oversized_code_block_atomic():
     """Кодовый блок (```...```) не разрывается, даже с пустыми строками."""
     code = "```\nline\n\n" * 10 + "```"
-    parts = pipeline._split_oversized_clause(code, 40)
+    parts = create_markdown._split_oversized_clause(code, 40)
     assert len(parts) >= 1
     assert all("```" in p for p in parts)
 
 
 def test_split_oversized_empty():
-    assert pipeline._split_oversized_clause("", 10) == [""]
+    assert create_markdown._split_oversized_clause("", 10) == [""]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -566,22 +566,22 @@ def test_split_oversized_empty():
 
 
 def test_find_doc_key_exact(rag_config):
-    assert pipeline._find_doc_key("СО153-34_21_122-2003 Молниезащита.pdf", rag_config) == "so153_molniezashita"
+    assert create_markdown._find_doc_key("СО153-34_21_122-2003 Молниезащита.pdf", rag_config) == "so153_molniezashita"
 
 
 def test_find_doc_key_normalized(rag_config):
     """Дефисы/подчёркивания и регистр не мешают сопоставлению."""
-    assert pipeline._find_doc_key("со153-34-21-122-2003 молниезащита.PDF", rag_config) == "so153_molniezashita"
+    assert create_markdown._find_doc_key("со153-34-21-122-2003 молниезащита.PDF", rag_config) == "so153_molniezashita"
 
 
 def test_find_doc_key_stem_match(rag_config):
     """Совпадение по stem (например, .docx вместо .pdf)."""
-    assert pipeline._find_doc_key("СО153-34_21_122-2003 Молниезащита.docx", rag_config) == "so153_molniezashita"
+    assert create_markdown._find_doc_key("СО153-34_21_122-2003 Молниезащита.docx", rag_config) == "so153_molniezashita"
 
 
 def test_find_doc_key_not_found(rag_config):
-    assert pipeline._find_doc_key("other_document.pdf", rag_config) is None
-    assert pipeline._find_doc_key("other_document.pdf", None) is None
+    assert create_markdown._find_doc_key("other_document.pdf", rag_config) is None
+    assert create_markdown._find_doc_key("other_document.pdf", None) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -597,7 +597,7 @@ def test_build_rag_jsonl_basic(so153_md, rag_config):
         {"page": 9, "number": "3.2.1"},
         {"page": 10, "number": "3.2.1.1"},
     ]
-    jsonl = pipeline.build_rag_jsonl(so153_md, jh, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(so153_md, jh, rag_config, "so153_molniezashita")
     rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
 
     # СОДЕРЖАНИЕ + подразделы пропущены → остаются 4 clause
@@ -629,7 +629,7 @@ def test_build_rag_jsonl_basic(so153_md, rag_config):
 
 def test_build_rag_jsonl_every_line_valid(so153_md, rag_config):
     """Каждая строка JSONL парсится json.loads()."""
-    jsonl = pipeline.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
     for line in jsonl.splitlines():
         if line.strip():
             obj = json.loads(line)
@@ -641,7 +641,7 @@ def test_build_rag_jsonl_every_line_valid(so153_md, rag_config):
 
 def test_build_rag_jsonl_ignore_sections(so153_md, rag_config):
     """ignore_sections=['Содержание'] → секция и подразделы пропущены."""
-    jsonl = pipeline.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
     assert "Текст оглавления" not in jsonl
     rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
     # Ни один heading из оглавления не попал в ancestors: раздел 3.2.1.1
@@ -651,7 +651,7 @@ def test_build_rag_jsonl_ignore_sections(so153_md, rag_config):
 
 def test_build_rag_jsonl_source_page_null_without_json(so153_md, rag_config):
     """Без Yandex JSON → source.page = null (режим .md + --rag)."""
-    jsonl = pipeline.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(so153_md, None, rag_config, "so153_molniezashita")
     rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
     assert all(r["source"]["page"] is None for r in rows)
 
@@ -669,7 +669,7 @@ def test_build_rag_jsonl_oversized_splits(rag_config):
         "#### 3.2.1. Молниеприемники\n"
         + "\n\n".join(paras)
     )
-    jsonl = pipeline.build_rag_jsonl(md, [{"page": 5, "number": "3.2.1"}], cfg, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(md, [{"page": 5, "number": "3.2.1"}], cfg, "so153_molniezashita")
     rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
     assert len(rows) >= 2
     clauses = [r["clause"] for r in rows]
@@ -686,19 +686,19 @@ def test_build_rag_jsonl_oversized_splits(rag_config):
 def test_build_rag_jsonl_unknown_doc_key(so153_md, rag_config):
     """Неизвестный doc_key → ValueError."""
     with pytest.raises(ValueError):
-        pipeline.build_rag_jsonl(so153_md, None, rag_config, "unknown_doc")
+        create_markdown.build_rag_jsonl(so153_md, None, rag_config, "unknown_doc")
 
 
 def test_build_rag_jsonl_empty_md(rag_config):
     """Пустой MD → пустая JSONL-строка."""
-    jsonl = pipeline.build_rag_jsonl("", None, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl("", None, rag_config, "so153_molniezashita")
     assert jsonl == ""
 
 
 def test_build_rag_jsonl_skips_empty_clauses(rag_config):
     """Заголовок без текста → clause пропущен."""
     md = "## 1. ПУСТАЯ ГЛАВА\n## 2. ГЛАВА С ТЕКСТОМ\nТекст второй главы."
-    jsonl = pipeline.build_rag_jsonl(md, None, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(md, None, rag_config, "so153_molniezashita")
     rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
     assert len(rows) == 1
     assert rows[0]["chapter"] == "2"
@@ -715,12 +715,12 @@ def test_build_rag_jsonl_real_json(rag_config):
         pytest.skip(f"Тестовый JSON не найден: {TEST_JSON}")
     with open(TEST_JSON, encoding="utf-8") as f:
         pages = json.load(f)
-    md_text, _, _ = pipeline.parse_yandex_json_to_md(pages=pages)
-    headings = pipeline._extract_headings_from_json(pages)
-    md_text = pipeline._apply_headings_to_md(md_text, headings)
+    md_text, _, _ = create_markdown.parse_yandex_json_to_md(pages=pages)
+    headings = create_markdown._extract_headings_from_json(pages)
+    md_text = create_markdown._apply_headings_to_md(md_text, headings)
     assert len(headings) >= 68
 
-    jsonl = pipeline.build_rag_jsonl(md_text, headings, rag_config, "so153_molniezashita")
+    jsonl = create_markdown.build_rag_jsonl(md_text, headings, rag_config, "so153_molniezashita")
     rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
     assert len(rows) > 0
     # Ни один clause не содержит оглавление (ignore_sections)
@@ -749,13 +749,13 @@ def test_process_file_rag_writes_jsonl(tmp_path, rag_config):
                                              "blocks": [], "tables": [], "pictures": []}}}]
     md = "## 3. ЗАЩИТА ОТ ПРЯМЫХ УДАРОВ МОЛНИИ\nТекст главы.\n"
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline._init_tokenizer",
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown._init_tokenizer",
                return_value=(lambda t: len(t) // 3, "qwen3")), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
-        ok = pipeline.process_file(
+         patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+        ok = create_markdown.process_file(
             pdf, use_ai=False, config={},
             api_key="key", folder_id="folder",
             output_base=out_base, tmp_base=tmp_base,
@@ -785,11 +785,11 @@ def test_process_file_rag_no_doc_key(tmp_path, rag_config):
                                              "blocks": [], "tables": [], "pictures": []}}}]
     md = "## 3. ТЕКСТ\nТекст.\n"
 
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+        ok = create_markdown.process_file(
             pdf, use_ai=False, config={},
             api_key="key", folder_id="folder",
             output_base=out_base, tmp_base=tmp_base,
@@ -806,11 +806,11 @@ def test_process_file_without_rag_no_jsonl(tmp_path, rag_config):
     pages = [{"result": {"textAnnotation": {"width": 10, "height": 10,
                                              "blocks": [], "tables": [], "pictures": []}}}]
     md = "## 3. ТЕКСТ\nТекст.\n"
-    with patch("pipeline.send_to_yandex_ocr", return_value=pages), \
-         patch("pipeline.parse_yandex_json_to_md", return_value=(md, [], [])), \
-         patch("pipeline.extract_images_from_pdf", return_value=[]), \
-         patch("pipeline.run_script_postprocess", side_effect=lambda m, i, **kw: m):
-        ok = pipeline.process_file(
+    with patch("create_markdown.send_to_yandex_ocr", return_value=pages), \
+         patch("create_markdown.parse_yandex_json_to_md", return_value=(md, [], [])), \
+         patch("create_markdown.extract_images_from_pdf", return_value=[]), \
+         patch("create_markdown.run_script_postprocess", side_effect=lambda m, i, **kw: m):
+        ok = create_markdown.process_file(
             pdf, use_ai=False, config={},
             api_key="key", folder_id="folder",
             output_base=out_base, tmp_base=tmp_base,
@@ -826,9 +826,9 @@ def test_process_file_md_rag(tmp_path, rag_config):
     out_base = str(tmp_path / "out")
     tmp_base = str(tmp_path / "tmp")
 
-    with patch("pipeline._init_tokenizer",
+    with patch("create_markdown._init_tokenizer",
                return_value=(lambda t: len(t) // 3, "qwen3")):
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             str(md_file), use_ai=False, config={},
             api_key="", folder_id="",
             output_base=out_base, tmp_base=tmp_base,
@@ -850,7 +850,7 @@ def test_process_file_md_without_ai_rag_fails(tmp_path, rag_config):
     """.md без --ai и без --rag → ошибка (существующее поведение)."""
     md_file = tmp_path / "doc.md"
     md_file.write_text("текст", encoding="utf-8")
-    ok = pipeline.process_file(
+    ok = create_markdown.process_file(
         str(md_file), use_ai=False, config={},
         api_key="", folder_id="",
         output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
@@ -865,11 +865,11 @@ def test_process_file_md_ai_rag(tmp_path, rag_config):
     out_base = str(tmp_path / "out")
     tmp_base = str(tmp_path / "tmp")
 
-    with patch("pipeline.ai_postprocess",
+    with patch("create_markdown.ai_postprocess",
                side_effect=lambda md, cfg, label: md + "\n\n## 4. ДОБАВЛЕНО AI\nТекст.\n"), \
-         patch("pipeline._init_tokenizer",
+         patch("create_markdown._init_tokenizer",
                return_value=(lambda t: len(t) // 3, "qwen3")):
-        ok = pipeline.process_file(
+        ok = create_markdown.process_file(
             str(md_file), use_ai=True, config={"ai_postprocess": {"prompt": "x"}},
             api_key="", folder_id="",
             output_base=out_base, tmp_base=tmp_base,
@@ -889,13 +889,13 @@ def test_process_file_md_ai_rag(tmp_path, rag_config):
 
 
 def test_parse_args_rag_flags():
-    args = pipeline.parse_args(["-i", "file.pdf", "--rag", "--rag-config", "my_rag.yaml"])
+    args = create_markdown.parse_args(["-i", "file.pdf", "--rag", "--rag-config", "my_rag.yaml"])
     assert args.rag is True
     assert args.rag_config == "my_rag.yaml"
 
 
 def test_parse_args_rag_defaults():
-    args = pipeline.parse_args(["-i", "file.pdf"])
+    args = create_markdown.parse_args(["-i", "file.pdf"])
     assert args.rag is False
     assert args.rag_config == "./rag_config.yaml"
 

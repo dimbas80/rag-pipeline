@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from pipeline import (
+from create_markdown import (
     _CONTINUATION_CAPTION_RE,
     _find_table_caption_block,
     _normalize_inline_latex_delimiters,

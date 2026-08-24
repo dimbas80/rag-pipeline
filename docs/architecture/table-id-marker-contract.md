@@ -1,7 +1,7 @@
 # Контракт ID-маркеров таблиц `<!-- t_pN_M -->`
 
 Статус: утверждено (architect, t_6340b905). Реализация: coder (t_d50ff6ce).
-Файл-источник кода: `firmware/src/pipeline.py` (строки указаны приблизительно, по состоянию на
+Файл-источник кода: `firmware/src/create_markdown.py` (строки указаны приблизительно, по состоянию на
 коммит `fc62e01`; при реализации ориентироваться на имена функций).
 
 ## 1. Цель
@@ -388,10 +388,10 @@ elif etype == "table":
 
 ## 11. Критерии приёмки (для coder'а)
 
-- `python3 -m py_compile firmware/src/pipeline.py` — чисто.
+- `python3 -m py_compile firmware/src/create_markdown.py` — чисто.
 - `cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py` — все проходят.
 - Тесты T1-T13 реализованы; старые тесты `_inject_table_ids` удалены/заменены.
-- `_inject_table_ids` отсутствует в `pipeline.py`; `run_script_postprocess` без `page_boundaries`;
+- `_inject_table_ids` отсутствует в `create_markdown.py`; `run_script_postprocess` без `page_boundaries`;
   AI-этап и `recognize_tables_vision` не изменены (проверить `git diff` по строкам ≈1909-1964,
   ≈5260-5357).
 - Воспроизведение на ГОСТ 18410-73 (или эквивалентных синтетических фикстурах): «Таблица 2»

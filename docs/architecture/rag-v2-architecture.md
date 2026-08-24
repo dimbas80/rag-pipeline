@@ -3,7 +3,7 @@
 **Статус:** Предложено (архитектура, исправлено)
 **Дата:** 2026-08-05
 **ADR:** [ADR-010](decision-records/adr-010-rag-semantic-assets-and-token-chunking.md)
-**На основе:** ADR-009, `firmware/src/pipeline.py` (секция 12)
+**На основе:** ADR-009, `firmware/src/create_markdown.py` (секция 12)
 
 > **Исправления (2026-08-05):**
 > - Токенизатор заменён с `tiktoken cl100k_base` на `Qwen/Qwen3-Embedding-8B` через `transformers.AutoTokenizer`
@@ -15,7 +15,7 @@
 
 ## 1. Обзор
 
-RAG v2 расширяет существующий RAG-контур (ADR-009, секция 12 pipeline.py) следующими возможностями:
+RAG v2 расширяет существующий RAG-контур (ADR-009, секция 12 create_markdown.py) следующими возможностями:
 
 1. **Токен-ориентированное чанкирование** (Qwen3-Embedding-8B native tokenizer, `max_chunk_tokens: 7000`)
 2. **Статус документа** (`active`/`inactive`) в `rag_config.yaml` и каждой JSONL-строке
@@ -31,7 +31,7 @@ RAG v2 расширяет существующий RAG-контур (ADR-009, с
 ### 2.1 Декомпозиция модулей
 
 ```
-pipeline.py
+create_markdown.py
 ├── ...
 ├── 11. CLI & Main                         (существующий, обновлён)
 ├── 12. RAG JSONL Converter v1             (существующий, обновлён)
@@ -537,18 +537,18 @@ def _run_rag_only(md_path: Path, rag_config: dict | None) -> bool:
 
 ```bash
 # Этап 1: Генерация Markdown из PDF (таблицы всегда в image/)
-python3 pipeline.py -i file.pdf                  # без AI
-python3 pipeline.py -i file.pdf --ai             # с AI (сложный документ)
+python3 create_markdown.py -i file.pdf                  # без AI
+python3 create_markdown.py -i file.pdf --ai             # с AI (сложный документ)
 
 # Этап 2: Проверка человеком
 # (открыть Markdown/file/file.md, сверить с PDF, при необходимости поправить)
 
 # Этап 3: RAG-индексация проверенного Markdown
 # (перезаписывает rag_chunks.jsonl и rag_assets.json, не трогает .md и image/)
-python3 pipeline.py -i Markdown/file/file.md --rag
+python3 create_markdown.py -i Markdown/file/file.md --rag
 
 # Всё вместе (быстрый путь, без проверки):
-python3 pipeline.py -i file.pdf --ai --rag
+python3 create_markdown.py -i file.pdf --ai --rag
 ```
 
 **Контракт перезаписи:**
@@ -676,7 +676,7 @@ def validate_rag_config(config: dict) -> list[str]:
 
 ## 7. Миграция с v1
 
-### 7.1 Что меняется в pipeline.py
+### 7.1 Что меняется в create_markdown.py
 
 | Функция | Изменение |
 |---------|-----------|

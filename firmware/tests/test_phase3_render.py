@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from pipeline import (
+from create_markdown import (
     BBox, Block, Cell, Document, Page, Picture, Table,
     merge_tables_by_model, render_document_to_md, table_cells_to_md,
 )

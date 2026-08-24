@@ -8,7 +8,7 @@
 
 ## 1. Problem Statement
 
-The current pipeline (`firmware/src/pipeline.py`) processes documents through an intermediate `raw.md` artifact:
+The current pipeline (`firmware/src/create_markdown.py`) processes documents through an intermediate `raw.md` artifact:
 
 ```
 Yandex JSON → parse_yandex_json_to_md() → raw.md → postprocessing → final.md
@@ -359,7 +359,7 @@ Per user requirement: **NOT a big-bang rewrite**. Incremental migration with wor
 
 ## 6. Interface Definitions
 
-### 6.1 New Public Functions (added to pipeline.py)
+### 6.1 New Public Functions (added to create_markdown.py)
 
 ```python
 # Phase 1
@@ -413,7 +413,7 @@ def ai_postprocess_json_native(
 | `extract_table_images()` | Keep for backward compat; new model-based version above |
 | `parse_yandex_json_to_md()` | Keep for backward compat; mark deprecated |
 
-### 6.3 Data Classes (in pipeline.py or new `models.py`)
+### 6.3 Data Classes (in create_markdown.py or new `models.py`)
 
 ```python
 @dataclass
@@ -527,7 +527,7 @@ table_stitching:
 cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py
 
 # Specific document test
-python3 pipeline.py -i "СП 52.pdf" --json-native --ai --rag
+python3 create_markdown.py -i "СП 52.pdf" --json-native --ai --rag
 # Verify: Table 4.1 has 4 component_images; no <!-- t_p --> in output
 ```
 
@@ -549,7 +549,7 @@ python3 pipeline.py -i "СП 52.pdf" --json-native --ai --rag
 
 1. **Architecture Document:** This file → `docs/architecture/json-native-pipeline.md`
 2. **Implementation Report:** `workflows/t_f82ca6a2/implementation-report.md` (after coder completes)
-3. **Git Branch:** `refactor/json-pipeline` with only `firmware/src/pipeline.py` changes
+3. **Git Branch:** `refactor/json-pipeline` with only `firmware/src/create_markdown.py` changes
 4. **Updated Contracts:** `table-id-marker-contract.md` marked superseded; new section in `rag-v2-architecture.md`
 
 ---
@@ -558,7 +558,7 @@ python3 pipeline.py -i "СП 52.pdf" --json-native --ai --rag
 
 - Changing `rag_config.yaml` or `config_ai.yaml` schemas (user forbids)
 - Changing `table_images.json` schema (user forbids)
-- Rewriting `firmware/src/pipeline.py` from scratch (incremental only)
+- Rewriting `firmware/src/create_markdown.py` from scratch (incremental only)
 - New dependencies beyond `transformers` (already in RAG v2)
 - Big-bang migration — each phase must keep pipeline working
 

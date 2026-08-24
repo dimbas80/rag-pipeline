@@ -2,7 +2,7 @@
 
 **Task:** `t_f82ca6a2` — Design architecture for JSON-native pipeline (no `raw.md`)  
 **Output:** `docs/architecture/json-native-pipeline.md` (completed) + this plan  
-**Branch:** `refactor/json-pipeline` (only `firmware/src/pipeline.py` changes)  
+**Branch:** `refactor/json-pipeline` (only `firmware/src/create_markdown.py` changes)
 **Method:** Incremental phases, working pipeline at each step
 
 ---
@@ -22,7 +22,7 @@
 
 ## Phase 1: Structured Document Model + Stage 1 Parser
 
-### 1.1 Add Dataclasses (top of pipeline.py, after imports)
+### 1.1 Add Dataclasses (top of create_markdown.py, after imports)
 
 ```python
 from dataclasses import dataclass, field
@@ -129,7 +129,7 @@ class Document:
 ```bash
 # Compare headings/tables between old parse and new model
 python3 -c "
-from pipeline import parse_yandex_json_to_md, parse_yandex_json_to_model
+from create_markdown import parse_yandex_json_to_md, parse_yandex_json_to_model
 pages = load_test_pages()
 md_old, _, _ = parse_yandex_json_to_md(pages=pages)
 doc_new = parse_yandex_json_to_model(pages)
@@ -298,7 +298,7 @@ def populate_component_images(doc: Document) -> None:
 ```bash
 # Test on СП 52 (Table 4.1 = 4 pages)
 python3 -c "
-from pipeline import parse_yandex_json_to_model, stitch_tables, extract_table_images_from_model
+from create_markdown import parse_yandex_json_to_model, stitch_tables, extract_table_images_from_model
 doc = parse_yandex_json_to_model(pages)
 stitch_tables(doc)
 extract_table_images_from_model('SP52.pdf', doc, Path('image'))
@@ -376,8 +376,8 @@ Reuse existing `_matrix_to_md_table` logic.
 
 ```bash
 # Diff against current pipeline output
-python3 pipeline.py -i "SP52.pdf" --json-native  # new
-python3 pipeline.py -i "SP52.pdf"                # old
+python3 create_markdown.py -i "SP52.pdf" --json-native  # new
+python3 create_markdown.py -i "SP52.pdf"                # old
 diff Markdown/SP52/SP52.md Markdown/SP52/SP52.md.old
 # Should show only formatting differences, no structural changes
 ```
@@ -388,7 +388,7 @@ diff Markdown/SP52/SP52.md Markdown/SP52/SP52.md.old
 
 ### 4.1 Delete `_inject_table_ids()` Entirely
 
-Remove function (≈lines 2711-2802 in current pipeline.py).
+Remove function (≈lines 2711-2802 in current create_markdown.py).
 
 ### 4.2 Remove Marker Emission from Parse
 
@@ -429,7 +429,7 @@ md_text = _merge_by_component_images(md_text, table_images_for_stitch)
 
 ```bash
 # No markers in output
-python3 pipeline.py -i "SP52.pdf" --json-native
+python3 create_markdown.py -i "SP52.pdf" --json-native
 grep -c '<!-- t_p' Markdown/SP52/SP52.md
 # Expected: 0
 
@@ -511,7 +511,7 @@ def process_file(...):
 
 ```bash
 # AI run on SP52 with --json-native --ai
-python3 pipeline.py -i "SP52.pdf" --json-native --ai
+python3 create_markdown.py -i "SP52.pdf" --json-native --ai
 # Verify: tables corrected, no marker warnings in log
 ```
 
@@ -555,7 +555,7 @@ python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py
 
 # Test all 3 corpus documents
 for doc in "SP52.pdf" "SP89.pdf" "GOST18410.pdf"; do
-    python3 pipeline.py -i "$doc" --json-native --ai --rag
+    python3 create_markdown.py -i "$doc" --json-native --ai --rag
     # Verify outputs
 done
 ```
@@ -564,7 +564,7 @@ done
 
 ## File Changes Summary
 
-**Only `firmware/src/pipeline.py` modified:**
+**Only `firmware/src/create_markdown.py` modified:**
 
 | Region | Change |
 |--------|--------|
@@ -609,7 +609,7 @@ If any phase breaks regression:
 
 1. ✅ `docs/architecture/json-native-pipeline.md` (architecture document)
 2. This file → `workflows/t_f82ca6a2/implementation-plan.md`
-3. Branch `refactor/json-pipeline` with `firmware/src/pipeline.py` changes
+3. Branch `refactor/json-pipeline` with `firmware/src/create_markdown.py` changes
 4. Updated `table-id-marker-contract.md` (mark superseded)
 5. Implementation report after coder completes
 

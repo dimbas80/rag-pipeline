@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown через Yandex Vision OCR.
+create_markdown.py — Пайплайн конвертации PDF/DOCX/MD в Markdown через Yandex Vision OCR.
 
 Модель: math-markdown (даёт markdown + tables + pictures + blocks).
 
@@ -13,11 +13,11 @@ pipeline.py — Пайплайн конвертации PDF/DOCX/MD в Markdown 
 Режим .md + --ai: только AI-постобработка готового .md файла, без OCR.
 
 Использование:
-  python3 pipeline.py -i file.pdf
-  python3 pipeline.py -i file.pdf --ai --config config_ai.yaml
-  python3 pipeline.py -i file.md --ai                 # только AI
-  python3 pipeline.py -i file.pdf --rag               # + RAG JSONL (секция 12)
-  python3 pipeline.py -i dir/
+  python3 create_markdown.py -i file.pdf
+  python3 create_markdown.py -i file.pdf --ai --config config_ai.yaml
+  python3 create_markdown.py -i file.md --ai                 # только AI
+  python3 create_markdown.py -i file.pdf --rag               # + RAG JSONL (секция 12)
+  python3 create_markdown.py -i dir/
 """
 
 import argparse

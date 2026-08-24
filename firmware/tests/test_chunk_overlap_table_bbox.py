@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
-from pipeline import ai_postprocess, extract_table_images, _chunk_text, SECTION_BOUNDARY_RE  # noqa: E402
+from create_markdown import ai_postprocess, extract_table_images, _chunk_text, SECTION_BOUNDARY_RE  # noqa: E402
 
 CTX_START = "[Контекст из предыдущего чанка]"
 CTX_END = "[Конец контекста]"
@@ -38,7 +38,7 @@ def test_ai_postprocess_single_chunk_no_overlap(monkeypatch, tmp_path):
     md_text = "# Заголовок\n\nОбычный текст."
     calls = []
 
-    with patch("pipeline._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
+    with patch("create_markdown._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
         result = ai_postprocess(md_text, {}, file_label="test")
 
     assert len(calls) == 1
@@ -68,7 +68,7 @@ def test_ai_postprocess_multi_chunk_overlap_last_3_lines(monkeypatch, tmp_path):
     assert len(chunks) == 2, f"Ожидалось 2 чанка, получено {len(chunks)}: {chunks!r}"
 
     calls = []
-    with patch("pipeline._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
+    with patch("create_markdown._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
         result = ai_postprocess(md_text, {}, file_label="test")
 
     assert len(calls) == 2
@@ -94,7 +94,7 @@ def test_ai_postprocess_multi_chunk_overlap_short_prev(monkeypatch, tmp_path):
     assert len(chunks[0].strip().split("\n")) < 3
 
     calls = []
-    with patch("pipeline._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
+    with patch("create_markdown._call_ai_api", side_effect=_fake_ai_strips_context(calls)):
         ai_postprocess(md_text, {}, file_label="test")
 
     expected = f"{CTX_START}\n{chunks[0].strip()}\n{CTX_END}\n\n{chunks[1]}"

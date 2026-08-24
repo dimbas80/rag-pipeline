@@ -255,8 +255,8 @@ documents:
 
 **Этап 1 — Генерация (как сейчас):**
 ```bash
-python3 pipeline.py -i file.pdf            # без --ai: простой документ
-python3 pipeline.py -i file.pdf --ai       # с --ai: сложный документ
+python3 create_markdown.py -i file.pdf            # без --ai: простой документ
+python3 create_markdown.py -i file.pdf --ai       # с --ai: сложный документ
 ```
 → `Markdown/file/file.md` + `image/`
 
@@ -271,7 +271,7 @@ python3 pipeline.py -i file.pdf --ai       # с --ai: сложный докум�
 
 **Этап 3 — RAG-индексация (отдельный запуск):**
 ```bash
-python3 pipeline.py -i Markdown/file/file.md --rag
+python3 create_markdown.py -i Markdown/file/file.md --rag
 ```
 → `Markdown/file/rag_chunks.jsonl` + `rag_assets.json`
 
@@ -301,7 +301,7 @@ python3 pipeline.py -i Markdown/file/file.md --rag
 - Разделение этапов исключает риск случайной перезаписи проверенного Markdown
 - Явный контракт: .md внутри Markdown/ + --rag = только индексация
 - Перезапись JSONL/assets безопасна — это производные данные
-- Не требуется отдельных скриптов — используется тот же pipeline.py с другим режимом
+- Не требуется отдельных скриптов — используется тот же create_markdown.py с другим режимом
 - Вырезание таблиц всегда (без --ai) — уменьшает путаницу: таблицы в image/ появляются
   всегда, независимо от AI-обработки
 

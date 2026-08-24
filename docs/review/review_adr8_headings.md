@@ -6,7 +6,7 @@
 
 ## Scope
 
-Reviewed the implementation of ADR-8 heading extraction in `firmware/src/pipeline.py`:
+Reviewed the implementation of ADR-8 heading extraction in `firmware/src/create_markdown.py`:
 - `_extract_headings_from_json()` (lines 1167–1253)
 - `_apply_headings_to_md()` (lines 1256–1277)
 - Integration in `process_file()` (line 2883–2889)
@@ -66,13 +66,13 @@ No regressions across ai_table, chunk_overlap, gap_filling, latex_caret, no_hard
 
 ### 1. Regex implementation differs cosmetically from ADR-8 spec text
 - **Severity:** LOW (non-blocking)
-- **Location:** `pipeline.py:1160`
+- **Location:** `create_markdown.py:1160`
 - **Problem:** ADR-8 specifies `^\d+\.(\d+\.)*\s`. Implementation uses `^(\d+(?:\.\d+)*)\.\s`. Both patterns match identical strings. The implementation's capture group (full number) is actually cleaner for extracting the number for level calculation.
 - **Verdict:** Functionally equivalent. No change needed.
 
 ### 2. Count=1 may convert TOC entry rather than body heading
 - **Severity:** MEDIUM (observation, not a bug)
-- **Location:** `pipeline.py:1275` — `re.sub(count=1)`
+- **Location:** `create_markdown.py:1275` — `re.sub(count=1)`
 - **Problem:** In standard GOST documents, the table of contents appears before the actual section content. `count=1` replaces the first occurrence — which is typically the TOC entry, not the actual section heading. This means the TOC entry becomes `## 3. ЗАЩИТА...` while the actual body heading remains `**3. ЗАЩИТА...**` (bold).
 - **Expected behavior per ADR-8 rationale:** TOC entries should stay bold; actual section headings should become `##/###/####`. The implementation produces the opposite when TOC precedes content.
 - **Reason for not blocking:** ADR-8 explicitly specifies `count=1` and acknowledges this as an acceptable trade-off. The test (line 202-213) validates this behavior explicitly. If this behavior is undesirable, the fix belongs in the ADR-8 spec (e.g., use `count=0` to replace all, or add a YTOC-detection heuristic). Not an implementation defect.

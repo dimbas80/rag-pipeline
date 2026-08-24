@@ -4,7 +4,7 @@
 
 ## Репозиторий и layout
 
-- Рабочий код: `firmware/src/pipeline.py`.
+- Рабочий код: `firmware/src/create_markdown.py`.
 - Зависимости: `firmware/src/requirements.txt`; конфиги рядом с пайплайном: `config_ai.yaml`, `rag_config.yaml`.
 - Тесты: `firmware/tests/`; тесты добавляют `firmware/src` в `sys.path`.
 - Архитектурные решения: `docs/architecture/`, актуальный RAG-контракт — `docs/architecture/rag-v2-architecture.md` и ADR-010.
@@ -22,7 +22,7 @@
 - Полный подтверждённый набор: `cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py`.
 - `test_gap_filling.py` — известный отдельный набор с предсуществующими падениями; его исключают из полного регрессионного прогона.
 - RAG-тесты: `cd firmware && python3 -m pytest tests/test_rag_v2.py tests/test_rag_jsonl.py -q`.
-- Синтаксическая проверка: `python3 -m py_compile firmware/src/pipeline.py`.
+- Синтаксическая проверка: `python3 -m py_compile firmware/src/create_markdown.py`.
 - Отдельный запуск теста: `cd firmware && python3 -m pytest tests/<test_file>.py -q`.
 - В репозитории не обнаружены Makefile, package manager scripts, tox-конфигурация или отдельный lint-конфиг; не добавляйте команды для них без соответствующей настройки.
 
@@ -30,11 +30,11 @@
 
 Запускать из `firmware/src` или указывать путь к скрипту:
 
-- `python3 pipeline.py -i document.pdf` — OCR и Markdown без AI.
-- `python3 pipeline.py -i document.pdf --ai` — OCR + vision/AI-постобработка.
-- `python3 pipeline.py -i result.md --ai` — только AI-постобработка готового Markdown.
-- `python3 pipeline.py -i Markdown/file/file.md --rag --rag-config ./rag_config.yaml` — RAG только из проверенного Markdown.
-- `python3 pipeline.py -i document.pdf --ai --rag` — AI-постобработка и RAG-файлы.
+- `python3 create_markdown.py -i document.pdf` — OCR и Markdown без AI.
+- `python3 create_markdown.py -i document.pdf --ai` — OCR + vision/AI-постобработка.
+- `python3 create_markdown.py -i result.md --ai` — только AI-постобработка готового Markdown.
+- `python3 create_markdown.py -i Markdown/file/file.md --rag --rag-config ./rag_config.yaml` — RAG только из проверенного Markdown.
+- `python3 create_markdown.py -i document.pdf --ai --rag` — AI-постобработка и RAG-файлы.
 - `--config` задаёт AI-конфиг (по умолчанию `./config_ai.yaml`); `--rag-config` — RAG-конфиг (по умолчанию `./rag_config.yaml`).
 
 Для `.md` внутри каталога `Markdown/` с `--rag` OCR, AI, `.md` и `image/` не используются/не изменяются; атомарно перезаписываются только производные RAG-файлы. Каталог входных файлов не поддерживается текущей реализацией, несмотря на старый текст README.
@@ -59,4 +59,4 @@
 ## Change boundaries
 
 - Производственный код размещать в `firmware/src/`, тесты — в `firmware/tests/`; не использовать `workflows/` для кода.
-- После изменений пайплайна запускать `python3 -m py_compile firmware/src/pipeline.py` и релевантные pytest-команды выше; для RAG проверять выходные JSONL/asset-файлы на реальном Markdown, а не только unit-тестами.
+- После изменений пайплайна запускать `python3 -m py_compile firmware/src/create_markdown.py` и релевантные pytest-команды выше; для RAG проверять выходные JSONL/asset-файлы на реальном Markdown, а не только unit-тестами.
