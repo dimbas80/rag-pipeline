@@ -23,22 +23,27 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from llm_providers import (_get_providers,get_api_key,get_endpoint,resolve_subrole,run_with_fallback,ProviderUnavailableError,DEFAULT_PROVIDERS_PATH)
 
 import requests
 from dotenv import load_dotenv
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models
 
-EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
 SPARSE_MODEL = "Qdrant/bm25"
-RERANK_MODEL = "Qwen/Qwen3-Reranker-8B"
 DEFAULT_COLLECTION = "technical_standard"
+_DEFAULT_PROVIDER_CFG = _get_providers()
+EMBED_MODEL = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")["model"]
+RERANK_MODEL = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "rerank")["model"]
+EMBED_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")["provider"], "embedding")
+RERANK_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "rerank")["provider"], "rerank")
 
 # Базовый URL SiliconFlow. По умолчанию — публичный API; переопределяется
 # через SILICONFLOW_BASE_URL (например, для прокси или тестового стенда).
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.com")
-EMBED_API_URL = f"{SILICONFLOW_BASE_URL}/v1/embeddings"
-RERANK_API_URL = f"{SILICONFLOW_BASE_URL}/v1/rerank"
+
 
 # Qwen3-Embedding рекомендует давать инструкцию только для запросов,
 # документы эмбеддятся без неё (см. build_embed_text в create_index.py).
@@ -50,84 +55,36 @@ QUERY_INSTRUCTION = (
 # Distance-фильтр перед реранком: кандидаты с RRF-скором ниже порога
 # отсеиваются; если отсеялись все — fallback на сырые данные.
 RRF_SCORE_THRESHOLD = 0.15
+API_TIMEOUT = 120
+QUALITY_EXACT = 0.78
+QUALITY_GOOD = 0.72
 
 # Метки качества (адаптация порогов distance из ChromaDB-скриптов:
 # dist < 0.22 -> "точное", dist < 0.28 -> "хорошее", иначе "среднее";
 # здесь score = 1 - distance, поэтому пороги инвертированы).
-QUALITY_EXACT = 0.78
-QUALITY_GOOD = 0.72
-
-API_TIMEOUT = 120
-API_RETRIES = 3
-API_RETRY_BACKOFF = 2.0
-
 
 def resolve_api_key(cli_key: str | None) -> str:
-    """Порядок: --api-key > переменная окружения > .env (через python-dotenv)."""
-    load_dotenv()
-    key = cli_key or os.environ.get("SILICONFLOW_API_KEY")
-    if not key:
-        print(
-            "[ERROR] SILICONFLOW_API_KEY не задан. Укажи --api-key или "
-            "положи ключ в .env (SILICONFLOW_API_KEY=...).",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    return key
+    cfg = _get_providers(); spec = resolve_subrole(cfg, "build_search_index", "embedding")
+    try: return get_api_key(cfg, spec["provider"], cli_key)
+    except Exception as exc: print(f"[ERROR] {exc}", file=sys.stderr); sys.exit(2)
 
-
-def embed_query_siliconflow(query: str, api_key: str, model: str = EMBED_MODEL) -> list[float]:
-    """Dense-эмбеддинг запроса (с инструкцией Qwen3-Embedding) через SiliconFlow API."""
-    text = QUERY_INSTRUCTION.format(query=query)
-    payload = {"model": model, "input": [text], "encoding_format": "float"}
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    last_exc: Exception | None = None
-    for attempt in range(1, API_RETRIES + 1):
+def embed_query_siliconflow(query: str, api_key: str | None = None, model: str | None = None) -> list[float]:
+    cfg = _get_providers(); spec = resolve_subrole(cfg, "build_search_index", "embedding")
+    if model: spec["model"] = model
+    def attempt(target):
         try:
-            resp = requests.post(EMBED_API_URL, json=payload, headers=headers, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["data"][0]["embedding"]
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            last_exc = exc
-            if attempt < API_RETRIES:
-                time.sleep(API_RETRY_BACKOFF * attempt)
-    raise RuntimeError(f"SiliconFlow embedding failed after {API_RETRIES} attempts: {last_exc}")
+            key=get_api_key(cfg,target["provider"],api_key); r=requests.post(get_endpoint(cfg,target["provider"],"embedding"),json={"model":target["model"],"input":[QUERY_INSTRUCTION.format(query=query)],"encoding_format":"float"},headers={"Authorization":f"Bearer {key}"},timeout=API_TIMEOUT); r.raise_for_status(); return r.json()["data"][0]["embedding"]
+        except (requests.RequestException,KeyError,IndexError,TypeError,ValueError) as exc: raise ProviderUnavailableError(str(exc)) from exc
+    return run_with_fallback(spec,attempt,"embedding")
 
-
-def rerank_siliconflow(
-    query: str,
-    documents: list[str],
-    api_key: str,
-    top_n: int,
-    model: str = RERANK_MODEL,
-) -> list[float]:
-    """
-    Реранк документов через SiliconFlow Rerank API.
-
-    POST https://api.siliconflow.cn/v1/rerank
-    {"model": "Qwen/Qwen3-Reranker-8B", "query": "...", "documents": [...], "top_n": N}
-
-    Возвращает relevance_score для каждого документа в исходном порядке.
-    """
-    payload = {"model": model, "query": query, "documents": documents, "top_n": top_n}
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    last_exc: Exception | None = None
-    for attempt in range(1, API_RETRIES + 1):
+def rerank_siliconflow(query: str, documents: list[str], api_key: str | None, top_n: int, model: str | None = None) -> list[float]:
+    cfg=_get_providers(); spec=resolve_subrole(cfg,"build_search_index","rerank")
+    if model: spec["model"]=model
+    def attempt(target):
         try:
-            resp = requests.post(RERANK_API_URL, json=payload, headers=headers, timeout=API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-            by_index = {item["index"]: item["relevance_score"] for item in data["results"]}
-            return [by_index.get(i, 0.0) for i in range(len(documents))]
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            last_exc = exc
-            if attempt < API_RETRIES:
-                time.sleep(API_RETRY_BACKOFF * attempt)
-    raise RuntimeError(f"SiliconFlow rerank failed after {API_RETRIES} attempts: {last_exc}")
-
+            key=get_api_key(cfg,target["provider"],api_key); r=requests.post(get_endpoint(cfg,target["provider"],"rerank"),json={"model":target["model"],"query":query,"documents":documents,"top_n":top_n},headers={"Authorization":f"Bearer {key}"},timeout=API_TIMEOUT); r.raise_for_status(); d=r.json(); m={x["index"]:x["relevance_score"] for x in d["results"]}; return [m.get(i,0.0) for i in range(len(documents))]
+        except (requests.RequestException,KeyError,IndexError,TypeError,ValueError) as exc: raise ProviderUnavailableError(str(exc)) from exc
+    return run_with_fallback(spec,attempt,"rerank")
 
 def build_payload_filter(domain: str | None, document_type: str | None, document_id: str | None) -> models.Filter | None:
     """Фильтр по payload-полям Qdrant; None = без фильтра."""
@@ -240,6 +197,7 @@ def list_collections(client):
 
 
 def main():
+    global DEFAULT_PROVIDERS_PATH, _DEFAULT_PROVIDER_CFG, EMBED_MODEL, RERANK_MODEL, EMBED_API_URL, RERANK_API_URL
     ap = argparse.ArgumentParser(
         description="Гибридный поиск по Qdrant с реранком через SiliconFlow."
     )
@@ -250,7 +208,9 @@ def main():
     ap.add_argument("--final-k", type=int, default=6, help="Сколько вернуть после реранка (default: 6)")
     ap.add_argument("--qdrant-path", default="./qdrant_data",
                     help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
-    ap.add_argument("--api-key", help="API-ключ SiliconFlow (или SILICONFLOW_API_KEY в .env)")
+    ap.add_argument("--providers_config", default=DEFAULT_PROVIDERS_PATH,
+                    help="Путь к реестру провайдеров (providers.yaml)")
+    ap.add_argument("--api-key", help="API-ключ провайдера (или переменная окружения в .env)")
     ap.add_argument("--domain", help="Фильтр по payload.domain")
     ap.add_argument("--document_type", help="Фильтр по payload.document_type")
     ap.add_argument("--document_id", help="Фильтр по payload.document_id")
@@ -258,6 +218,14 @@ def main():
     ap.add_argument("--sources", action="store_true", help="Только уникальные имена документов в выдаче")
     ap.add_argument("--list-collections", action="store_true", help="Список коллекций Qdrant")
     args = ap.parse_args()
+    DEFAULT_PROVIDERS_PATH = args.providers_config
+    _DEFAULT_PROVIDER_CFG = _get_providers(args.providers_config)
+    embedding_spec = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")
+    rerank_spec = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "rerank")
+    EMBED_MODEL = embedding_spec["model"]
+    RERANK_MODEL = rerank_spec["model"]
+    EMBED_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, embedding_spec["provider"], "embedding")
+    RERANK_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, rerank_spec["provider"], "rerank")
 
     client = QdrantClient(path=args.qdrant_path)
 
@@ -302,7 +270,7 @@ def main():
         )
 
     docs = [c.payload["text"] for c in filtered]
-    print(f"[RERANK] {len(docs)} документов через {RERANK_MODEL} ...", file=sys.stderr)
+    print(f"[RERANK] {len(docs)} документов ...", file=sys.stderr)
     scores = rerank_siliconflow(args.query, docs, api_key, top_n=min(args.final_k, len(docs)))
 
     ranked = sorted(zip(filtered, scores), key=lambda x: x[1], reverse=True)[: args.final_k]

@@ -1,0 +1,66 @@
+# Реестр LLM-провайдеров и назначение ролей.
+# Секреты не хранятся: api_key_env содержит только имя переменной .env.
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    models:
+      deepseek-v4-flash: chat
+      deepseek-v4-pro: chat
+      deepseek-v4-flash-vision-exp: vision
+  provod:
+    base_url: https://api.provod.ai/v1
+    api_key_env: PROVOD_API_KEY
+    models:
+      glm-4.5v: vision
+      deepseek-v4-pro: chat
+      google/gemini-2.5-flash: chat
+  anymodel:
+    base_url: https://anymodel.org/v1
+    api_key_env: ANYMODEL_API_KEY
+    models:
+      glm/glm-4.6v: vision
+      glm/glm-5.2: chat
+  zai-custom:
+    base_url: https://api.z.ai/api/paas/v4
+    api_key_env: Z_AI_API_KEY
+    models:
+      glm-4.6v-flash: vision
+  siliconflow:
+    base_url: https://api.siliconflow.com/v1
+    api_key_env: SILICONFLOW_API_KEY
+    models:
+      Qwen/Qwen3.5-35B-A3B: chat
+      Qwen/Qwen3-32B: chat
+      Qwen/Qwen3-Embedding-8B: embedding
+      Qwen/Qwen3-Reranker-8B: rerank
+
+roles:
+  create_markdown:
+    table_vision:
+      provider: provod
+      model: glm-4.5v
+      fallback:
+        provider: anymodel
+        model: glm/glm-4.6v
+    ai_postprocess:
+      provider: deepseek
+      model: deepseek-v4-pro
+      fallback:
+        provider: provod
+        model: deepseek-v4-pro
+  build_search_index:
+    query_processing:
+      provider: deepseek
+      model: deepseek-v4-flash
+      fallback:
+        provider: provod
+        model: deepseek-v4-pro
+    embedding:
+      provider: siliconflow
+      model: Qwen/Qwen3-Embedding-8B
+      fallback: {}
+    rerank:
+      provider: siliconflow
+      model: Qwen/Qwen3-Reranker-8B
+      fallback: {}

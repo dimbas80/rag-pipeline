@@ -73,6 +73,14 @@ from search import (
 # asset_caption_number — номер из подписи ассета. Модуль зависит только
 # от stdlib, поэтому безопасен для импорта из core-графа.
 from telegram_bot.asset_helpers import asset_caption_number, extract_asset_references
+from llm_providers import (
+    ProviderUnavailableError,
+    _get_providers,
+    get_api_key,
+    get_endpoint,
+    resolve_subrole,
+    run_with_fallback,
+)
 
 logger = logging.getLogger("qa_graph")
 
@@ -158,7 +166,9 @@ class QAGraphState(TypedDict):
 # ─── Конфигурация (раздел 8 архитектуры) ──────────────────────────────
 
 # Путь к llm_config.yaml по умолчанию — рядом с модулем (firmware/src/).
-DEFAULT_LLM_CONFIG_PATH = str(Path(__file__).resolve().parent / "llm_config.yaml")
+DEFAULT_SEARCH_CONFIG_PATH = str(Path(__file__).resolve().parent / "search_config.yaml")
+DEFAULT_PROVIDERS_PATH = str(Path(__file__).resolve().parent / "providers.yaml")
+
 
 
 @dataclass
@@ -181,20 +191,15 @@ class QAGraphConfig:
     rrf_threshold: float = 0.15
 
     # LLM (конфигурируемые провайдеры, раздел 6)
-    llm_config_path: str = DEFAULT_LLM_CONFIG_PATH
-    # Переопределения поверх llm_config.yaml (по умолчанию None — брать
-    # default_provider/default_model из конфига).
+    search_config_path: str = DEFAULT_SEARCH_CONFIG_PATH
+    providers_path: str = DEFAULT_PROVIDERS_PATH
+
     llm_provider: str | None = None
     llm_model: str | None = None
     # Переопределение API-ключа провайдера (CLI --api-key); при None —
     # чтение api_key_env из окружения/.env.
     llm_api_key: str | None = None
 
-    # API
-    # SiliconFlow остаётся для embedding/rerank в search_node (search.py)
-    # — без изменений, ключ через SILICONFLOW_API_KEY.
-    siliconflow_api_key: str | None = None
-    siliconflow_base_url: str = "https://api.siliconflow.com"
 
     # Пороги оценки
     score_good_threshold: float = 0.7
@@ -202,241 +207,71 @@ class QAGraphConfig:
     max_reformulate_attempts: int = 2
 
 
-# ─── Разрешение API-ключа ─────────────────────────────────────────────
-
-def resolve_api_key(cli_key: str | None = None, env_path: str | None = None,
-                    env_var: str = "SILICONFLOW_API_KEY") -> str:
-    """Разрешение API-ключа: аргумент → переменная окружения → .env.
-
-    Порядок идентичен существующему search.py (раздел 6.4 архитектуры).
-    Отличие от search.py: вместо sys.exit(2) бросается ValueError —
-    qa_graph.py является импортируемым модулем (класс QAGraph в юните 3),
-    и завершение процесса из конструктора/библиотечной функции недопустимо.
-
-    env_path — опциональный путь к .env-файлу (для тестов и явного
-    указания); при None используется стандартный поиск python-dotenv
-    от текущей директории.
-
-    env_var — имя переменной окружения/.env-ключа. По умолчанию
-    SILICONFLOW_API_KEY (embedding/rerank в search_node). LLM-чат больше
-    НЕ использует этот путь: ключи провайдеров задаются в llm_config.yaml
-    (api_key_env) и читаются через get_api_key() (раздел 6 архитектуры).
-    """
-    load_dotenv(env_path)
-    key = cli_key or os.environ.get(env_var)
-    if not key:
-        raise ValueError(
-            f"{env_var} не задан. Передайте api_key или положите "
-            f"ключ в .env ({env_var}=...)."
-        )
-    return key
+# ─── Search/provider configuration ─────────────────────────────────────
+_search_config_cache: dict[str, dict] = {}
 
 
-# ─── Конфигурация LLM-провайдеров (раздел 6 архитектуры) ──────────────
-# Провайдеры, модели и параметры узлов задаются в llm_config.yaml
-# (firmware/src/llm_config.yaml). Любой OpenAI-совместимый провайдер
-# подключается добавлением секции в providers — без изменения кода.
-
-# Кэш загруженных конфигов: путь → dict (чтобы не парсить YAML на
-# каждый вызов llm_chat в рамках одного процесса).
-_llm_config_cache: dict[str, dict] = {}
-
-
-def load_llm_config(path: str | None = None) -> dict:
-    """Загрузка и валидация llm_config.yaml (раздел 6 архитектуры).
-
-    Ожидаемая структура:
-
-        default_provider: str
-        default_model: str
-        providers:
-          <name>:
-            base_url: str        # OpenAI-совместимый /v1/chat/completions
-            api_key_env: str     # имя переменной окружения с ключом
-            models: list[str]
-        nodes:
-          <node_name>:
-            temperature: float
-            max_tokens: int
-
-    Возвращает словарь конфигурации. При отсутствии файла или
-    некорректной структуре бросает ValueError с понятным сообщением.
-    """
-    path = path or DEFAULT_LLM_CONFIG_PATH
+def load_search_config(path: str | None = None) -> dict:
+    path = path or DEFAULT_SEARCH_CONFIG_PATH
     if not os.path.exists(path):
-        raise ValueError(f"Файл конфигурации LLM не найден: {path}")
+        raise ValueError(f"Файл конфигурации поиска не найден: {path}")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
     except yaml.YAMLError as exc:
         raise ValueError(f"Ошибка парсинга YAML в {path}: {exc}") from exc
-
-    if not isinstance(data, dict):
-        raise ValueError(
-            f"{path}: ожидался YAML-словарь, получено {type(data).__name__}"
-        )
-
-    providers = data.get("providers")
-    if not isinstance(providers, dict) or not providers:
-        raise ValueError(f"{path}: секция 'providers' отсутствует или пуста")
-
-    default_provider = data.get("default_provider")
-    if not isinstance(default_provider, str) or default_provider not in providers:
-        raise ValueError(
-            f"{path}: 'default_provider' должен быть именем из providers "
-            f"(доступны: {', '.join(providers) or '(пусто)'})"
-        )
-
-    for name, provider in providers.items():
-        if not isinstance(provider, dict):
-            raise ValueError(f"{path}: провайдер '{name}' должен быть словарём")
-        for field in ("base_url", "api_key_env"):
-            if not isinstance(provider.get(field), str) or not provider[field].strip():
-                raise ValueError(
-                    f"{path}: у провайдера '{name}' отсутствует строка '{field}'"
-                )
-        models = provider.get("models")
-        if not isinstance(models, list) or not all(
-            isinstance(m, str) for m in models
-        ):
-            raise ValueError(
-                f"{path}: у провайдера '{name}' 'models' должен быть списком строк"
-            )
-
-    if not isinstance(data.get("default_model"), str):
-        raise ValueError(f"{path}: 'default_model' должен быть строкой")
-
-    nodes = data.get("nodes")
-    if not isinstance(nodes, dict) or not nodes:
-        raise ValueError(f"{path}: секция 'nodes' отсутствует или пуста")
-    for node_name, params in nodes.items():
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), dict) or not data["nodes"]:
+        raise ValueError(f"{path}: секция nodes отсутствует или пуста")
+    for name, params in data["nodes"].items():
         if not isinstance(params, dict):
-            raise ValueError(f"{path}: узел '{node_name}' должен быть словарём")
+            raise ValueError(f"{path}: узел {name!r} должен быть словарём")
         for field in ("temperature", "max_tokens"):
-            if not isinstance(params.get(field), (int, float)) or isinstance(
-                params.get(field), bool
-            ):
-                raise ValueError(
-                    f"{path}: у узла '{node_name}' параметр '{field}' должен быть числом"
-                )
-
+            value = params.get(field)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{path}: у узла {name!r} параметр {field!r} должен быть числом")
     return data
 
 
-def _get_llm_config(config: QAGraphConfig) -> dict:
-    """Загруженный llm_config для QAGraphConfig (с кэшем по пути)."""
-    path = config.llm_config_path or DEFAULT_LLM_CONFIG_PATH
-    if path not in _llm_config_cache:
-        _llm_config_cache[path] = load_llm_config(path)
-    return _llm_config_cache[path]
+def _get_search_config(config: QAGraphConfig) -> dict:
+    path = config.search_config_path
+    if path not in _search_config_cache:
+        _search_config_cache[path] = load_search_config(path)
+    return _search_config_cache[path]
 
 
-def get_chat_url(llm_cfg: dict, provider_name: str) -> str:
-    """base_url провайдера из загруженного llm_config."""
-    provider = (llm_cfg.get("providers") or {}).get(provider_name)
-    if not isinstance(provider, dict) or not provider.get("base_url"):
-        raise ValueError(
-            f"Провайдер '{provider_name}' не найден в llm_config или "
-            f"не содержит base_url (доступны: "
-            f"{', '.join(llm_cfg.get('providers') or {}) or '(пусто)'})"
-        )
-    return provider["base_url"]
 
-
-def get_api_key(llm_cfg: dict, provider_name: str, override: str | None = None) -> str:
-    """API-ключ провайдера: override (--api-key) → env (api_key_env) → .env."""
-    if override:
-        return override
-    provider = (llm_cfg.get("providers") or {}).get(provider_name)
-    if not isinstance(provider, dict) or not provider.get("api_key_env"):
-        raise ValueError(
-            f"Провайдер '{provider_name}' не найден в llm_config или "
-            f"не содержит api_key_env"
-        )
-    env_name = provider["api_key_env"]
-    load_dotenv()  # .env из текущей директории (как resolve_api_key)
-    key = os.environ.get(env_name)
-    if not key:
-        raise ValueError(
-            f"API-ключ {env_name} для провайдера '{provider_name}' не задан. "
-            f"Положите ключ в .env ({env_name}=...) или передайте --api-key."
-        )
-    return key
-
-
-# ─── Вызов LLM (раздел 6.1 архитектуры) ───────────────────────────────
-
-def llm_chat(
-    messages: list[dict],
-    config: QAGraphConfig | None = None,
-    node_name: str = "generate_answer",
-    provider_override: str | None = None,
-    model_override: str | None = None,
-    timeout: int = API_TIMEOUT,
-) -> str:
-    """Вызов chat completions провайдера из llm_config.yaml с retry.
-
-    Порядок разрешения провайдера/модели (раздел 6.4 архитектуры):
-      1. provider_override / model_override (аргументы функции);
-      2. llm_provider / llm_model (QAGraphConfig, CLI --llm-provider/
-         --llm-model);
-      3. default_provider / default_model (llm_config.yaml).
-
-    temperature/max_tokens — из секции nodes[node_name] конфига.
-    API-ключ — get_api_key (env по api_key_env провайдера, либо
-    переопределение --api-key); URL — get_chat_url (base_url провайдера).
-
-    POST {base_url}
-    {"model": ..., "messages": [...], "temperature": ..., "max_tokens": ...}
-
-    Возвращает text из choices[0].message.content.
-    При исчерпании попыток бросает RuntimeError.
-    """
+def llm_chat(messages: list[dict], config: QAGraphConfig | None = None,
+             node_name: str = "generate_answer", provider_override: str | None = None,
+             model_override: str | None = None, timeout: int = API_TIMEOUT) -> str:
     cfg = config or QAGraphConfig()
-    llm_cfg = _get_llm_config(cfg)
-
-    provider = provider_override or cfg.llm_provider or llm_cfg.get("default_provider")
-    model = model_override or cfg.llm_model or llm_cfg.get("default_model")
-    # load_llm_config гарантирует default_provider/default_model; проверка
-    # нужна только для переопределений извне.
-    if not isinstance(provider, str) or not provider:
-        raise ValueError("Не удалось определить провайдера LLM (default_provider)")
-    if not isinstance(model, str) or not model:
-        raise ValueError("Не удалось определить модель LLM (default_model)")
-
-    node_params = (llm_cfg.get("nodes") or {}).get(node_name)
+    search_cfg = _get_search_config(cfg)
+    node_params = search_cfg["nodes"].get(node_name)
     if not isinstance(node_params, dict):
-        raise ValueError(
-            f"Узел '{node_name}' не найден в nodes конфигурации LLM "
-            f"(доступны: {', '.join(llm_cfg.get('nodes') or {}) or '(пусто)'})"
-        )
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": node_params.get("temperature", 0.0),
-        "max_tokens": node_params.get("max_tokens", 2048),
-    }
-    headers = {
-        "Authorization": f"Bearer {get_api_key(llm_cfg, provider, override=cfg.llm_api_key)}",
-        "Content-Type": "application/json",
-    }
-    url = get_chat_url(llm_cfg, provider)
-
-    last_exc: Exception | None = None
-    for attempt in range(1, API_RETRIES + 1):
+        raise ValueError(f"Узел {node_name!r} не найден в nodes")
+    providers = _get_providers(cfg.providers_path)
+    spec = resolve_subrole(providers, "build_search_index", "query_processing")
+    if provider_override or cfg.llm_provider:
+        spec["provider"] = provider_override or cfg.llm_provider
+    if model_override or cfg.llm_model:
+        spec["model"] = model_override or cfg.llm_model
+    # Validate CLI overrides while retaining configured fallback.
+    spec = {**spec, "fallback": spec.get("fallback")}
+    payload = {"model": spec["model"], "messages": messages,
+               "temperature": node_params["temperature"], "max_tokens": node_params["max_tokens"]}
+    def attempt(target):
         try:
-            resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
-            last_exc = exc
-            if attempt < API_RETRIES:
-                time.sleep(API_RETRY_BACKOFF * attempt)
-    raise RuntimeError(
-        f"LLM chat ({provider}/{model}) failed after {API_RETRIES} attempts: {last_exc}"
-    )
+            key = get_api_key(providers, target["provider"], cfg.llm_api_key)
+            response = requests.post(get_endpoint(providers, target["provider"], "chat"),
+                                     json={**payload, "model": target["model"]},
+                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                                     timeout=timeout)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except ProviderUnavailableError:
+            raise
+        except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(str(exc)) from exc
+    return run_with_fallback(spec, attempt, "chat")
 
 
 # ─── Форматирование результатов поиска (раздел 5.6) ───────────────────
@@ -1067,7 +902,7 @@ def search_node(state: QAGraphState, config=None) -> dict:
     query = (state.get("active_query") or "").strip() or state.get("query", "")
     client = _get_qdrant_client(cfg.qdrant_path)
     sparse_model = _get_sparse_model()
-    api_key = cfg.siliconflow_api_key or resolve_api_key()
+    api_key = cfg.llm_api_key
 
     # Целенаправленный поиск для явных запросов «покажи таблицу/рисунок N»
     # (фикс 3.3): ищем чанк по caption, не полагаясь на семантический топ.
@@ -1598,7 +1433,7 @@ class QAGraph:
         # (решение юнита 1 — без sys.exit). Ключ LLM-провайдера НЕ
         # резолвится здесь — он читается из llm_config.yaml через
         # get_api_key() при первом вызове llm_chat.
-        self.api_key = self.config.siliconflow_api_key or resolve_api_key()
+        self.api_key = None
         # QdrantClient НЕ открывается при инициализации (фикс 3.1): локальный
         # Qdrant держит эксклюзивный файловый замок на папку базы, поэтому
         # клиент создаётся на время каждого поиска в search_node и закрывается
@@ -1879,9 +1714,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--qdrant-path", default="./qdrant_data",
                     help="Путь к локальному хранилищу Qdrant "
                          "(по умолчанию ./qdrant_data)")
-    ap.add_argument("--llm-config", default=DEFAULT_LLM_CONFIG_PATH,
-                    help="Путь к конфигурации LLM-провайдеров "
-                         "(по умолчанию firmware/src/llm_config.yaml)")
+    ap.add_argument("--config", default=DEFAULT_SEARCH_CONFIG_PATH,
+                    help="Путь к search_config.yaml")
+    ap.add_argument("--providers_config", default=DEFAULT_PROVIDERS_PATH,
+                    help="Путь к providers.yaml")
     ap.add_argument("--llm-provider",
                     help="Переопределить провайдера LLM-чата "
                          "(например, deepseek, siliconflow)")
@@ -1889,8 +1725,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Переопределить модель LLM-чата")
     ap.add_argument("--api-key",
                     help="API-ключ: переопределяет ключ LLM-провайдера из "
-                         "конфига (--llm-config) и ключ SiliconFlow для "
-                         "embedding/rerank (или ключи в .env)")
+                         "конфигурации providers.yaml и ключи embedding/rerank (или ключи в .env)")
     ap.add_argument("--verbose", action="store_true",
                     help="Подробный вывод шагов графа (узлы, результаты)")
     return ap
@@ -1916,23 +1751,23 @@ def main(argv=None, input_fn=input, print_fn=print) -> int:
         return 0
 
     try:
-        # Предварительная проверка LLM-конфигурации: плохой путь/структура
+        # Предварительная проверка конфигурации: плохой путь/структура
         # YAML и отсутствующий ключ провайдера → код 2 до запуска графа.
-        llm_cfg = load_llm_config(args.llm_config)
-        provider = args.llm_provider or llm_cfg.get("default_provider")
-        if not isinstance(provider, str):
-            raise ValueError("Не удалось определить провайдера LLM (default_provider)")
-        get_api_key(llm_cfg, provider, override=args.api_key)
+        load_search_config(args.config)
+        provider_cfg = _get_providers(args.providers_config)
+        spec = resolve_subrole(provider_cfg, "build_search_index", "query_processing")
+        provider = args.llm_provider or spec["provider"]
+        get_api_key(provider_cfg, provider, override=args.api_key)
 
         cfg = QAGraphConfig(
             qdrant_path=args.qdrant_path,
-            llm_config_path=args.llm_config,
+            search_config_path=args.config,
+            providers_path=args.providers_config,
             llm_provider=args.llm_provider,
             llm_model=args.llm_model,
             llm_api_key=args.api_key,
-            siliconflow_api_key=args.api_key,
         )
-        qa = QAGraph(cfg)  # проверяет SILICONFLOW_API_KEY (embedding/rerank)
+        qa = QAGraph(cfg)
     except ValueError as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 2

@@ -36,21 +36,27 @@ import sys
 import time
 import uuid
 from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests
 from dotenv import load_dotenv
 from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models
 from tqdm import tqdm
+from llm_providers import (_get_providers, get_api_key, get_endpoint,
+                           resolve_subrole, run_with_fallback,
+                           ProviderUnavailableError, DEFAULT_PROVIDERS_PATH)
 
-EMBED_MODEL = "Qwen/Qwen3-Embedding-8B"
 SPARSE_MODEL = "Qdrant/bm25"
 DEFAULT_COLLECTION = "technical_standard"
+_DEFAULT_PROVIDER_CFG = _get_providers()
+EMBED_MODEL = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")["model"]
+EMBED_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")["provider"], "embedding")
 
 # Базовый URL SiliconFlow. По умолчанию — публичный API; переопределяется
 # через SILICONFLOW_BASE_URL (например, для прокси или тестового стенда).
-SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.com")
-EMBED_API_URL = f"{SILICONFLOW_BASE_URL}/v1/embeddings"
+
 
 EMBED_TIMEOUT = 120
 EMBED_RETRIES = 3
@@ -191,7 +197,9 @@ def stable_point_id(chunk: dict, row_index: int) -> str:
 def resolve_api_key(cli_key: str | None) -> str:
     """Порядок: --api-key > переменная окружения > .env (через python-dotenv)."""
     load_dotenv()
-    key = cli_key or os.environ.get("SILICONFLOW_API_KEY")
+    cfg = _get_providers()
+    spec = resolve_subrole(cfg, "build_search_index", "embedding")
+    key = get_api_key(cfg, spec["provider"], cli_key)
     if not key:
         print(
             "[ERROR] SILICONFLOW_API_KEY не задан. Укажи --api-key или "
@@ -202,7 +210,7 @@ def resolve_api_key(cli_key: str | None) -> str:
     return key
 
 
-def embed_texts_siliconflow(texts: list[str], api_key: str, model: str = EMBED_MODEL) -> list[list[float]]:
+def embed_texts_siliconflow(texts: list[str], api_key: str | None = None, model: str | None = None) -> list[list[float]]:
     """
     Dense-эмбеддинг батча текстов через SiliconFlow API.
 
@@ -211,22 +219,20 @@ def embed_texts_siliconflow(texts: list[str], api_key: str, model: str = EMBED_M
 
     Возвращает список векторов в том же порядке, что и texts.
     """
-    payload = {"model": model, "input": texts, "encoding_format": "float"}
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    last_exc: Exception | None = None
-    for attempt in range(1, EMBED_RETRIES + 1):
+    cfg = _get_providers(); spec = resolve_subrole(cfg, "build_search_index", "embedding")
+    if model: spec["model"] = model
+    def attempt(target):
         try:
-            resp = requests.post(EMBED_API_URL, json=payload, headers=headers, timeout=EMBED_TIMEOUT)
+            key = get_api_key(cfg, target["provider"], api_key)
+            resp = requests.post(get_endpoint(cfg, target["provider"], "embedding"),
+                json={"model": target["model"], "input": texts, "encoding_format": "float"},
+                headers={"Authorization": f"Bearer {key}"}, timeout=EMBED_TIMEOUT)
             resp.raise_for_status()
-            data = resp.json()
-            items = sorted(data["data"], key=lambda it: it.get("index", 0))
+            items = sorted(resp.json()["data"], key=lambda it: it.get("index", 0))
             return [it["embedding"] for it in items]
-        except (requests.RequestException, KeyError, ValueError) as exc:
-            last_exc = exc
-            if attempt < EMBED_RETRIES:
-                time.sleep(EMBED_RETRY_BACKOFF * attempt)
-    raise RuntimeError(f"SiliconFlow embedding failed after {EMBED_RETRIES} attempts: {last_exc}")
+        except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ProviderUnavailableError(str(exc)) from exc
+    return run_with_fallback(spec, attempt, "embedding")
 
 
 def build_payload(chunk: dict, doc_meta: dict, assets_by_id: dict, row_index: int) -> dict:
@@ -416,6 +422,8 @@ def main():
                     help="Имя коллекции Qdrant (по умолчанию авто-выбор: единственная в базе / новая / спросить)")
     ap.add_argument("--qdrant-path", default="./qdrant_data",
                     help="Путь к локальному хранилищу Qdrant (по умолчанию ./qdrant_data)")
+    ap.add_argument("--providers_config", default=DEFAULT_PROVIDERS_PATH,
+                    help="Путь к providers.yaml")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--api-key", help="API-ключ SiliconFlow (или SILICONFLOW_API_KEY в .env)")
     ap.add_argument(
@@ -424,6 +432,11 @@ def main():
         help="Прервать индексацию, если валидация нашла ошибки (по умолчанию только предупреждает).",
     )
     args = ap.parse_args()
+    global _DEFAULT_PROVIDER_CFG, EMBED_MODEL, EMBED_API_URL
+    _DEFAULT_PROVIDER_CFG = _get_providers(args.providers_config)
+    embedding_spec = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")
+    EMBED_MODEL = embedding_spec["model"]
+    EMBED_API_URL = get_endpoint(_DEFAULT_PROVIDER_CFG, embedding_spec["provider"], "embedding")
 
     try:
         chunks_path, assets_path = resolve_input_paths(args.input_dir, args.chunks, args.assets)

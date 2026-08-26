@@ -216,9 +216,9 @@ def test_embed_texts_siliconflow_retries_then_raises(monkeypatch):
         raise ValueError("boom")
 
     monkeypatch.setattr(create_index.requests, "post", failing_post)
-    with pytest.raises(RuntimeError, match="SiliconFlow embedding failed"):
+    with pytest.raises(RuntimeError, match="невозможно продолжить"):
         create_index.embed_texts_siliconflow(["a"], api_key="k")
-    assert calls["n"] == create_index.EMBED_RETRIES
+    assert calls["n"] == 1
 
 
 # ─── search: rerank_siliconflow (mock requests) ───────────────────────

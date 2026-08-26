@@ -45,7 +45,7 @@ def _load(name):
 
 
 helpers = _load("asset_helpers")
-bot = _load("bot")
+bot = _load("request_bot")
 
 
 # ─── Удаление Markdown-таблиц из текста ────────────────────────────────

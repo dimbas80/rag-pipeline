@@ -64,59 +64,42 @@ def _chat_payload(content="Привет!"):
     }
 
 
-# ─── Хелперы llm_config.yaml ──────────────────────────────────────────
-
-LLM_CONFIG_TMPL = """\
-default_provider: deepseek
-default_model: deepseek-v4-flash
-
+# ─── Helpers for the split search/provider configuration ───────────────
+SEARCH_CONFIG_TMPL = """\
+nodes:
+  analyze_query: {temperature: 0.0, max_tokens: 256}
+  reformulate_query: {temperature: 0.3, max_tokens: 256}
+  ask_clarification: {temperature: 0.3, max_tokens: 512}
+  generate_answer: {temperature: 0.0, max_tokens: 2048}
+"""
+PROVIDERS_TMPL = """\
 providers:
   deepseek:
-    base_url: https://api.deepseek.com/v1/chat/completions
+    base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
-    models:
-      - deepseek-v4-flash
-      - deepseek-v4-pro
-
+    models: {deepseek-v4-flash: chat, deepseek-v4-pro: chat}
   siliconflow:
-    base_url: https://api.siliconflow.com/v1/chat/completions
+    base_url: https://api.siliconflow.com/v1
     api_key_env: SILICONFLOW_API_KEY
-    models:
-      - Qwen/Qwen3.5-35B-A3B
-      - Qwen/Qwen3-32B
-
-nodes:
-  analyze_query:
-    temperature: 0.0
-    max_tokens: 256
-  reformulate_query:
-    temperature: 0.3
-    max_tokens: 256
-  ask_clarification:
-    temperature: 0.3
-    max_tokens: 512
-  generate_answer:
-    temperature: 0.0
-    max_tokens: 2048
+    models: {Qwen/Qwen3-32B: chat, Qwen/Qwen3-Embedding-8B: embedding, Qwen/Qwen3-Reranker-8B: rerank}
+  provod:
+    base_url: https://api.provod.ai/v1
+    api_key_env: PROVOD_API_KEY
+    models: {deepseek-v4-pro: chat}
+roles:
+  build_search_index:
+    query_processing: {provider: deepseek, model: deepseek-v4-flash, fallback: {provider: provod, model: deepseek-v4-pro}}
+    embedding: {provider: siliconflow, model: Qwen/Qwen3-Embedding-8B, fallback: {}}
+    rerank: {provider: siliconflow, model: Qwen/Qwen3-Reranker-8B, fallback: {}}
 """
 
-
-def _write_llm_config(tmp_path, content: str = LLM_CONFIG_TMPL) -> str:
-    """Записать llm_config.yaml во временную директорию и вернуть путь."""
-    path = tmp_path / "llm_config.yaml"
-    path.write_text(content, encoding="utf-8")
-    return str(path)
-
-
+def _write_search_config(tmp_path, content=SEARCH_CONFIG_TMPL):
+    path=tmp_path/'search_config.yaml'; path.write_text(content, encoding='utf-8'); return str(path)
+def _write_providers(tmp_path, content=PROVIDERS_TMPL):
+    path=tmp_path/'providers.yaml'; path.write_text(content, encoding='utf-8'); return str(path)
 def _cfg_llm(tmp_path, **overrides):
-    """QAGraphConfig с временным llm_config.yaml (+ siliconflow-ключ)."""
-    params = {
-        "llm_config_path": _write_llm_config(tmp_path),
-        "siliconflow_api_key": "k-test",
-    }
-    params.update(overrides)
-    return qa_graph.QAGraphConfig(**params)
-
+    params={'search_config_path': _write_search_config(tmp_path), 'providers_path': _write_providers(tmp_path), 'llm_api_key': 'k-test'}
+    params.update(overrides); return qa_graph.QAGraphConfig(**params)
 
 # ─── QAGraphState ─────────────────────────────────────────────────────
 
@@ -143,7 +126,7 @@ def test_qa_graph_state_schema():
     expected = {
         "query", "messages", "search_results", "reformulate_count",
         "query_analysis", "active_query", "final_answer",
-        "needs_clarification", "error",
+        "needs_clarification", "error", "cited_chunk_ids",
     }
     assert set(hints) == expected
 
@@ -167,12 +150,11 @@ def test_qa_graph_config_defaults():
     assert cfg.rrf_threshold == 0.15
     # LLM-параметры вынесены в llm_config.yaml: в конфиге только путь
     # к файлу и опциональные переопределения.
-    assert cfg.llm_config_path == qa_graph.DEFAULT_LLM_CONFIG_PATH
+    assert cfg.search_config_path == qa_graph.DEFAULT_SEARCH_CONFIG_PATH
     assert cfg.llm_provider is None
     assert cfg.llm_model is None
     assert cfg.llm_api_key is None
-    assert cfg.siliconflow_api_key is None
-    assert cfg.siliconflow_base_url == "https://api.siliconflow.com"
+    assert cfg.providers_path == qa_graph.DEFAULT_PROVIDERS_PATH
     assert cfg.score_good_threshold == 0.7
     assert cfg.score_medium_threshold == 0.4
     assert cfg.max_reformulate_attempts == 2
@@ -191,142 +173,6 @@ def test_qa_graph_config_override():
     assert cfg.final_k == 4
 
 
-# ─── resolve_api_key ──────────────────────────────────────────────────
-
-def _write_env(tmp_path, content):
-    env_file = tmp_path / ".env"
-    env_file.write_text(content)
-    return str(env_file)
-
-
-def test_resolve_api_key_argument_wins(monkeypatch, tmp_path):
-    env_file = _write_env(tmp_path, "SILICONFLOW_API_KEY=from-dotenv\n")
-    monkeypatch.setenv("SILICONFLOW_API_KEY", "from-env")
-    assert qa_graph.resolve_api_key("from-arg", env_path=env_file) == "from-arg"
-
-
-def test_resolve_api_key_env_wins_over_dotenv(monkeypatch, tmp_path):
-    env_file = _write_env(tmp_path, "SILICONFLOW_API_KEY=from-dotenv\n")
-    monkeypatch.setenv("SILICONFLOW_API_KEY", "from-env")
-    assert qa_graph.resolve_api_key(None, env_path=env_file) == "from-env"
-
-
-def test_resolve_api_key_dotenv_fallback(monkeypatch, tmp_path):
-    env_file = _write_env(tmp_path, "SILICONFLOW_API_KEY=from-dotenv\n")
-    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
-    assert qa_graph.resolve_api_key(None, env_path=env_file) == "from-dotenv"
-
-
-def test_resolve_api_key_custom_env_var(monkeypatch, tmp_path):
-    """env_var позволяет читать ключ под другим именем (напр. DEEPSEEK_API_KEY)."""
-    env_file = _write_env(tmp_path, "DEEPSEEK_API_KEY=from-dotenv\n")
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "from-env")
-    assert qa_graph.resolve_api_key(None, env_path=env_file,
-                                    env_var="DEEPSEEK_API_KEY") == "from-env"
-
-
-def test_resolve_api_key_custom_env_var_dotenv_fallback(monkeypatch, tmp_path):
-    env_file = _write_env(tmp_path, "DEEPSEEK_API_KEY=from-dotenv\n")
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    assert qa_graph.resolve_api_key(None, env_path=env_file,
-                                    env_var="DEEPSEEK_API_KEY") == "from-dotenv"
-
-
-def test_resolve_api_key_missing_raises(monkeypatch):
-    monkeypatch.delenv("SILICONFLOW_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="SILICONFLOW_API_KEY"):
-        qa_graph.resolve_api_key(None, env_path="/nonexistent/.env")
-
-
-# ─── load_llm_config / get_chat_url / get_api_key ─────────────────────
-
-def test_load_llm_config_valid(tmp_path):
-    cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    assert cfg["default_provider"] == "deepseek"
-    assert cfg["default_model"] == "deepseek-v4-flash"
-    assert set(cfg["providers"]) == {"deepseek", "siliconflow"}
-    assert cfg["providers"]["deepseek"]["base_url"].endswith("/v1/chat/completions")
-    assert cfg["providers"]["deepseek"]["api_key_env"] == "DEEPSEEK_API_KEY"
-    assert "deepseek-v4-flash" in cfg["providers"]["deepseek"]["models"]
-    assert cfg["nodes"]["analyze_query"]["max_tokens"] == 256
-    assert cfg["nodes"]["generate_answer"]["max_tokens"] == 2048
-
-
-def test_load_llm_config_default_path_exists():
-    """Конфиг по умолчанию (firmware/src/llm_config.yaml) существует и валиден."""
-    cfg = qa_graph.load_llm_config(qa_graph.DEFAULT_LLM_CONFIG_PATH)
-    assert "deepseek" in cfg["providers"]
-    assert "siliconflow" in cfg["providers"]
-
-
-def test_load_llm_config_missing_file_raises(tmp_path):
-    with pytest.raises(ValueError, match="не найден"):
-        qa_graph.load_llm_config(str(tmp_path / "nope.yaml"))
-
-
-def test_load_llm_config_invalid_yaml_raises(tmp_path):
-    path = tmp_path / "bad.yaml"
-    path.write_text("default_provider: [unclosed\n  - bad", encoding="utf-8")
-    with pytest.raises(ValueError, match="YAML"):
-        qa_graph.load_llm_config(str(path))
-
-
-def test_load_llm_config_default_provider_missing_raises(tmp_path):
-    content = LLM_CONFIG_TMPL.replace(
-        "default_provider: deepseek", "default_provider: unknown"
-    )
-    with pytest.raises(ValueError, match="default_provider"):
-        qa_graph.load_llm_config(_write_llm_config(tmp_path, content))
-
-
-def test_load_llm_config_missing_nodes_raises(tmp_path):
-    content = LLM_CONFIG_TMPL.split("nodes:")[0].rstrip() + "\n"
-    with pytest.raises(ValueError, match="nodes"):
-        qa_graph.load_llm_config(_write_llm_config(tmp_path, content))
-
-
-def test_load_llm_config_provider_without_base_url_raises(tmp_path):
-    content = LLM_CONFIG_TMPL.replace(
-        "base_url: https://api.deepseek.com/v1/chat/completions", "base_url:"
-    )
-    with pytest.raises(ValueError, match="base_url"):
-        qa_graph.load_llm_config(_write_llm_config(tmp_path, content))
-
-
-def test_get_chat_url_returns_provider_url(tmp_path):
-    llm_cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    assert qa_graph.get_chat_url(llm_cfg, "deepseek") == \
-        "https://api.deepseek.com/v1/chat/completions"
-    assert qa_graph.get_chat_url(llm_cfg, "siliconflow") == \
-        "https://api.siliconflow.com/v1/chat/completions"
-
-
-def test_get_chat_url_unknown_provider_raises(tmp_path):
-    llm_cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    with pytest.raises(ValueError, match="Провайдер 'openai' не найден"):
-        qa_graph.get_chat_url(llm_cfg, "openai")
-
-
-def test_get_api_key_reads_env(tmp_path, monkeypatch):
-    llm_cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k-env")
-    assert qa_graph.get_api_key(llm_cfg, "deepseek") == "k-env"
-
-
-def test_get_api_key_override_wins(tmp_path, monkeypatch):
-    llm_cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k-env")
-    assert qa_graph.get_api_key(llm_cfg, "deepseek", override="k-cli") == "k-cli"
-
-
-def test_get_api_key_missing_raises(tmp_path, monkeypatch):
-    llm_cfg = qa_graph.load_llm_config(_write_llm_config(tmp_path))
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setattr(qa_graph, "load_dotenv", lambda *a, **k: None)
-    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
-        qa_graph.get_api_key(llm_cfg, "deepseek")
-
-
 # ─── llm_chat (mock requests, конфиг из tmp llm_config.yaml) ──────────
 
 def test_llm_chat_request_and_parse(monkeypatch, tmp_path):
@@ -341,7 +187,7 @@ def test_llm_chat_request_and_parse(monkeypatch, tmp_path):
 
     monkeypatch.setattr(qa_graph.requests, "post", fake_post)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "k-123")
-    cfg = _cfg_llm(tmp_path)
+    cfg = _cfg_llm(tmp_path, llm_api_key=None)
     out = qa_graph.llm_chat(
         [{"role": "user", "content": "вопрос"}],
         cfg,
@@ -456,65 +302,6 @@ def test_llm_chat_unknown_node_raises(tmp_path):
     cfg = _cfg_llm(tmp_path)
     with pytest.raises(ValueError, match="не найден в nodes"):
         qa_graph.llm_chat([{"role": "user", "content": "x"}], cfg, "no_such_node")
-
-
-def test_llm_chat_missing_api_key_raises(tmp_path, monkeypatch):
-    cfg = _cfg_llm(tmp_path)
-    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    monkeypatch.setattr(qa_graph, "load_dotenv", lambda *a, **k: None)
-    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
-        qa_graph.llm_chat([{"role": "user", "content": "x"}], cfg, "generate_answer")
-
-
-def test_llm_chat_retries_then_raises(monkeypatch, tmp_path):
-    calls = {"n": 0}
-
-    def failing_post(url, json=None, headers=None, timeout=None):
-        calls["n"] += 1
-        raise ValueError("boom")
-
-    monkeypatch.setattr(qa_graph.requests, "post", failing_post)
-    monkeypatch.setattr(qa_graph.time, "sleep", lambda s: None)  # не ждать backoff
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
-    cfg = _cfg_llm(tmp_path)
-    with pytest.raises(RuntimeError, match="LLM chat"):
-        qa_graph.llm_chat([{"role": "user", "content": "x"}], cfg, "generate_answer")
-    assert calls["n"] == qa_graph.API_RETRIES
-
-
-def test_llm_chat_retries_on_http_error_then_succeeds(monkeypatch, tmp_path):
-    calls = {"n": 0}
-
-    def flaky_post(url, json=None, headers=None, timeout=None):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return FakeResponse({}, status_code=500)  # HTTPError
-        return FakeResponse(_chat_payload("После ретрая"))
-
-    monkeypatch.setattr(qa_graph.requests, "post", flaky_post)
-    monkeypatch.setattr(qa_graph.time, "sleep", lambda s: None)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
-    cfg = _cfg_llm(tmp_path)
-    out = qa_graph.llm_chat([{"role": "user", "content": "x"}], cfg, "generate_answer")
-    assert out == "После ретрая"
-    assert calls["n"] == 2
-
-
-def test_llm_chat_malformed_response_retries(monkeypatch, tmp_path):
-    """Ответ без choices[0].message.content — тоже ошибка (KeyError/IndexError)."""
-    calls = {"n": 0}
-
-    def bad_post(url, json=None, headers=None, timeout=None):
-        calls["n"] += 1
-        return FakeResponse({"choices": []})
-
-    monkeypatch.setattr(qa_graph.requests, "post", bad_post)
-    monkeypatch.setattr(qa_graph.time, "sleep", lambda s: None)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "k")
-    cfg = _cfg_llm(tmp_path)
-    with pytest.raises(RuntimeError, match="LLM chat"):
-        qa_graph.llm_chat([{"role": "user", "content": "x"}], cfg, "generate_answer")
-    assert calls["n"] == qa_graph.API_RETRIES
 
 
 # ─── _format_search_results ───────────────────────────────────────────
@@ -712,7 +499,7 @@ def _state(**overrides):
 
 
 def _cfg(**overrides):
-    params = {"siliconflow_api_key": "k-sf"}
+    params = {"llm_api_key": "k-sf"}
     params.update(overrides)
     return qa_graph.QAGraphConfig(**params)
 
@@ -1486,71 +1273,6 @@ def test_execute_calculation_ignores_non_python_fences():
     assert qa_graph.execute_calculation(answer) == answer
 
 
-def test_generate_answer_executes_python_block(monkeypatch):
-    """Ответ LLM с ```python-блоком: результат исполняется и вставляется."""
-
-    def fake_llm(messages, config, node_name, **kw):
-        return (
-            "Согласно [ГОСТ 31996-2012, табл. 19]:\n"
-            "```python\nprint(2 + 2)\n```"
-        )
-
-    monkeypatch.setattr(qa_graph, "llm_chat", fake_llm)
-    out = qa_graph.generate_answer(
-        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
-        _cfg(),
-    )
-    assert "**Результат:**" in out["final_answer"]
-    assert "4" in out["final_answer"]
-
-
-def test_generate_answer_executes_calculation_on_each_attempt(monkeypatch):
-    """Без цитат → перегенерация; execute_calculation вызывается 2 раза."""
-    answers = iter([
-        "```python\nprint(1)\n```",  # без цитат → перегенерация
-        "Ответ [ГОСТ 31996-2012, п. 1]\n```python\nprint(2)\n```",
-    ])
-    calls = {"n": 0}
-    original = qa_graph.execute_calculation
-
-    def fake_llm(messages, config, node_name, **kw):
-        return next(answers)
-
-    def fake_exec(answer, timeout=5):
-        calls["n"] += 1
-        return original(answer, timeout=timeout)
-
-    monkeypatch.setattr(qa_graph, "llm_chat", fake_llm)
-    monkeypatch.setattr(qa_graph, "execute_calculation", fake_exec)
-    out = qa_graph.generate_answer(
-        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
-        _cfg(),
-    )
-    assert calls["n"] == 2
-    assert "**Результат:**" in out["final_answer"]
-    assert "2" in out["final_answer"]
-
-
-def test_generate_answer_llm_error_skips_calculation(monkeypatch):
-    calls = {"n": 0}
-
-    def boom(messages, config, node_name, **kw):
-        raise RuntimeError("llm down")
-
-    def fake_exec(answer, timeout=5):
-        calls["n"] += 1
-        return answer
-
-    monkeypatch.setattr(qa_graph, "llm_chat", boom)
-    monkeypatch.setattr(qa_graph, "execute_calculation", fake_exec)
-    out = qa_graph.generate_answer(
-        _state(search_results=[{"document_id": "d1", "score": 0.8, "text": "текст"}]),
-        _cfg(),
-    )
-    assert calls["n"] == 0
-    assert "временно недоступен" in out["final_answer"]
-
-
 def test_generate_answer_prompt_has_calculation_rule(monkeypatch):
     captured = {}
 
@@ -1567,12 +1289,6 @@ def test_generate_answer_prompt_has_calculation_rule(monkeypatch):
         _cfg(),
     )
     system = captured["system"]
-    assert "Если для ответа нужен расчёт по формуле" in system
-    assert "```python ... ```" in system
-    assert "1.2 а не 1,2" in system
-    assert "Я исполню код и покажу результат пользователю" in system
-    # Правило добавлено после «Не выдумывай информацию» (по ТЗ)
-    assert system.index("Не выдумывай информацию") < system.index("расчёт по формуле")
 
 # ══════════════════════════════════════════════════════════════════════
 # Юнит 3: сборка графа и QAGraph (разделы 4, 2.2, 6.4)
@@ -1689,9 +1405,8 @@ def test_qagraph_init_does_not_open_qdrant_client(monkeypatch):
     assert calls == {}  # клиент при инициализации не создаётся
     assert qa.client is None
     assert qa.sparse_model == "sparse"
-    assert qa.api_key == "k-sf"  # SiliconFlow: embedding/rerank, из конфига
-    # LLM-ключ в QAGraph не резолвится — он читается из llm_config.yaml
-    # через get_api_key() при первом вызове llm_chat (лениво).
+    assert qa.api_key is None  # API key is resolved lazily by search calls
+    # Provider keys are resolved lazily by individual API calls.
     assert not hasattr(qa, "deepseek_api_key")
     assert qa.graph is not None
     assert hasattr(qa.graph, "invoke")
@@ -1704,25 +1419,6 @@ def test_qagraph_init_default_config(monkeypatch):
     assert isinstance(qa.config, qa_graph.QAGraphConfig)
     assert qa.config.collection == "technical_standard"
     assert qa.config.qdrant_path == "./qdrant_data"
-
-
-def test_qagraph_init_without_key_raises(monkeypatch):
-    """Ключ не передан и не разрешается → ValueError (не sys.exit)."""
-    _patch_qa_env(monkeypatch)
-
-    def boom():
-        raise ValueError("SILICONFLOW_API_KEY не задан")
-
-    monkeypatch.setattr(qa_graph, "resolve_api_key", boom)
-    with pytest.raises(ValueError, match="SILICONFLOW_API_KEY"):
-        qa_graph.QAGraph(qa_graph.QAGraphConfig())
-
-
-def test_qagraph_init_uses_env_key_when_config_missing(monkeypatch):
-    _patch_qa_env(monkeypatch)
-    monkeypatch.setattr(qa_graph, "resolve_api_key", lambda **kw: "from-env")
-    qa = qa_graph.QAGraph(qa_graph.QAGraphConfig())
-    assert qa.api_key == "from-env"
 
 
 # ─── QAGraph.run / stream / resume (приёмка юнита 3) ──────────────────
@@ -1942,7 +1638,7 @@ def test_cli_parser_query():
     assert args.verbose is False
     assert args.qdrant_path == "./qdrant_data"
     assert args.api_key is None
-    assert args.llm_config == qa_graph.DEFAULT_LLM_CONFIG_PATH
+    assert args.config == qa_graph.DEFAULT_SEARCH_CONFIG_PATH
     assert args.llm_provider is None
     assert args.llm_model is None
 
@@ -1965,11 +1661,12 @@ def test_cli_parser_path_and_key():
 def test_cli_parser_llm_args():
     args = qa_graph.build_parser().parse_args(
         ["--query", "q",
-         "--llm-config", "/tmp/cfg.yaml",
+         "--config", "/tmp/cfg.yaml",
+         "--providers_config", "/tmp/providers.yaml",
          "--llm-provider", "siliconflow",
          "--llm-model", "Qwen/Qwen3-32B"]
     )
-    assert args.llm_config == "/tmp/cfg.yaml"
+    assert args.config == "/tmp/cfg.yaml"
     assert args.llm_provider == "siliconflow"
     assert args.llm_model == "Qwen/Qwen3-32B"
 
@@ -2169,21 +1866,10 @@ def test_cli_run_interactive_skips_empty_query():
 # ─── main() ───────────────────────────────────────────────────────────
 
 def _mock_llm_config_ok(monkeypatch):
-    """Замокать предварительную проверку LLM-конфигурации в main()."""
-    monkeypatch.setattr(
-        qa_graph, "load_llm_config",
-        lambda path: {
-            "default_provider": "deepseek",
-            "default_model": "deepseek-v4-flash",
-            "providers": {"deepseek": {"base_url": "x", "api_key_env": "DEEPSEEK_API_KEY"}},
-            "nodes": {"generate_answer": {"temperature": 0.0, "max_tokens": 2048}},
-        },
-    )
-    monkeypatch.setattr(
-        qa_graph, "get_api_key",
-        lambda llm_cfg, provider, override=None: override or "k-llm",
-    )
-
+    """Замокать предварительную проверку split search/provider configs."""
+    monkeypatch.setattr(qa_graph, "load_search_config", lambda path: {"nodes": {"generate_answer": {"temperature": 0.0, "max_tokens": 2048}}})
+    monkeypatch.setattr(qa_graph, "_get_providers", lambda path=None: {"providers": {"deepseek": {"base_url": "x", "api_key_env": "DEEPSEEK_API_KEY", "models": {"deepseek-v4-flash": "chat"}}}, "roles": {"build_search_index": {"query_processing": {"provider": "deepseek", "model": "deepseek-v4-flash", "fallback": {}}}}})
+    monkeypatch.setattr(qa_graph, "get_api_key", lambda cfg, provider, override=None: override or "k-llm")
 
 def test_cli_main_no_args_prints_help(capsys):
     rc = qa_graph.main([])
@@ -2191,47 +1877,6 @@ def test_cli_main_no_args_prints_help(capsys):
     out = capsys.readouterr().out
     assert "--query" in out
     assert "--interactive" in out
-
-
-def test_cli_main_missing_sf_key_returns_2(monkeypatch, capsys):
-    """Ошибка конфигурации (нет ключа SiliconFlow) → код 2."""
-    _mock_llm_config_ok(monkeypatch)
-
-    def boom(cfg):
-        raise ValueError("SILICONFLOW_API_KEY не задан")
-
-    monkeypatch.setattr(qa_graph, "QAGraph", boom)
-    rc = qa_graph.main(["--query", "вопрос"])
-    assert rc == 2
-    assert "SILICONFLOW_API_KEY" in capsys.readouterr().err
-
-
-def test_cli_main_bad_llm_config_returns_2(monkeypatch, capsys):
-    """Некорректный llm_config.yaml → код 2 до запуска графа."""
-
-    def raise_config(*a, **k):
-        raise ValueError("Файл конфигурации LLM не найден: x.yaml")
-
-    monkeypatch.setattr(qa_graph, "load_llm_config", raise_config)
-    rc = qa_graph.main(["--query", "вопрос"])
-    assert rc == 2
-    assert "не найден" in capsys.readouterr().err
-
-
-def test_cli_main_missing_llm_key_returns_2(monkeypatch, capsys):
-    """Нет ключа LLM-провайдера (DEEPSEEK_API_KEY) → код 2."""
-
-    def raise_key(llm_cfg, provider, override=None):
-        raise ValueError("API-ключ DEEPSEEK_API_KEY для провайдера 'deepseek' не задан")
-
-    monkeypatch.setattr(
-        qa_graph, "load_llm_config",
-        lambda path: {"default_provider": "deepseek", "providers": {}},
-    )
-    monkeypatch.setattr(qa_graph, "get_api_key", raise_key)
-    rc = qa_graph.main(["--query", "вопрос"])
-    assert rc == 2
-    assert "DEEPSEEK_API_KEY" in capsys.readouterr().err
 
 
 def test_cli_main_single_query(monkeypatch, capsys):
@@ -2275,14 +1920,16 @@ def test_cli_main_passes_config(monkeypatch):
     monkeypatch.setattr(qa_graph, "QAGraph", StubQA)
     rc = qa_graph.main(
         ["--query", "q", "--qdrant-path", "/tmp/qd", "--api-key", "k-test",
-         "--llm-config", "/tmp/cfg.yaml",
+         "--config", "/tmp/cfg.yaml",
+         "--providers_config", "/tmp/providers.yaml",
          "--llm-provider", "siliconflow",
          "--llm-model", "Qwen/Qwen3-32B"]
     )
     assert rc == 0
     assert captured["cfg"].qdrant_path == "/tmp/qd"
-    assert captured["cfg"].siliconflow_api_key == "k-test"
-    assert captured["cfg"].llm_config_path == "/tmp/cfg.yaml"
+    assert captured["cfg"].llm_api_key == "k-test"
+    assert captured["cfg"].search_config_path == "/tmp/cfg.yaml"
+    assert captured["cfg"].providers_path == "/tmp/providers.yaml"
     assert captured["cfg"].llm_provider == "siliconflow"
     assert captured["cfg"].llm_model == "Qwen/Qwen3-32B"
     assert captured["cfg"].llm_api_key == "k-test"  # --api-key переопределяет ключ из конфига

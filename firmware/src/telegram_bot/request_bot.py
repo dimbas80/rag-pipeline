@@ -6,7 +6,7 @@ Telegram-бот для QA-системы нормативных документ
 Принимает сообщения, показывает «печатает...», возвращает ответ с цитатами.
 
 Запуск:
-    python bot.py
+    python request_bot.py
 
 Зависимости: python-telegram-bot, qa_graph (локальный импорт)
 """
@@ -38,8 +38,14 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
 # ─── Конфигурация ──────────────────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 QDRANT_PATH = os.environ.get("QDRANT_PATH", "/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data")
-LLM_CONFIG = os.path.join(os.path.dirname(__file__), "..", "llm_config.yaml")
-MAX_HISTORY = 3  # сколько последних пар вопрос-ответ хранить
+SEARCH_CONFIG = os.path.join(os.path.dirname(__file__), "..", "search_config.yaml")
+PROVIDERS_CONFIG = os.path.join(os.path.dirname(__file__), "..", "providers.yaml")
+ALLOWED_USERS = {
+    int(value.strip())
+    for value in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
+    if value.strip().isdigit()
+}
+MAX_HISTORY = 3
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -47,7 +53,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stderr),
         logging.handlers.RotatingFileHandler(
-            os.path.join(os.path.dirname(__file__), "bot.log"),
+            os.path.join(os.path.dirname(__file__), "request_bot.log"),
             maxBytes=5 * 1024 * 1024,  # 5 MB
             backupCount=3,
             encoding="utf-8",
@@ -75,7 +81,8 @@ def get_qa():
         _qa = QAGraph(
             QAGraphConfig(
                 qdrant_path=QDRANT_PATH,
-                llm_config_path=LLM_CONFIG,
+                search_config_path=SEARCH_CONFIG,
+                providers_path=PROVIDERS_CONFIG,
             )
         )
         logger.info("QAGraph инициализирован")
@@ -84,8 +91,21 @@ def get_qa():
 
 # ─── Обработчики ────────────────────────────────────────────────────────
 
+def _is_authorized(update: Update) -> bool:
+    """Allow everyone when unset; otherwise allow configured user IDs."""
+    if not ALLOWED_USERS:
+        return True
+    user_id = getattr(update.effective_user, "id", None)
+    if user_id in ALLOWED_USERS:
+        return True
+    logger.warning("Отклонено сообщение неавторизованного пользователя user_id=%s", user_id)
+    return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие при /start."""
+    if not _is_authorized(update):
+        return
     await update.message.reply_text(
         "🔍 *QA-бот нормативных документов*\n\n"
         "Я отвечаю на вопросы по ГОСТ, СП, СНиП, СанПиН "
@@ -107,6 +127,8 @@ async def list_documents_command(update: Update, context: ContextTypes.DEFAULT_T
     В отличие от текстовой ветки handle_message: без _send_images и без
     записи в _history. Форматирование — через общий format_document_list.
     """
+    if not _is_authorized(update):
+        return
     try:
         documents = await asyncio.to_thread(get_qa().list_documents)
     except Exception as exc:
@@ -122,6 +144,8 @@ async def list_documents_command(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка текстового сообщения — поиск в QA-системе с контекстом диалога."""
+    if not _is_authorized(update):
+        return
     query = update.message.text.strip()
     if not query:
         return
