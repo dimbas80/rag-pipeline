@@ -48,7 +48,7 @@ def test_same_caption_unrelated_tables_do_not_share_images():
 
 
 def test_stitching_reads_threshold_and_number_match_config(tmp_path, monkeypatch):
-    (tmp_path / 'rag_config.yaml').write_text(
+    (tmp_path / 'create_markdown_config.yaml').write_text(
         'table_stitching:\n  bottom_threshold_ratio: 0.5\n  require_table_num_match: false\n',
         encoding='utf-8',
     )
@@ -62,7 +62,7 @@ def test_stitching_reads_threshold_and_number_match_config(tmp_path, monkeypatch
 
 
 def test_stitching_uses_configured_geometry_threshold(tmp_path, monkeypatch):
-    (tmp_path / 'rag_config.yaml').write_text(
+    (tmp_path / 'create_markdown_config.yaml').write_text(
         'table_stitching:\n  bottom_threshold_ratio: 0.5\n', encoding='utf-8'
     )
     monkeypatch.chdir(tmp_path)

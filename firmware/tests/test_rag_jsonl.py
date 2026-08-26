@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import create_markdown
 
-RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
+RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "create_markdown_config.yaml")
 
 # Тестовый JSON ГОСТ СО153-34.21.122-2003 (как в test_headings.py)
 TEST_JSON = "/mnt/sdb/!База_ГОСТ/tmp/СО153-34_21_122-2003 Молниезащита/yandex_result.json"
@@ -33,7 +33,30 @@ TEST_JSON = "/mnt/sdb/!База_ГОСТ/tmp/СО153-34_21_122-2003 Молние
 
 @pytest.fixture(scope="module")
 def rag_config():
-    return create_markdown.load_rag_config(RAG_CONFIG)
+    """Единый конфиг + тестовая запись so153 (как per-doc overlay).
+
+    Каталог documents из create_markdown_config.yaml удалён; RAG-тесты
+    опираются на запись so153 — добавляем её как per-document overlay.
+    """
+    cfg = create_markdown.load_rag_config(RAG_CONFIG)
+    cfg.setdefault("documents", {})["so153_molniezashita"] = {
+        "document_id": "СО 153-34.21.122-2003",
+        "document_id_alt": None,
+        "document_type": None,
+        "domain": None,
+        "title": "Инструкция по устройству молниезащиты зданий, сооружений и промышленных коммуникаций",
+        "edition": "2003",
+        "date_enacted": "2003-06-30",
+        "date_amended": None,
+        "amended_by": None,
+        "source_file": "СО153-34_21_122-2003 Молниезащита.pdf",
+        "status": "active",
+        "status_reason": None,
+        "replaced_by_document_id": None,
+        "replaced_by_doc_key": None,
+        "ignore_sections": ["Содержание"],
+    }
+    return cfg
 
 
 @pytest.fixture(scope="module")
@@ -66,12 +89,13 @@ def so153_md():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def test_load_rag_config_ok(rag_config):
-    """Загрузка реального rag_config.yaml: секции defaults/references/documents."""
+def test_load_rag_config_ok():
+    """Загрузка реального create_markdown_config.yaml: секции defaults/references;
+    каталог documents в едином конфиге отсутствует (живёт в per-doc overlay)."""
+    rag_config = create_markdown.load_rag_config(RAG_CONFIG)
     assert "defaults" in rag_config
     assert "references" in rag_config
-    assert "documents" in rag_config
-    assert "so153_molniezashita" in rag_config["documents"]
+    assert "documents" not in rag_config
     # v2: токен-лимит вместо char-лимита, Qwen3 tokenizer, статус документа
     assert rag_config["defaults"]["max_chunk_tokens"] == 7000
     assert rag_config["defaults"]["tokenizer"] == "Qwen/Qwen3-Embedding-8B"
@@ -79,23 +103,30 @@ def test_load_rag_config_ok(rag_config):
     assert rag_config["defaults"]["allow_degraded_fallback"] is False
     assert rag_config["defaults"]["default_status"] == "active"
     assert len(rag_config["references"]["patterns"]) >= 5
-    doc = rag_config["documents"]["so153_molniezashita"]
+
+
+def test_load_rag_config_documents_from_overlay(tmp_path):
+    """Записи документов подхватываются из per-document overlay (<stem>_reg.yaml),
+    а не из единого конфига."""
+    overlay = tmp_path / "doc_reg.yaml"
+    overlay.write_text(
+        "documents:\n"
+        "  so153_molniezashita:\n"
+        '    document_id: "СО 153-34.21.122-2003"\n'
+        "    status: active\n"
+        "    status_reason: null\n"
+        "    replaced_by_document_id: null\n"
+        "    replaced_by_doc_key: null\n"
+        "    source_file: \"СО153-34_21_122-2003 Молниезащита.pdf\"\n",
+        encoding="utf-8",
+    )
+    rag = create_markdown.load_rag_config(RAG_CONFIG, reg_path=overlay)
+    assert "so153_molniezashita" in rag["documents"]
+    doc = rag["documents"]["so153_molniezashita"]
     assert doc["document_id"] == "СО 153-34.21.122-2003"
     assert doc["status"] == "active"
-    assert doc["status_reason"] is None
-    assert doc["replaced_by_document_id"] is None
-    assert "Содержание" in doc["ignore_sections"]
-
-
-def test_load_rag_config_inactive_document(rag_config):
-    """Недействующий документ: официальный номер в replaced_by_document_id, не slug."""
-    doc = rag_config["documents"]["old_snip"]
-    assert doc["status"] == "inactive"
-    assert doc["status_reason"] == "Заменён на СП 60.13330.2012"
-    # Официальный номер документа-преемника (не doc_key/slug)
-    assert doc["replaced_by_document_id"] == "СП 60.13330.2012"
-    # Ключ каталога — отдельное опциональное поле
-    assert doc["replaced_by_doc_key"] == "sp60_otoplenie"
+    # Без overlay documents нет вовсе
+    assert "documents" not in create_markdown.load_rag_config(RAG_CONFIG)
 
 
 def test_load_rag_config_missing_file():
@@ -889,15 +920,15 @@ def test_process_file_md_ai_rag(tmp_path, rag_config):
 
 
 def test_parse_args_rag_flags():
-    args = create_markdown.parse_args(["-i", "file.pdf", "--rag", "--rag-config", "my_rag.yaml"])
+    args = create_markdown.parse_args(["-i", "file.pdf", "--rag", "--config", "my_config.yaml"])
     assert args.rag is True
-    assert args.rag_config == "my_rag.yaml"
+    assert args.config == "my_config.yaml"
 
 
 def test_parse_args_rag_defaults():
     args = create_markdown.parse_args(["-i", "file.pdf"])
     assert args.rag is False
-    assert args.rag_config == "./rag_config.yaml"
+    assert args.config == "./create_markdown_config.yaml"
 
 
 if __name__ == "__main__":

@@ -82,43 +82,44 @@ def test_constant_removed():
 
 
 def test_gap_filling_hardcoded_prompt_removed():
-    """Хардкод-промт gap-filling убран из create_markdown.py — только из config_ai.yaml."""
+    """Хардкод-промт gap-filling убран из create_markdown.py — только из create_markdown_config.yaml."""
     src = Path(create_markdown.__file__).read_text(encoding="utf-8")
     check(
         "gap-filling хардкод-текст отсутствует",
         "Проверь все таблицы в Markdown-файле ниже" not in src,
     )
     check(
-        "gap-filling берёт ai_table",
-        'config.get("ai_table", {})' in src,
+        "gap-filling берёт ai_postprocess",
+        'config.get("ai_postprocess"' in src,
     )
     check(
-        "gap-filling проверяет prompt из ai_table",
-        "укажите prompt в секции ai_table конфига" in src,
+        "gap-filling проверяет prompt",
+        "укажите prompt в секции ai_postprocess конфига" in src,
     )
 
 
-def test_config_ai_table_section():
-    """config_ai.yaml содержит секцию ai_table с промптом."""
+def test_config_sections():
+    """create_markdown_config.yaml: секции table_vision/ai_postprocess/reg_extract;
+    reg_extract содержит ТОЛЬКО prompt (провайдер/модель — один раз в ai_postprocess)."""
     import yaml
 
-    cfg_path = Path(create_markdown.__file__).parent / "config_ai.yaml"
+    cfg_path = Path(create_markdown.__file__).parent / "create_markdown_config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    ai_table = cfg.get("ai_table")
-    check("ai_table секция есть", isinstance(ai_table, dict))
-    if not isinstance(ai_table, dict):
-        return
-    check("ai_table.prompt задан", bool(ai_table.get("prompt")))
-    check("ai_table.provider задан", bool(ai_table.get("provider")))
-    check("ai_table.model задан", bool(ai_table.get("model")))
-    check("ai_table.api_key_env задан", bool(ai_table.get("api_key_env")))
-    check("ai_table.base_url задан", bool(ai_table.get("base_url")))
-    check("ai_table.fallback задан", isinstance(ai_table.get("fallback"), dict))
-    check(
-        "существующие секции не тронуты",
-        isinstance(cfg.get("table_vision"), dict)
-        and isinstance(cfg.get("ai_postprocess"), dict),
-    )
+    check("table_vision секция есть", isinstance(cfg.get("table_vision"), dict))
+    check("ai_postprocess секция есть", isinstance(cfg.get("ai_postprocess"), dict))
+    ai = cfg.get("ai_postprocess") or {}
+    check("ai_postprocess.prompt задан", bool(ai.get("prompt")))
+    check("ai_postprocess.provider задан", bool(ai.get("provider")))
+    check("ai_postprocess.model задан", bool(ai.get("model")))
+    check("ai_postprocess.api_key_env задан", bool(ai.get("api_key_env")))
+    check("ai_postprocess.base_url задан", bool(ai.get("base_url")))
+    check("ai_postprocess.fallback задан", isinstance(ai.get("fallback"), dict))
+    reg = cfg.get("reg_extract") or {}
+    check("reg_extract.prompt задан", bool(reg.get("prompt")))
+    check("reg_extract без провайдера (модель из ai_postprocess)", "provider" not in reg)
+    check("reg_extract без модели", "model" not in reg)
+    check("reg_extract без fallback", "fallback" not in reg)
+    check("каталог documents удалён из конфига", "documents" not in cfg)
 
 
 if __name__ == "__main__":
@@ -128,7 +129,7 @@ if __name__ == "__main__":
     test_vision_prompt_present()
     test_constant_removed()
     test_gap_filling_hardcoded_prompt_removed()
-    test_config_ai_table_section()
+    test_config_sections()
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)} проверок")

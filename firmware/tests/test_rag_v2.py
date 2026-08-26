@@ -24,12 +24,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import create_markdown
 
-RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
+RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "create_markdown_config.yaml")
 
 
 @pytest.fixture(scope="module")
 def rag_config():
-    return create_markdown.load_rag_config(RAG_CONFIG)
+    """Единый конфиг + тестовая запись so153 (как per-doc overlay).
+
+    Каталог documents из create_markdown_config.yaml удалён; RAG-тесты
+    опираются на запись so153 — добавляем её как per-document overlay.
+    """
+    cfg = create_markdown.load_rag_config(RAG_CONFIG)
+    cfg.setdefault("documents", {})["so153_molniezashita"] = {
+        "document_id": "СО 153-34.21.122-2003",
+        "document_id_alt": None,
+        "document_type": None,
+        "domain": None,
+        "title": "Инструкция по устройству молниезащиты зданий, сооружений и промышленных коммуникаций",
+        "edition": "2003",
+        "date_enacted": "2003-06-30",
+        "date_amended": None,
+        "amended_by": None,
+        "source_file": "СО153-34_21_122-2003 Молниезащита.pdf",
+        "status": "active",
+        "status_reason": None,
+        "replaced_by_document_id": None,
+        "replaced_by_doc_key": None,
+        "ignore_sections": ["Содержание"],
+    }
+    return cfg
 
 
 def _tok(text: str) -> int:
@@ -345,10 +368,34 @@ class TestBuildRagJsonlV2:
         for r in rows:
             assert "page" not in r["source"]
 
-    def test_inactive_status(self, v2_md, rag_config):
-        """Неактивный документ: статус и номер преемника в каждой строке."""
+    def test_inactive_status(self, v2_md):
+        """Неактивный документ: статус и номер преемника в каждой строке.
+
+        Запись old_snip задаётся инлайн (per-doc overlay-слой), каталога
+        documents в едином конфиге больше нет.
+        """
+        cfg = {
+            "defaults": {
+                "max_chunk_tokens": 7000,
+                "tokenizer": "Qwen/Qwen3-Embedding-8B",
+                "tokenizer_revision": "main",
+                "allow_degraded_fallback": False,
+                "default_status": "active",
+                "extract_references": True,
+                "include_tables": True,
+                "include_images": True,
+            },
+            "documents": {
+                "old_snip": {
+                    "status": "inactive",
+                    "status_reason": "Заменён на СП 60.13330.2012",
+                    "replaced_by_document_id": "СП 60.13330.2012",
+                    "replaced_by_doc_key": "sp60_otoplenie",
+                }
+            },
+        }
         jsonl = create_markdown.build_rag_jsonl_v2(
-            v2_md, None, rag_config, "old_snip", _tok, "qwen3",
+            v2_md, None, cfg, "old_snip", _tok, "qwen3",
         )
         rows = [json.loads(l) for l in jsonl.splitlines() if l.strip()]
         assert rows

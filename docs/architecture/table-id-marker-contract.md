@@ -277,7 +277,7 @@ elif etype == "table":
 
 - НЕ редактировать формат id и AI-этап `process_file` (читает маркеры как есть).
 - НЕ менять `_find_table_caption_for`/`_find_table_caption_block`/`_table_crop_top`.
-- НЕ трогать `rag_config.yaml`, `config_ai.yaml`, `.env`.
+- НЕ трогать `create_markdown_config.yaml`, `.env`.
 - НЕ менять схему `table_images.json` без явного указания в этом контракте.
 - НЕ помещать production-код в `workflows/`.
 

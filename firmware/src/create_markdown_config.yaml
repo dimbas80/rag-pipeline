@@ -1,7 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════════════
-# Конфигурация AI для create_markdown.py
+# Единый конфиг create_markdown.py
+# Объединяет бывшие config_ai.yaml (AI/vision/промпты) и rag_config.yaml
+# (RAG: defaults, references). Каталог документов (documents) вынесен:
+# каждая запись живёт в per-document файле <stem>_reg.yaml рядом с итоговым
+# Markdown (см. docs/architecture/rag-register-flag.md).
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Vision-распознавание таблиц (--ai-table)
+# ═══════════════════════════════════════════════════════════════════════════
 table_vision:
   # Провайдер для vision-распознавания таблиц (--ai-table)
   provider: provod
@@ -12,7 +19,6 @@ table_vision:
   #model: glm-4.6v-flash
   #api_key_env: Z_AI_API_KEY
   #base_url: https://api.z.ai/api/paas/v4
-  
 
   # Резервный провайдер для vision-распознавания
   fallback:
@@ -39,21 +45,20 @@ table_vision:
       же строке — это номер строки, выведи в отдельную колонку.
       Определи имя таблицы над таблицей.
       Выдай только markdown без комментариев
-    
 
-  
-# API-ключи задаются через .env (DEEPSEEK_API_KEY, ANYMODEL_API_KEY).
-# Порядок загрузки: .env → переменные окружения.
-#
 # ═══════════════════════════════════════════════════════════════════════════
-
+# AI-постобработка (--ai)
+# ЕДИНСТВЕННЫЙ источник провайдера/модели/fallback для всех LLM-вызовов
+# текстовой постобработки, включая извлечение полей для --reg (reg_extract
+# задаёт только промпт и переиспользует провайдера/модель из этой секции).
+# ═══════════════════════════════════════════════════════════════════════════
 ai_postprocess:
   # Провайдер по умолчанию: deepseek или provod
   provider: deepseek
-  model: deepseek-v4-pro  
+  model: deepseek-v4-pro
   # Имя переменной окружения с API-ключом
   api_key_env: DEEPSEEK_API_KEY
-  #Базовый URL API (OpenAI-совместимый)
+  # Базовый URL API (OpenAI-совместимый)
   base_url: https://api.deepseek.com/v1
   #provider: provod
   #model: google/gemini-2.5-flash
@@ -62,10 +67,10 @@ ai_postprocess:
 
   # Резервный провайдер (если primary не отвечает или ключ не задан)
   fallback:
-        provider: provod
-        model: deepseek-v4-pro
-        api_key_env: PROVOD_API_KEY
-        base_url: https://api.provod.ai/v1
+    provider: provod
+    model: deepseek-v4-pro
+    api_key_env: PROVOD_API_KEY
+    base_url: https://api.provod.ai/v1
 
   # Объединённый промпт: постобработка + сверка таблиц с vision-эталоном.
   # Правила 1–13 — постобработка, 14–20 — сверка таблиц.
@@ -160,20 +165,12 @@ ai_postprocess:
     - НЕ меняй форматирование чисел
     
 # ═══════════════════════════════════════════════════════════════════════════
-
 # Извлечение полей для --reg (интерактивная регистрация документа).
 # Контракт: docs/architecture/rag-register-flag.md §4.2.
-# Переиспользует эндпоинт ai_postprocess, но со своим коротким промптом.
+# Переиспользует провайдера/модель/fallback секции ai_postprocess — здесь
+# задаётся ТОЛЬКО промпт.
+# ═══════════════════════════════════════════════════════════════════════════
 reg_extract:
-  provider: deepseek
-  model: deepseek-v4-pro          # как ai_postprocess
-  api_key_env: DEEPSEEK_API_KEY
-  base_url: https://api.deepseek.com/v1
-  fallback:                        # как ai_postprocess
-    provider: anymodel
-    model: glm/glm-5.2
-    api_key_env: ANYMODEL_API_KEY
-    base_url: https://anymodel.org/v1
   prompt: |
     Ты — библиограф нормативных документов. Ниже — начало Markdown-файла,
     полученного из OCR нормативного документа (ГОСТ/СП/СО/СНиП/ПУЭ).
@@ -182,3 +179,35 @@ reg_extract:
      "title": "<заголовок документа КАК НАПИСАН, без кавычек>",
      "domain_hint": "<1 слово тематики, напр. Кабели>"}
     Если поле не определяется — null. Только JSON.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RAG-индексация нормативных документов v2 (ADR-010)
+# Спецификация: docs/software/rag_config_spec.yaml
+# Изменения v2: max_chunk_tokens (Qwen3 tokenizer), status/status_reason,
+#               replaced_by_document_id (официальный номер документа-преемника)
+# ═══════════════════════════════════════════════════════════════════════════
+defaults:
+  output_format: "jsonl"               # jsonl (построчно)
+  max_chunk_tokens: 7000               # макс. размер чанка в токенах Qwen3
+  tokenizer: "Qwen/Qwen3-Embedding-8B" # HF model id для transformers.AutoTokenizer
+  tokenizer_revision: "main"           # фиксированная ревизия токенизатора
+  allow_degraded_fallback: false       # запретить молчаливый chars/token fallback
+  tokenizer_fallback_ratio: 3.5        # chars/token (только при allow_degraded_fallback: true)
+  include_tables: true                 # таблицы — в text как Markdown
+  include_images: true                 # ![fig_N](image/fig_N.jpg) — как есть
+  extract_references: true             # авто regexp: «см. п.», «табл.», «гл.»
+  default_status: "active"             # статус по умолчанию если не указан
+
+# ── Паттерны references ──
+references:
+  patterns:
+    - 'см\.\s*(?:п\.|пункт)\s*(\d+(?:\.\d+)*)'
+    - '(?:согласно|по)\s+(?:п\.|пункту)\s*(\d+(?:\.\d+)*)'
+    - '(?:табл\.|таблица)\s*(\d+(?:\.\d+)*)'
+    - 'разд\.\s*(\d+(?:\.\d+)*)'
+    - '(?:гл\.|глава)\s*(\d+(?:\.\d+)*)'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API-ключи задаются через .env (DEEPSEEK_API_KEY, PROVOD_API_KEY,
+# ANYMODEL_API_KEY, Z_AI_API_KEY). Порядок загрузки: .env → переменные окружения.
+# ═══════════════════════════════════════════════════════════════════════════

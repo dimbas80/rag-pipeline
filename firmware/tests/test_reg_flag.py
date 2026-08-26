@@ -33,7 +33,68 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import create_markdown
 
-RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "rag_config.yaml")
+RAG_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "create_markdown_config.yaml")
+
+# Текст per-document overlay (как <stem>_reg.yaml рядом с Markdown): секция
+# documents с записями so153 (неполная: document_type/domain null), sp89
+# (document_type null) и полной GOST_18410. Используется тестами записи
+# вместо каталога documents (каталог из единого конфига удалён).
+OVERLAY_TEXT = """# ═══ Per-document overlay (тестовый) ═══
+documents:
+  so153_molniezashita:
+    document_id: "СО 153-34.21.122-2003"
+    document_id_alt: null
+    document_type: null
+    domain: null
+    title: "Инструкция по устройству молниезащиты зданий, сооружений и промышленных коммуникаций"
+    edition: "2003"
+    date_enacted: "2003-06-30"
+    date_amended: null
+    amended_by: null
+    source_file: "СО153-34_21_122-2003 Молниезащита.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Содержание"
+  sp89_kotelnye:
+    document_id: "СП 89.13330.2016"
+    document_id_alt: "СНиП II-35-76"
+    document_type: null
+    domain: null
+    title: "Котельные установки"
+    edition: "2016"
+    date_enacted: "2017-06-17"
+    date_amended: "2021-05-18"
+    amended_by: "Приказ Минстроя РФ № 295/пр от 18.05.2021"
+    source_file: "СП 89.13330.2016 Котельные установки.pdf"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Предисловие"
+      - "Содержание"
+  GOST_18410:
+    document_id: "ГОСТ 18410—73"
+    document_id_alt: null
+    document_type: "ГОСТ"
+    domain: null
+    title: "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ. ТЕХНИЧЕСКИЕ УСЛОВИЯ"
+    edition: "1973"
+    date_enacted: "1975-01-01"
+    date_amended: null
+    amended_by: null
+    source_file: "ГОСТ18410-73_Кабели_с_бумажной_изоляцией.md"
+    status: active
+    status_reason: null
+    replaced_by_document_id: null
+    replaced_by_doc_key: null
+    ignore_sections:
+      - "Предисловие"
+      - "Содержание"
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,7 +136,12 @@ def queue_input(monkeypatch, answers):
 
 
 def real_config_text() -> str:
-    return Path(RAG_CONFIG).read_text(encoding="utf-8")
+    """Текст per-document overlay (секция documents), не единый конфиг.
+
+    Каталог documents из create_markdown_config.yaml удалён; записи живут
+    в per-document <stem>_reg.yaml. Тесты записи оперируют таким overlay.
+    """
+    return OVERLAY_TEXT
 
 
 def write_config(tmp_path, text):
@@ -276,7 +342,11 @@ class TestExtraction:
                 '"domain_hint": "Кабели"}'
             ),
         ):
-            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(
+                head,
+                {"ai_postprocess": {"provider": "deepseek", "model": "m", "prompt": "x"},
+                 "reg_extract": {"prompt": "p"}},
+            )
         assert r["document_id"] == "ГОСТ 18410—73"
         assert r["title"] == "КАБЕЛИ СИЛОВЫЕ С ПРОПИТАННОЙ БУМАЖНОЙ ИЗОЛЯЦИЕЙ"
         assert r["domain_hint"] == "Кабели"
@@ -288,21 +358,33 @@ class TestExtraction:
             "create_markdown._call_ai_api",
             return_value='```json\n{"document_id": "ГОСТ 18410—73"}\n```',
         ):
-            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(
+                head,
+                {"ai_postprocess": {"provider": "deepseek", "model": "m", "prompt": "x"},
+                 "reg_extract": {"prompt": "p"}},
+            )
         assert r["document_id"] == "ГОСТ 18410—73"
 
     def test_llm_broken_falls_back_to_regex(self, monkeypatch):
         """LLM вернул не-JSON → regex-слой."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         with patch("create_markdown._call_ai_api", return_value="не понял"):
-            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(
+                head,
+                {"ai_postprocess": {"provider": "deepseek", "model": "m", "prompt": "x"},
+                 "reg_extract": {"prompt": "p"}},
+            )
         assert r["document_id"] == "ГОСТ 18410—73"
 
     def test_llm_override_recomputes_edition(self, monkeypatch):
         """LLM заменил document_id → edition пересчитан по новому id."""
         head = "КАБЕЛИ СИЛОВЫЕ\nГОСТ 18410—73\n"
         with patch("create_markdown._call_ai_api", return_value='{"document_id": "ГОСТ 839—80"}'):
-            r = create_markdown._reg_extract_fields(head, {"reg_extract": {"prompt": "p"}})
+            r = create_markdown._reg_extract_fields(
+                head,
+                {"ai_postprocess": {"provider": "deepseek", "model": "m", "prompt": "x"},
+                 "reg_extract": {"prompt": "p"}},
+            )
         assert r["document_id"] == "ГОСТ 839—80"
         assert r["edition"] == "1980"
 
@@ -446,7 +528,7 @@ class TestIdempotence:
         assert doc["edition"] == "2003"
         assert doc["document_type"] == "СО"
         assert doc["domain"] == "Молниезащита"
-        assert global_cfg.read_bytes() == Path(RAG_CONFIG).read_bytes()
+        assert global_cfg.read_bytes() == real_config_text().encode("utf-8")
 
     def test_second_run_skips_without_prompts(self, tmp_path, monkeypatch, tty):
         """После записи повторный прогон — полный skip, ни одного input()."""
@@ -700,7 +782,7 @@ class TestRegression:
         ok = create_markdown.process_file(
             str(md), use_ai=False, config={}, api_key="", folder_id="",
             output_base=str(tmp_path / "out"), tmp_base=str(tmp_path / "tmp"),
-            use_reg=True, rag_config=create_markdown.load_rag_config(cfg), rag_config_path=str(cfg),
+            use_reg=True, rag_config=create_markdown.load_rag_config(cfg),
         )
         assert ok is True
         global_config = yaml.safe_load(cfg.read_text(encoding="utf-8"))
@@ -729,23 +811,35 @@ class TestRegression:
         monkeypatch.setattr(
             create_markdown.sys, "argv",
             ["create_markdown.py", "-i", str(md), "--reg",
-             "--rag-config", str(tmp_path / "nope.yaml")],
+             "--config", str(tmp_path / "nope.yaml")],
         )
         with pytest.raises(SystemExit) as e:
             create_markdown.main()
         assert e.value.code == 1
 
-    def test_reg_extract_section_in_config_ai(self):
-        """config_ai.yaml содержит секцию reg_extract с промптом (§4.2)."""
-        cfg_path = Path(create_markdown.__file__).parent / "config_ai.yaml"
+    def test_reg_extract_section_in_config(self):
+        """create_markdown_config.yaml: reg_extract содержит ТОЛЬКО prompt;
+        провайдер/модель/fallback заданы один раз в ai_postprocess (§4.2)."""
+        cfg_path = Path(create_markdown.__file__).parent / "create_markdown_config.yaml"
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
         reg = cfg.get("reg_extract")
         assert isinstance(reg, dict)
         assert bool(reg.get("prompt"))
-        assert bool(reg.get("provider"))
-        assert bool(reg.get("model"))
-        assert bool(reg.get("api_key_env"))
-        assert isinstance(reg.get("fallback"), dict)
+        # В reg_extract НЕТ дублирования провайдера — модель одна (ai_postprocess)
+        assert "provider" not in reg
+        assert "model" not in reg
+        assert "api_key_env" not in reg
+        assert "base_url" not in reg
+        assert "fallback" not in reg
+        # Единый источник модели — ai_postprocess
+        ai = cfg.get("ai_postprocess")
+        assert isinstance(ai, dict)
+        assert bool(ai.get("provider"))
+        assert bool(ai.get("model"))
+        assert bool(ai.get("api_key_env"))
+        assert bool(ai.get("base_url"))
+        assert isinstance(ai.get("fallback"), dict)
         # существующие секции не тронуты
         assert isinstance(cfg.get("table_vision"), dict)
-        assert isinstance(cfg.get("ai_postprocess"), dict)
+        # каталог documents из конфига удалён
+        assert "documents" not in cfg

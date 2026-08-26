@@ -18,7 +18,7 @@
 RAG v2 расширяет существующий RAG-контур (ADR-009, секция 12 create_markdown.py) следующими возможностями:
 
 1. **Токен-ориентированное чанкирование** (Qwen3-Embedding-8B native tokenizer, `max_chunk_tokens: 7000`)
-2. **Статус документа** (`active`/`inactive`) в `rag_config.yaml` и каждой JSONL-строке
+2. **Статус документа** (`active`/`inactive`) в per-document `<stem>_reg.yaml` (секция `documents`) и каждой JSONL-строке
 3. **Удаление номеров страниц** из публичного JSONL (сохранение как `_source_page`)
 4. **Реестр активов** `rag_assets.json` — таблицы и изображения с привязкой к чанкам
 5. **Трёхэтапный CLI** с гарантией безопасности `--rag` (без повторного OCR, перезаписывает только производные файлы)
@@ -561,11 +561,16 @@ python3 create_markdown.py -i file.pdf --ai --rag
 
 ---
 
-## 6. rag_config.yaml — обновлённая схема
+## 6. Единый конфиг — RAG-секции (create_markdown_config.yaml)
+
+> Актуализировано 2026-08-26: `config_ai.yaml` + `rag_config.yaml` объединены
+> в `create_markdown_config.yaml`; секция `documents` УДАЛЕНА — записи живут
+> в per-document `<stem>_reg.yaml` рядом с Markdown (overlay накладывается
+> `load_rag_config(config_path, reg_path=...)`).
 
 ```yaml
 # ═══════════════════════════════════════════════════════════════
-# Конфигурация RAG-индексации нормативных документов v2
+# RAG-секции единого конфига create_markdown_config.yaml
 # ═══════════════════════════════════════════════════════════════
 
 defaults:

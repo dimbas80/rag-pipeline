@@ -31,8 +31,8 @@ python3 create_markdown.py -i result.md --ai
 | `-i`, `--input` | **Обязательно.** Входной файл (`.pdf`, `.docx`, `.doc`, `.md`) или папка с файлами |
 | `--ai` | Полный AI-цикл: vision-распознавание таблиц → единый AI-проход (коррекция таблиц + постобработка). Для `.md` — только AI-постобработка (без OCR). |
 | `--rag` | Генерация `rag_chunks.jsonl` для RAG-индексации (см. секцию «Генерация RAG JSONL») |
-| `--rag-config` | Путь к `rag_config.yaml`. По умолчанию: `./rag_config.yaml` |
-| `--config` | Путь к конфигурационному файлу AI. По умолчанию: `./config_ai.yaml` |
+| `--config` | Путь к **единому конфигу** `create_markdown_config.yaml` (AI + RAG-секции). По умолчанию: `./create_markdown_config.yaml` |
+| `--reg` | Интерактивная регистрация документа в per-document `<stem>_reg.yaml` рядом с итоговым Markdown (требует TTY) |
 
 ## Пайплайн обработки
 
@@ -71,22 +71,22 @@ DOCX → PDF (LibreOffice)
 
 Только AI-постобработка готового Markdown (без OCR и скриптовой части). Использует тот же объединённый промпт из `ai_postprocess`.
 
-## Конфигурационный файл: config_ai.yaml
+## Конфигурационный файл: create_markdown_config.yaml
 
-Содержит две независимые секции:
+Единый конфиг (заменил `config_ai.yaml` + `rag_config.yaml`). Содержит секции:
 
 ### `table_vision` — Vision-распознавание таблиц
 
-Изображения таблиц (PNG, вырезанные из PDF) отправляются в Gemini/GLM через AnyModel.
+Изображения таблиц (PNG, вырезанные из PDF) отправляются в vision-модель (Provod/GLM).
 
 | Поле | Описание |
 |------|----------|
-| `provider` | Провайдер: `anymodel` |
-| `model` | Модель: `gc/gemini-2.5-flash` |
-| `api_key_env` | Переменная окружения с API-ключом: `ANYMODEL_API_KEY` |
-| `base_url` | Базовый URL API: `https://anymodel.org/v1` |
+| `provider` | Провайдер: `provod` (vision) |
+| `model` | Модель: `glm-4.5v` |
+| `api_key_env` | Переменная окружения с API-ключом: `PROVOD_API_KEY` |
+| `base_url` | Базовый URL API: `https://api.provod.ai/v1` |
 | `prompt` | Промпт для vision-модели — инструкция по переводу таблицы в Markdown |
-| `fallback` | Резервный провайдер (если primary недоступен) |
+| `fallback` | Резервный провайдер (например, `anymodel` / `glm/glm-4.6v`) |
 
 ### `ai_postprocess` — Единая AI-обработка (постобработка + сверка таблиц)
 
@@ -99,7 +99,17 @@ DOCX → PDF (LibreOffice)
 | `api_key_env` | Переменная окружения: `DEEPSEEK_API_KEY` |
 | `base_url` | `https://api.deepseek.com/v1` |
 | `prompt` | **Объединённый промпт**: правила 1–13 (постобработка: LaTeX, OCR-артефакты, форматирование), правила 14–20 (сверка таблиц: сравнение по ID, заполнение ячеек, in-place редактирование) |
-| `fallback` | Резервный провайдер: `anymodel` / `glm/glm-5.2` |
+| `fallback` | Резервный провайдер: `provod` / `deepseek-v4-pro` |
+
+**Единый источник модели:** секция `ai_postprocess` задаёт провайдера/модель/fallback **один раз** — он же используется для LLM-слоя `--reg`.
+
+### `reg_extract` — извлечение полей для `--reg`
+
+Содержит **только `prompt`**. Провайдер/модель/fallback берутся из `ai_postprocess` (см. выше) — дублирования в конфиге нет.
+
+### `defaults` / `references` — RAG-индексация
+
+Параметры RAG v2: `max_chunk_tokens`, `tokenizer` (Qwen3), `extract_references`, `default_status` и regexp-паттерны кросс-ссылок.
 
 **Важно:** если `prompt` не задан — скрипт завершится с ошибкой. Дефолтных промтов нет.
 
@@ -122,7 +132,7 @@ DOCX → PDF (LibreOffice)
 ```bash
 python3 create_markdown.py -i file.pdf --rag                # только JSONL
 python3 create_markdown.py -i file.pdf --ai --rag           # AI + JSONL
-python3 create_markdown.py -i file.pdf --rag --rag-config my_rag.yaml
+python3 create_markdown.py -i file.pdf --rag --config my_config.yaml
 ```
 
 ### Формат выхода
@@ -137,7 +147,7 @@ python3 create_markdown.py -i file.pdf --rag --rag-config my_rag.yaml
   "section": "3.2. Внешняя молниезащитная система",
   "clause": "3.2.1. Молниеприемники",
   "text": "Молниеприемники могут быть специально установленными...",
-  "page": 12,
+  "_source_page": 12,
   "references": ["п. 3.2.2", "табл. 3.4"]
 }
 ```
@@ -146,41 +156,50 @@ python3 create_markdown.py -i file.pdf --rag --rag-config my_rag.yaml
 
 1. MD-документ разбирается на структурные единицы (chapter/section/clause) по заголовкам `##`/`###`/`####`
 2. Каждая единица с непустым текстом становится отдельной JSON-строкой
-3. Номера страниц восстанавливаются из Yandex JSON (только для PDF, для `.md` — `null`)
+3. Номера страниц сохраняются в служебное поле `_source_page` (в публичный JSONL не попадают); для `.md` — `null`
 4. Кросс-ссылки («см. п. 3.2.2», «табл. 3.4») извлекаются по regexp-паттернам из конфига
-5. Чанки длиннее `max_chunk_chars` (по умолчанию 1500) разбиваются с суффиксом `(ч. 1)`, `(ч. 2)`...
+5. Чанки длиннее `max_chunk_tokens` (по умолчанию 7000) разбиваются по токенам Qwen3 — суффикс `(ч. N)` в `clause` и `chunk_id` `.../part_N`
 
-### Конфигурация: rag_config.yaml
+### Конфигурация RAG: секции `defaults` / `references` (единый конфиг)
 
 | Секция | Поле | Описание |
 |--------|------|----------|
-| `defaults` | `max_chunk_chars` | Максимальный размер чанка (по умолчанию 1500) |
+| `defaults` | `max_chunk_tokens` | Максимальный размер чанка в токенах Qwen3 (по умолчанию 7000) |
+| `defaults` | `tokenizer` | HF model id токенизатора (`Qwen/Qwen3-Embedding-8B`) |
 | `defaults` | `extract_references` | Извлекать кросс-ссылки (`true`/`false`) |
+| `defaults` | `default_status` | Статус документа по умолчанию (`active`) |
 | `references` | `patterns` | Список regexp для поиска ссылок |
-| `documents` | `<doc_key>` | Метаданные документа: `document_id`, `title`, `edition`, `source_file` |
-| `documents` | `ignore_sections` | Секции, исключаемые из индексации (например, «Содержание») |
-### Пример заполнения rag_config.yaml
-documents:                                                                                                                                                    
-        pue_7:                                           # slug — любое уникальное латинское имя                                                                    
-          document_id: "ПУЭ"                             # официальный номер/обозначение
-          document_id_alt: null                          # старое обозначение если было (СНиП → СП)                                                                 
-          title: "Правила устройства электроустановок"   # полное название                                                                                          
-          edition: "7"                                   # редакция                                                                                                 
-          date_enacted: "2003-01-01"                     # дата ввода в действие                                                                                    
-          date_amended: "2022-01-01"                     # дата последних изменений (null если не было)                                                             
-          amended_by: "Приказ Минэнерго №123"            # кем изменён (null если не было)                                                                          
-          source_file: "ПУЭ_7.pdf"                       # ИМЯ ФАЙЛА — по нему ищется документ при --rag                                                            
-          status: active                                 # active или inactive                                                                                      
-          status_reason: null                            # для inactive: причина (для active: null)                                                                 
-          replaced_by_document_id: null                  # для inactive: официальный номер преемника                                                                
-          replaced_by_doc_key: null                      # для inactive: slug преемника в этом же конфиге                                                           
-          ignore_sections:                               # какие разделы пропустить при индексации                                                                  
-            - "Содержание"                                                                                                                                          
-            - "Предисловие"   
 
-### Сопоставление файлов
+### Per-document записи: `<stem>_reg.yaml`
 
-Ключ документа (`doc_key`) определяется по полю `source_file` в `rag_config.yaml` — он должен совпадать с именем входного файла. Если документ не найден в конфиге — генерация JSONL пропускается с warning.
+Каталог документов **удалён из конфига**. Метаданные каждого документа живут в
+per-document файле `<stem>_reg.yaml` рядом с итоговым Markdown
+(`Markdown/<stem>/<stem>_reg.yaml` для PDF/DOCX, рядом с `.md` для `--rag` по готовому Markdown).
+Формат записи:
+
+```yaml
+documents:
+  pue_7:                                           # slug — любое уникальное латинское имя
+    document_id: "ПУЭ"                             # официальный номер/обозначение
+    document_id_alt: null                          # старое обозначение если было (СНиП → СП)
+    title: "Правила устройства электроустановок"   # полное название
+    edition: "7"                                   # редакция
+    date_enacted: "2003-01-01"                     # дата ввода в действие
+    date_amended: "2022-01-01"                     # дата последних изменений (null если не было)
+    amended_by: "Приказ Минэнерго №123"            # кем изменён (null если не было)
+    source_file: "ПУЭ_7.pdf"                       # ИМЯ ФАЙЛА — по нему ищется документ при --rag
+    status: active                                 # active или inactive
+    status_reason: null                            # для inactive: причина (для active: null)
+    replaced_by_document_id: null                  # для inactive: официальный номер преемника
+    replaced_by_doc_key: null                      # для inactive: slug преемника
+    ignore_sections:                               # какие разделы пропустить при индексации
+      - "Содержание"
+      - "Предисловие"
+```
+
+При запуске `--rag`/`--reg` такой overlay автоматически накладывается на единый
+конфиг (`load_rag_config(config_path, reg_path=<stem>_reg.yaml)`); флаг `--reg`
+создаёт/дополняет запись интерактивно.
 
 ## Переменные окружения (.env)
 
@@ -190,9 +209,9 @@ documents:
 |------------|------------|
 | `YANDEX_API_KEY` | API-ключ Yandex Vision OCR |
 | `YANDEX_FOLDER_ID` | ID каталога Yandex Cloud |
-| `DEEPSEEK_API_KEY` | API-ключ DeepSeek |
-| `ANYMODEL_API_KEY` | API-ключ AnyModel (vision-распознавание таблиц) |
-| `PROVOD_API_KEY` | Устарел: Provod (Gemini) — не используется после перехода на AnyModel |
+| `DEEPSEEK_API_KEY` | API-ключ DeepSeek (primary `ai_postprocess`) |
+| `PROVOD_API_KEY` | API-ключ Provod (vision `table_vision`, fallback `ai_postprocess`) |
+| `ANYMODEL_API_KEY` | API-ключ AnyModel (fallback `table_vision`) |
 
 ## Выходные файлы
 

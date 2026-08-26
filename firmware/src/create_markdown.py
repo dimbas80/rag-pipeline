@@ -14,7 +14,7 @@ create_markdown.py — Пайплайн конвертации PDF/DOCX/MD в Ma
 
 Использование:
   python3 create_markdown.py -i file.pdf
-  python3 create_markdown.py -i file.pdf --ai --config config_ai.yaml
+  python3 create_markdown.py -i file.pdf --ai --config create_markdown_config.yaml
   python3 create_markdown.py -i file.md --ai                 # только AI
   python3 create_markdown.py -i file.pdf --rag               # + RAG JSONL (секция 12)
   python3 create_markdown.py -i dir/
@@ -273,7 +273,10 @@ def geometry_says_same_table(
 def _table_stitching_config() -> dict:
     """Load table stitching options, retaining safe defaults when absent."""
     config = {"bottom_threshold_ratio": 0.75, "require_table_num_match": True}
-    candidates = [Path.cwd() / "rag_config.yaml", Path(__file__).with_name("rag_config.yaml")]
+    candidates = [
+        Path.cwd() / "create_markdown_config.yaml",
+        Path(__file__).with_name("create_markdown_config.yaml"),
+    ]
     for path in candidates:
         if not path.exists():
             continue
@@ -2333,7 +2336,7 @@ def _call_vision_api(
     Args:
         image_b64: base64-encoded PNG.
         prompt: Текстовый промпт.
-        config: Секция table_vision из config_ai.yaml.
+        config: Секция table_vision из create_markdown_config.yaml.
         api_key: API-ключ.
 
     Returns:
@@ -3226,7 +3229,7 @@ def fix_ocr_artifacts(md_text: str) -> str:
 def fix_latex_caret_spaces(md_text: str) -> str:
     """Добавить пробелы вокруг ^ внутри LaTeX-формул ($...$ и $$...$$).
 
-    Правило (как в AI-промпте config_ai.yaml, но без --ai):
+    Правило (как в AI-промпте create_markdown_config.yaml, но без --ai):
       - внутри формул перед ^ ставится пробел, если его нет;
       - внутри формул после ^ ставится пробел, если его нет;
       - ^ вне формул не трогается;
@@ -3893,7 +3896,7 @@ _RAG_DEFAULT_MAX_CHARS = 1500  # v1 (deprecated, ADR-9)
 _RAG_DEFAULT_MAX_TOKENS = 7000  # v2 (ADR-010)
 
 # Префиксы канонических кросс-ссылок: определяются по ключевым словам
-# regexp-паттерна (паттерны в rag_config.yaml захватывают только номер).
+# regexp-паттерна (паттерны в конфиге, секция references, захватывают только номер).
 _REF_LABEL_HINTS: list[tuple[str, str]] = [
     ("табл", "табл."),
     ("пункт", "п."),
@@ -4786,7 +4789,7 @@ def _write_rag_jsonl(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 12b. --reg: интерактивная регистрация документа в rag_config.yaml
+# 12b. --reg: интерактивная регистрация документа в per-document <stem>_reg.yaml
 # Контракт: docs/architecture/rag-register-flag.md
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4860,7 +4863,7 @@ def run_registration(
     if not sys.stdin.isatty():
         log.error(
             "--reg требует интерактивного терминала (TTY); конфиг не изменён. "
-            "Запустите в терминале или добавьте запись в rag_config.yaml вручную"
+            "Запустите в терминале или добавьте запись в <stem>_reg.yaml вручную"
         )
         return None
 
@@ -4906,7 +4909,7 @@ def _reg_create_new(
     slug, fields, _filled = result
 
     block = _reg_render_record_block(slug, fields)
-    print("── Запись будет добавлена в rag_config.yaml: ──")
+    print("── Запись будет добавлена в per-document <stem>_reg.yaml: ──")
     print(block, end="")
     ans = _reg_ask_write()
     if ans is None:
@@ -4955,7 +4958,7 @@ def _reg_fill_existing(
         return rag_config
 
     block = _reg_render_record_block(slug, fields)
-    print("── Запись будет дополнена в rag_config.yaml: ──")
+    print("── Запись будет дополнена в per-document <stem>_reg.yaml: ──")
     print(block, end="")
     ans = _reg_ask_write()
     if ans is None:
@@ -5027,8 +5030,16 @@ def _reg_extract_fields(md_head: str, ai_config: dict | None) -> dict:
         result["title"] = best
 
     # ── LLM-слой (§4.2), опционально ──
-    reg_cfg = (ai_config or {}).get("reg_extract") if ai_config else None
-    if reg_cfg and reg_cfg.get("prompt"):
+    # Провайдер/модель/fallback берём из ai_postprocess (единый источник),
+    # prompt — из reg_extract. В конфиге reg_extract содержит только prompt.
+    reg_prompt = None
+    base_ai = None
+    if ai_config:
+        reg_prompt = (ai_config.get("reg_extract") or {}).get("prompt")
+        base_ai = ai_config.get("ai_postprocess") or {}
+    if reg_prompt and base_ai:
+        reg_cfg = dict(base_ai)
+        reg_cfg["prompt"] = reg_prompt
         try:
             resp = _call_ai_api(md_head, reg_cfg)
         except Exception as e:
@@ -5191,7 +5202,7 @@ def _reg_interactive_fill(
             print()
             return None
 
-    print("════ РЕГИСТРАЦИЯ ДОКУМЕНТА В rag_config.yaml ════")
+    print("════ РЕГИСТРАЦИЯ ДОКУМЕНТА В per-document <stem>_reg.yaml ════")
     print(f"Файл: {source_file}")
 
     fields: dict = {}
@@ -5527,7 +5538,7 @@ def _init_tokenizer(config: dict) -> tuple[Callable[[str], int], str]:
     raise RuntimeError(
         "RAG-индексация невозможна: токенизатор Qwen3 недоступен. "
         "Установите transformers>=4.51.0 и убедитесь в доступе к HuggingFace Hub, "
-        "либо включите allow_degraded_fallback: true в rag_config.yaml (с потерей точности)."
+        "либо включите allow_degraded_fallback: true в create_markdown_config.yaml (с потерей точности)."
     )
 
 
@@ -6272,7 +6283,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   %(prog)s -i file.md --ai                 # только AI-постобработка, без OCR
   %(prog)s -i file.pdf --rag               # дополнительно RAG JSONL + assets
   %(prog)s -i file.pdf --ai --rag          # AI-постобработка + RAG
-  %(prog)s -i file.pdf --ai --reg --rag    # + интерактивная регистрация в rag_config.yaml
+  %(prog)s -i file.pdf --ai --reg --rag    # + интерактивная регистрация в <stem>_reg.yaml
   %(prog)s -i Markdown/file/file.md --rag  # RAG-индексация проверенного MD
         """,
     )
@@ -6297,8 +6308,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="./config_ai.yaml",
-        help="Путь к config_ai.yaml (по умолч. ./config_ai.yaml)",
+        default="./create_markdown_config.yaml",
+        help="Путь к единому конфигу (по умолч. ./create_markdown_config.yaml)",
     )
     parser.add_argument(
         "--rag",
@@ -6307,11 +6318,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(Markdown/<файл>/rag_chunks.jsonl + rag_assets.json). "
         "Для .md внутри Markdown/ — единственный режим: только индексация "
         "без OCR/AI, .md и image/ не модифицируются",
-    )
-    parser.add_argument(
-        "--rag-config",
-        default="./rag_config.yaml",
-        help="Путь к rag_config.yaml (по умолч. ./rag_config.yaml)",
     )
     parser.add_argument(
         "--reg",
@@ -6382,7 +6388,6 @@ def process_file(
     use_rag: bool = False,
     rag_config: dict | None = None,
     use_reg: bool = False,
-    rag_config_path: str | Path = "",
     use_json_native: bool = False,
 ) -> bool:
     """Обработать один файл: Yandex OCR → парсинг → изображения → постобработка → сохранение.
@@ -6394,7 +6399,7 @@ def process_file(
         (без OCR/AI/извлечения), перезаписывает rag_chunks.jsonl + rag_assets.json
       - .md вне Markdown/: AI-постобработка (--ai) и/или RAG (--rag)
       - --reg (любой поток): после получения финального .md — интерактивная
-        регистрация документа в rag_config.yaml (контракт rag-register-flag.md);
+        регистрация документа в per-document <stem>_reg.yaml (контракт rag-register-flag.md);
         обновлённый конфиг передаётся в --rag того же запуска
 
     Returns:
@@ -6761,7 +6766,7 @@ def process_file(
         safe_write(md_path, md_text)
         log.info(f"Итоговый Markdown: {md_path} ({len(md_text)} символов)")
 
-        # Этап 8a: --reg — интерактивная регистрация документа в rag_config.yaml
+        # Этап 8a: --reg — интерактивная регистрация документа в <stem>_reg.yaml
         # (после финального .md, до RAG-генерации; контракт rag-register-flag.md)
         if use_reg:
             if rag_config is None:
@@ -6838,7 +6843,8 @@ def main() -> None:
     # Загружаем конфиг AI (если нужен — для --ai или LLM-слоя --reg)
     config = load_config(args.config) if (args.ai or args.reg) else {}
 
-    # Загружаем rag_config (если --rag или --reg). При ошибке загрузки:
+    # Загружаем RAG-часть единого конфига (если --rag или --reg).
+    # При ошибке загрузки:
     #   --rag — как раньше: warning, RAG-генерация пропущена;
     #   --reg — жёсткая ошибка (exit 1): регистрация невозможна без конфига
     #   (при обоих флагах ошибка --reg приоритетна, контракт §2).
@@ -6852,12 +6858,12 @@ def main() -> None:
                 None if input_file.suffix.lower() == ".md"
                 else Path(output_base) / input_file.stem,
             )
-            rag_config = load_rag_config(args.rag_config, reg_path=reg_path)
-            log.info(f"RAG-конфиг загружен: {args.rag_config}")
+            rag_config = load_rag_config(args.config, reg_path=reg_path)
+            log.info(f"RAG-конфиг загружен: {args.config}")
         except Exception as e:
-            log.error(f"Не удалось загрузить rag_config: {e}")
+            log.error(f"Не удалось загрузить конфиг: {e}")
             if args.reg:
-                log.error("--reg требует корректного rag_config.yaml — регистрация невозможна")
+                log.error("--reg требует корректного create_markdown_config.yaml — регистрация невозможна")
                 sys.exit(1)
             log.error("RAG-генерация пропущена")
 
@@ -6873,7 +6879,6 @@ def main() -> None:
         use_rag=args.rag,
         rag_config=rag_config,
         use_reg=args.reg,
-        rag_config_path=args.rag_config,
         use_json_native=args.json_native,
     )
 
