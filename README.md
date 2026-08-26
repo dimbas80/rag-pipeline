@@ -32,6 +32,7 @@ python3 create_markdown.py -i result.md --ai
 | `--ai` | Полный AI-цикл: vision-распознавание таблиц → единый AI-проход (коррекция таблиц + постобработка). Для `.md` — только AI-постобработка (без OCR). |
 | `--rag` | Генерация `rag_chunks.jsonl` для RAG-индексации (см. секцию «Генерация RAG JSONL») |
 | `--config` | Путь к **единому конфигу** `create_markdown_config.yaml` (AI + RAG-секции). По умолчанию: `./create_markdown_config.yaml` |
+| `--providers-config` | Путь к реестру провайдеров и ролей `providers.yaml`. По умолчанию: `./providers.yaml` |
 | `--reg` | Интерактивная регистрация документа в per-document `<stem>_reg.yaml` рядом с итоговым Markdown (требует TTY) |
 
 ## Пайплайн обработки
@@ -71,22 +72,21 @@ DOCX → PDF (LibreOffice)
 
 Только AI-постобработка готового Markdown (без OCR и скриптовой части). Использует тот же объединённый промпт из `ai_postprocess`.
 
+## Конфигурационные файлы
+
+`create_markdown_config.yaml` содержит промпты и RAG-секции. Провайдеры, модели, capability и назначения ролей находятся в `providers.yaml`; описание схемы и разрешения ролей — в `docs/architecture/providers-registry.md`.
+
 ## Конфигурационный файл: create_markdown_config.yaml
 
 Единый конфиг (заменил `config_ai.yaml` + `rag_config.yaml`). Содержит секции:
 
 ### `table_vision` — Vision-распознавание таблиц
 
-Изображения таблиц (PNG, вырезанные из PDF) отправляются в vision-модель (Provod/GLM).
+Изображения таблиц (PNG, вырезанные из PDF) отправляются в vision-модель, назначенную ролью `create_markdown.table_vision` в `providers.yaml`.
 
 | Поле | Описание |
 |------|----------|
-| `provider` | Провайдер: `provod` (vision) |
-| `model` | Модель: `glm-4.5v` |
-| `api_key_env` | Переменная окружения с API-ключом: `PROVOD_API_KEY` |
-| `base_url` | Базовый URL API: `https://api.provod.ai/v1` |
 | `prompt` | Промпт для vision-модели — инструкция по переводу таблицы в Markdown |
-| `fallback` | Резервный провайдер (например, `anymodel` / `glm/glm-4.6v`) |
 
 ### `ai_postprocess` — Единая AI-обработка (постобработка + сверка таблиц)
 
@@ -94,12 +94,7 @@ DOCX → PDF (LibreOffice)
 
 | Поле | Описание |
 |------|----------|
-| `provider` | Провайдер: `deepseek` |
-| `model` | Модель: `deepseek-v4-pro` |
-| `api_key_env` | Переменная окружения: `DEEPSEEK_API_KEY` |
-| `base_url` | `https://api.deepseek.com/v1` |
 | `prompt` | **Объединённый промпт**: правила 1–13 (постобработка: LaTeX, OCR-артефакты, форматирование), правила 14–20 (сверка таблиц: сравнение по ID, заполнение ячеек, in-place редактирование) |
-| `fallback` | Резервный провайдер: `provod` / `deepseek-v4-pro` |
 
 **Единый источник модели:** секция `ai_postprocess` задаёт провайдера/модель/fallback **один раз** — он же используется для LLM-слоя `--reg`.
 

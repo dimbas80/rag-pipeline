@@ -534,6 +534,69 @@ def load_config(config_path: str | Path) -> dict:
         return yaml.safe_load(f)
 
 
+def load_providers_config(path: str | Path) -> dict:
+    """Load and validate the provider registry YAML.
+
+    Provider configuration is deliberately separate from prompts and RAG
+    settings so it can be edited by the UI without exposing API secrets.
+    """
+    provider_path = Path(path)
+    if not provider_path.exists():
+        raise ValueError(f"Файл providers.yaml не найден: {provider_path}")
+    try:
+        with provider_path.open(encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Некорректный YAML providers.yaml: {exc}") from exc
+    if not isinstance(config, dict) or not isinstance(config.get("providers"), dict):
+        raise ValueError("Некорректный providers.yaml: отсутствует секция providers")
+
+    seen_keys: dict[str, str] = {}
+    for name, provider in config["providers"].items():
+        if not isinstance(provider, dict):
+            raise ValueError(f"Некорректный провайдер: {name}")
+        key_name = provider.get("api_key_env")
+        if not key_name:
+            raise ValueError(f"У провайдера {name} не задан api_key_env")
+        if key_name in seen_keys:
+            raise ValueError(
+                f"Дублирующийся api_key_env: {key_name} "
+                f"(провайдеры {seen_keys[key_name]} и {name})"
+            )
+        seen_keys[key_name] = str(name)
+    return config
+
+
+def resolve_role(role_cfg: dict, providers: dict) -> dict:
+    """Resolve a provider/model reference to the flat API client config."""
+    if not isinstance(role_cfg, dict):
+        raise ValueError("Некорректная конфигурация роли")
+    registry = providers.get("providers", providers)
+
+    def resolve_ref(ref: dict) -> dict:
+        if not isinstance(ref, dict):
+            raise ValueError("Некорректная ссылка на провайдера")
+        provider_name = ref.get("provider")
+        if provider_name not in registry:
+            raise ValueError(f"Неизвестный провайдер: {provider_name}")
+        provider = registry[provider_name]
+        model = ref.get("model")
+        models = provider.get("models", {})
+        if model not in models:
+            raise ValueError(f"Модель не в списке провайдера {provider_name}: {model}")
+        return {
+            "provider": provider_name,
+            "model": model,
+            "api_key_env": provider.get("api_key_env"),
+            "base_url": provider.get("base_url"),
+        }
+
+    resolved = resolve_ref(role_cfg)
+    if role_cfg.get("fallback") is not None:
+        resolved["fallback"] = resolve_ref(role_cfg["fallback"])
+    return resolved
+
+
 def ensure_dir(path: str | Path) -> Path:
     """Создать папку, если не существует."""
     p = Path(path)
@@ -6312,6 +6375,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Путь к единому конфигу (по умолч. ./create_markdown_config.yaml)",
     )
     parser.add_argument(
+        "--providers-config",
+        default="./providers.yaml",
+        help="Путь к providers.yaml (реестр провайдеров + роли)",
+    )
+    parser.add_argument(
         "--rag",
         action="store_true",
         help="Сгенерировать/перезаписать RAG-файлы "
@@ -6840,8 +6908,34 @@ def main() -> None:
             log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
             sys.exit(1)
 
-    # Загружаем конфиг AI (если нужен — для --ai или LLM-слоя --reg)
-    config = load_config(args.config) if (args.ai or args.reg) else {}
+    # Загружаем конфиг AI и разрешаем роли из отдельного реестра.
+    config = {}
+    if args.ai or args.reg:
+        try:
+            config = load_config(args.config)
+            if not isinstance(config, dict):
+                raise ValueError(f"Некорректный YAML конфигурации: {args.config}")
+            providers = load_providers_config(args.providers_config)
+            role_cfg = providers.get("roles", {}).get("create_markdown", {})
+            vision_role = role_cfg.get("table_vision")
+            ai_role = role_cfg.get("ai_postprocess")
+            if args.ai and not isinstance(vision_role, dict):
+                raise ValueError("Не найдена роль roles.create_markdown.table_vision")
+            if not isinstance(ai_role, dict):
+                raise ValueError("Не найдена роль roles.create_markdown.ai_postprocess")
+            if args.ai:
+                resolved_vision = resolve_role(vision_role, providers)
+                resolved_vision["prompt"] = config.get("table_vision", {}).get("prompt")
+                config["table_vision"] = resolved_vision
+            resolved_ai = resolve_role(ai_role, providers)
+            resolved_ai["prompt"] = config.get("ai_postprocess", {}).get("prompt")
+            config["ai_postprocess"] = resolved_ai
+            config["reg_extract"] = {
+                "prompt": config.get("reg_extract", {}).get("prompt")
+            }
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            log.error(f"Не удалось разрешить providers.yaml: {exc}")
+            sys.exit(1)
 
     # Загружаем RAG-часть единого конфига (если --rag или --reg).
     # При ошибке загрузки:

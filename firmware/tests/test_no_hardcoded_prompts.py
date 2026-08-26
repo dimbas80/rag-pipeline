@@ -109,17 +109,27 @@ def test_config_sections():
     check("ai_postprocess секция есть", isinstance(cfg.get("ai_postprocess"), dict))
     ai = cfg.get("ai_postprocess") or {}
     check("ai_postprocess.prompt задан", bool(ai.get("prompt")))
-    check("ai_postprocess.provider задан", bool(ai.get("provider")))
-    check("ai_postprocess.model задан", bool(ai.get("model")))
-    check("ai_postprocess.api_key_env задан", bool(ai.get("api_key_env")))
-    check("ai_postprocess.base_url задан", bool(ai.get("base_url")))
-    check("ai_postprocess.fallback задан", isinstance(ai.get("fallback"), dict))
+    check("ai_postprocess не содержит provider", "provider" not in ai)
+    check("ai_postprocess не содержит model", "model" not in ai)
+    check("ai_postprocess не содержит api_key_env", "api_key_env" not in ai)
+    check("ai_postprocess не содержит base_url", "base_url" not in ai)
+    check("ai_postprocess не содержит fallback", "fallback" not in ai)
     reg = cfg.get("reg_extract") or {}
     check("reg_extract.prompt задан", bool(reg.get("prompt")))
     check("reg_extract без провайдера (модель из ai_postprocess)", "provider" not in reg)
     check("reg_extract без модели", "model" not in reg)
     check("reg_extract без fallback", "fallback" not in reg)
     check("каталог documents удалён из конфига", "documents" not in cfg)
+
+
+def test_provider_registry_sections():
+    """Провайдеры и роли находятся в отдельном providers.yaml."""
+    import yaml
+    path = Path(create_markdown.__file__).parent / "providers.yaml"
+    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
+    check("providers.yaml providers задан", isinstance(cfg.get("providers"), dict))
+    check("providers.yaml roles задан", isinstance(cfg.get("roles"), dict))
+    check("create_markdown роли заданы", "create_markdown" in cfg["roles"])
 
 
 if __name__ == "__main__":
@@ -130,6 +140,7 @@ if __name__ == "__main__":
     test_constant_removed()
     test_gap_filling_hardcoded_prompt_removed()
     test_config_sections()
+    test_provider_registry_sections()
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)} проверок")

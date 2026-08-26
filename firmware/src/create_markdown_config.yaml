@@ -1,5 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # Единый конфиг create_markdown.py
+# Провайдеры и модели задаются в providers.yaml (флаг --providers-config);
+# здесь находятся только промпты и RAG-секции.
 # Объединяет бывшие config_ai.yaml (AI/vision/промпты) и rag_config.yaml
 # (RAG: defaults, references). Каталог документов (documents) вынесен:
 # каждая запись живёт в per-document файле <stem>_reg.yaml рядом с итоговым
@@ -10,27 +12,6 @@
 # Vision-распознавание таблиц (--ai-table)
 # ═══════════════════════════════════════════════════════════════════════════
 table_vision:
-  # Провайдер для vision-распознавания таблиц (--ai-table)
-  provider: provod
-  model: glm-4.5v
-  api_key_env: PROVOD_API_KEY
-  base_url: https://api.provod.ai/v1
-  #provider: zai-custom
-  #model: glm-4.6v-flash
-  #api_key_env: Z_AI_API_KEY
-  #base_url: https://api.z.ai/api/paas/v4
-
-  # Резервный провайдер для vision-распознавания
-  fallback:
-    provider: anymodel
-    model: glm/glm-4.6v
-    api_key_env: ANYMODEL_API_KEY
-    base_url: https://anymodel.org/v1
-    #provider: deepseek
-    #model: deepseek-v4-flash-vision-exp
-    #api_key_env: DEEPSEEK_API_KEY
-    #base_url: https://api.deepseek.com/v1
-
   # Промпт для vision-модели (картинка + промпт)
   prompt: |
     Переведи данную таблицу в markdown формат.
@@ -53,25 +34,6 @@ table_vision:
 # задаёт только промпт и переиспользует провайдера/модель из этой секции).
 # ═══════════════════════════════════════════════════════════════════════════
 ai_postprocess:
-  # Провайдер по умолчанию: deepseek или provod
-  provider: deepseek
-  model: deepseek-v4-pro
-  # Имя переменной окружения с API-ключом
-  api_key_env: DEEPSEEK_API_KEY
-  # Базовый URL API (OpenAI-совместимый)
-  base_url: https://api.deepseek.com/v1
-  #provider: provod
-  #model: google/gemini-2.5-flash
-  #api_key_env: PROVOD_API_KEY
-  #base_url: https://api.provod.ai/v1
-
-  # Резервный провайдер (если primary не отвечает или ключ не задан)
-  fallback:
-    provider: provod
-    model: deepseek-v4-pro
-    api_key_env: PROVOD_API_KEY
-    base_url: https://api.provod.ai/v1
-
   # Объединённый промпт: постобработка + сверка таблиц с vision-эталоном.
   # Правила 1–13 — постобработка, 14–20 — сверка таблиц.
   prompt: |

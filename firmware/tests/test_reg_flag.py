@@ -831,14 +831,14 @@ class TestRegression:
         assert "api_key_env" not in reg
         assert "base_url" not in reg
         assert "fallback" not in reg
-        # Единый источник модели — ai_postprocess
+        # Единый источник модели — providers.yaml; в prompt-конфиге только промпты.
         ai = cfg.get("ai_postprocess")
         assert isinstance(ai, dict)
-        assert bool(ai.get("provider"))
-        assert bool(ai.get("model"))
-        assert bool(ai.get("api_key_env"))
-        assert bool(ai.get("base_url"))
-        assert isinstance(ai.get("fallback"), dict)
+        assert "provider" not in ai
+        assert "model" not in ai
+        assert "api_key_env" not in ai
+        assert "base_url" not in ai
+        assert "fallback" not in ai
         # существующие секции не тронуты
         assert isinstance(cfg.get("table_vision"), dict)
         # каталог documents из конфига удалён

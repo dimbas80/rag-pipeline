@@ -5,9 +5,9 @@
 ## Репозиторий и layout
 
 - Рабочий код: `firmware/src/create_markdown.py`.
-- Зависимости: `firmware/src/requirements.txt`; единый конфиг рядом с пайплайном: `create_markdown_config.yaml` (AI + RAG-секции). Per-document записи (`documents`) — в `<stem>_reg.yaml` рядом с Markdown.
+- Зависимости: `firmware/src/requirements.txt`; конфиги рядом с пайплайном: `create_markdown_config.yaml` (промпты + RAG-секции `defaults`/`references`) и `providers.yaml` (реестр LLM-провайдеров + назначение ролей). Per-document записи (`documents`) — в `<stem>_reg.yaml` рядом с Markdown.
 - Тесты: `firmware/tests/`; тесты добавляют `firmware/src` в `sys.path`.
-- Архитектурные решения: `docs/architecture/`, актуальный RAG-контракт — `docs/architecture/rag-v2-architecture.md` и ADR-010.
+- Архитектурные решения: `docs/architecture/`; актуальный RAG-контракт — `docs/architecture/rag-v2-architecture.md` и ADR-010, реестр провайдеров — `docs/architecture/providers-registry.md`.
 - Workflow-отчёты лежат в `workflows/`; `.hermes/STATE.md` — проектный snapshot, не производственный код.
 
 ## Dev environment
@@ -35,7 +35,8 @@
 - `python3 create_markdown.py -i result.md --ai` — только AI-постобработка готового Markdown.
 - `python3 create_markdown.py -i Markdown/file/file.md --rag` — RAG только из проверенного Markdown.
 - `python3 create_markdown.py -i document.pdf --ai --rag` — AI-постобработка и RAG-файлы.
-- `--config` задаёт единый конфиг (по умолчанию `./create_markdown_config.yaml`); RAG-секции читаются из него же.
+- `--config` задаёт конфиг промптов/RAG (по умолчанию `./create_markdown_config.yaml`); RAG-секции читаются из него же.
+- `--providers-config` задаёт реестр провайдеров (по умолчанию `./providers.yaml`); нужен для `--ai`/`--reg`.
 
 Для `.md` внутри каталога `Markdown/` с `--rag` OCR, AI, `.md` и `image/` не используются/не изменяются; атомарно перезаписываются только производные RAG-файлы. Каталог входных файлов не поддерживается текущей реализацией, несмотря на старый текст README.
 
