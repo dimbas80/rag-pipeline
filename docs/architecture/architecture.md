@@ -2,6 +2,12 @@
 
 PDF/DOCX → Markdown pipeline via Yandex Vision OCR (`math-markdown` model).
 
+> **Исторический документ (архитектура v1).** Описывает исходный дизайн пайплайна
+> и местами устарел. Актуальные контракты: RAG v2 — `rag-v2-architecture.md` + ADR-010,
+> реестр провайдеров — `providers-registry.md`, флаг `--reg` — `rag-register-flag.md`,
+> ID-маркеры таблиц — `table-id-marker-contract.md`. Секция «8. Configuration»
+> ниже приведена к текущей схеме конфигов (`providers.yaml` + `create_markdown_config.yaml`).
+
 ## 1. Overview
 
 Целевой файл: **`firmware/src/create_markdown.py`** (~700–800 строк), один Python-модуль.
@@ -679,8 +685,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     -i/--input (required): входной файл или папка
     --ai (flag): включить AI-постобработку
     --rag (flag): сгенерировать JSONL для RAG-индексации
-    --rag-config (default: ./rag_config.yaml): путь к rag_config.yaml
-    --config (default: ./config_ai.yaml): путь к конфигу AI"""
+    --config (default: ./create_markdown_config.yaml): промпты + RAG
+    --providers-config (default: ./providers.yaml): реестр провайдеров"""
 
 def process_file(
     input_path: str,
@@ -744,9 +750,9 @@ libreoffice          # headless конвертация DOCX/DOC → PDF
 | Heading extraction: не найдено заголовков | `log.info("Заголовки не найдены")`, MD без изменений |
 | Heading extraction: JSON без blocks[] | `_extract_headings_from_json()` → `[]`, fallback на MD как есть |
 | Heading extraction: ошибка regex | `log.warning`, пропустить конкретный heading |
-| RAG: rag_config.yaml не найден | `log.error`, пропустить RAG-генерацию |
+| RAG: create_markdown_config.yaml не найден | `log.error`, пропустить RAG-генерацию |
 | RAG: doc_key не найден в конфиге | `log.error`, пропустить файл (нельзя определить метаданные) |
-| RAG: clause текст > max_chunk_chars и неразбиваем | `log.warning`, опубликовать как есть |
+| RAG: clause текст > max_chunk_tokens и неразбиваем | `log.warning`, опубликовать как есть |
 | RAG: JSON-сериализация ошибка | `log.error`, пропустить конкретный clause |
 
 **Принцип:** ошибка в одном файле не останавливает обработку остальных. `process_file()` возвращает `False`, `main()` считает статистику.
@@ -755,66 +761,75 @@ libreoffice          # headless конвертация DOCX/DOC → PDF
 
 ## 8. Configuration
 
-### .env
+Три источника конфигурации (полный контракт реестра провайдеров — `providers-registry.md`):
+
+### 8.1 .env — ключи API
 
 ```bash
-YANDEX_API_KEY=<key>
+YANDEX_API_KEY=<key>         # Yandex Vision OCR
 YANDEX_FOLDER_ID=<folder_id>
-PROVOD_API_KEY=<key>      # только для --ai
+DEEPSEEK_API_KEY=<key>       # ai_postprocess (primary)
+PROVOD_API_KEY=<key>         # table_vision (primary) + ai_postprocess (fallback)
+ANYMODEL_API_KEY=<key>       # table_vision (fallback)
+Z_AI_API_KEY=<key>           # zai-custom (опционально)
+SILICONFLOW_API_KEY=<key>    # embedding/rerank (build_search_index)
 ```
 
-### config_ai.yaml
+### 8.2 providers.yaml — реестр провайдеров + роли
 
 ```yaml
-postprocess:
-  primary:
-    provider: provod
-    base_url: https://api.provod.ai/v1
-    model: google/gemini-3.5-flash
-  fallback:
-    provider: provod
-    base_url: https://api.provod.ai/v1
-    model: anthropic/claude-sonnet-5
-  prompt: |
-    Ты — редактор технических текстов...
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    models:
+      deepseek-v4-flash: chat
+      deepseek-v4-pro: chat
+      deepseek-v4-flash-vision-exp: vision
+  # ... provod, anymodel, zai-custom, siliconflow (полный список — в providers.yaml)
+
+roles:
+  create_markdown:
+    table_vision:
+      provider: provod
+      model: glm-4.5v
+      fallback: {provider: anymodel, model: glm/glm-4.6v}
+    ai_postprocess:
+      provider: deepseek
+      model: deepseek-v4-pro
+      fallback: {provider: provod, model: deepseek-v4-pro}
 ```
 
-### rag_config.yaml
+### 8.3 create_markdown_config.yaml — промпты + RAG-секции
 
 ```yaml
-# Глобальные настройки
+table_vision:
+  prompt: | ...
+
+ai_postprocess:
+  prompt: | ...
+
+reg_extract:
+  prompt: | ...
+
 defaults:
   output_format: "jsonl"
-  max_chunk_chars: 1500
+  max_chunk_tokens: 7000          # v2 (ADR-010)
+  tokenizer: "Qwen/Qwen3-Embedding-8B"
+  allow_degraded_fallback: false
   include_tables: true
   include_images: true
   extract_references: true
+  default_status: "active"
 
-# Паттерны кросс-ссылок
 references:
   patterns:
     - 'см\\.\\s*(?:п\\.|пункт)\\s*(\\d+(?:\\.\\d+)*)'
-    - '(?:согласно|по)\\s+(?:п\\.|пункту)\\s*(\\d+(?:\\.\\d+)*)'
-    - '(?:табл\\.|таблица)\\s*(\\d+(?:\\.\\d+)*)'
-    - 'разд\\.\\s*(\\d+(?:\\.\\d+)*)'
-    - '(?:гл\\.|глава)\\s*(\\d+(?:\\.\\d+)*)'
-
-# Каталог документов (slug → метаданные)
-documents:
-  so153_molniezashita:
-    document_id: "СО 153-34.21.122-2003"
-    document_id_alt: null
-    title: "Инструкция по устройству молниезащиты..."
-    edition: "2003"
-    date_enacted: "2003-06-30"
-    date_amended: null
-    amended_by: null
-    source_file: "СО153-34_21_122-2003 Молниезащита.pdf"
-    ignore_sections:
-      - "Содержание"
+    # ... (полный список — в create_markdown_config.yaml)
 ```
 
----
+Каталог `documents` удалён из конфига — записи живут в per-document `<stem>_reg.yaml`
+(см. `rag-register-flag.md`).
 
 ## 9. Output Structure
 
