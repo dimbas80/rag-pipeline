@@ -8,20 +8,20 @@
 
 # Project State
 
-_Last updated: 2026-08-25 — by: orchestrator — vision/AI fallback (400/401/403 + «не смог распознать»), переименование pipeline.py→create_markdown.py, основная ветка → main
+_Last updated: 2026-08-26 — by: orchestrator — единый конфиг create_markdown_config.yaml (config_ai.yaml+rag_config.yaml), reg_extract=только prompt (модель из ai_postprocess), каталог documents удалён → per-doc <stem>_reg.yaml
 
 ## Working functionality
 
-- PDF/DOCX/DOC → Markdown pipeline работает через Yandex Vision OCR (модуль `firmware/src/create_markdown.py`); AI-режимы используют конфиг `config_ai.yaml`.
+- PDF/DOCX/DOC → Markdown pipeline работает через Yandex Vision OCR (модуль `firmware/src/create_markdown.py`); AI-режимы используют единый конфиг `create_markdown_config.yaml` (заменил `config_ai.yaml` + `rag_config.yaml`).
 - **Vision/AI fallback (2026-08-25):** пустой ответ или явный отказ распознать (HTTP 400/401/403, фразы «не смог распознать» RU/EN) → автоматический переход на fallback-провайдера; в `_call_vision_api` и `_call_ai_api`.
 - Для входного `.md` в `Markdown/<stem>/` флаг `--rag` выполняет только RAG-индексацию без OCR и без изменения проверенного Markdown/`image/`.
 - RAG v2 строит токен-ориентированные чанки Qwen3, `{stem}_chunks.jsonl` и `{stem}_assets.json`; производные файлы записываются атомарно.
 - **Многостраничные таблицы** (полный цикл): `extract_table_images()` группирует вырезки пространственно (продолжение на след. странице + подписи «Продолжение/Окончание таблицы N») → `component_images` в `tmp/<stem>/table_images.json`; `_merge_by_component_images()` склеивает части в одну MD-таблицу; `_build_asset_registry()` восстанавливает `image_paths` (все компоненты) по имени файла после снятия ID-маркеров AI-постобработкой.
 - Проверено на СП 89.13330.2016: 17 вырезок → **12 логических таблиц**; Таблица Б.1 → `image_paths = [table_3, table_4, table_5]`, Ж.1 → `[table_13, table_14, table_15]`, И.1 → `[table_16, table_17]`.
-- Регрессионный прогон: `cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py` — **386 passed** (2026-08-25; 2 предсуществующих RAG-падения `old_snip` вне scope).
-- **Флаг `--reg`**: после прогона интерактивно регистрирует документ в `rag_config.yaml` (авто-поля «определено: X» с подтверждением, поля пользователя пошагово с комментарием+примером; идемпотентно; требует TTY). Связка `--ai --reg --rag` регистрирует и индексирует за один запуск.
+- Регрессионный прогон: `cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py` — **388 passed** (2026-08-26; единый конфиг).
+- **Флаг `--reg`**: после прогона интерактивно регистрирует документ в per-document `<stem>_reg.yaml` (авто-поля «определено: X» с подтверждением, поля пользователя пошагово с комментарием+примером; идемпотентно; требует TTY). Связка `--ai --reg --rag` регистрирует и индексирует за один запуск. LLM-слой берёт модель из `ai_postprocess` (в `reg_extract` — только prompt).
 - **tmp/-независимость (п.1, 2026-08-22):** `table_images.json` персистится рядом с итоговым `.md` (в папке документа), fallback на `tmp/<stem>/` только если персистентной копии нет; `--rag` не требует существования `tmp/`. ID-маркеры `<!-- t_pN_M -->` и `<!-- WARN_N -->` больше не зачищаются из `.md` после AI-постобработки — остаются видимыми (Вариант B), но исключаются in-memory из `{stem}_chunks.jsonl` при `--rag`.
-- **Пер-документная регистрация (п.2, 2026-08-22):** `--reg` пишет `<stem>_reg.yaml` (секция `documents.<slug>` только) в папку с `.md`, а не в общий `rag_config.yaml`; `load_rag_config` при `--rag` сливает пер-документный конфиг с общими defaults/references; старые записи в `rag_config.yaml` остаются как legacy fallback.
+- **Пер-документная регистрация (п.2, 2026-08-22; каталог удалён 2026-08-26):** `--reg` пишет `<stem>_reg.yaml` (секция `documents.<slug>` только) в папку с `.md`, а не в общий конфиг; `load_rag_config` при `--rag` сливает пер-документный конфиг с defaults/references единого конфига. С 2026-08-26 секция `documents` полностью удалена из `create_markdown_config.yaml` — записи живут ТОЛЬКО в per-doc overlay.
 - **Legacy→per-doc материализация (2026-08-23, коммит `6233341`):** `--reg` для документа, чья запись есть только в общем `rag_config.yaml` (legacy), создаёт `<stem>_reg.yaml` с ПОЛНОЙ записью — `_reg_fill_existing()` ветвится по существованию файла; legacy-запись не трогается.
 - **Маркеры сшитых/поглощённых таблиц (п.3, 2026-08-22):** `_stitch_continuation_tables()` и `merge_tables()` сохраняют маркеры ВСЕХ компонентов сшитой таблицы (не только головы) — стеком перед итоговой таблицей; AI-постобработка получает vision-эталоны всех кусков, не только первого.
 - **Дедупликация служебных строк шапки (п.4, 2026-08-22):** глобальная `seen`-дедупликация `merge_tables()`, удалявшая легитимные байт-идентичные строки разных rowspan-групп, заменена common-prefix-срезом повторов шапки — устранены и дубли заголовков, и ложные потери строк.
