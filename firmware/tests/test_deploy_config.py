@@ -170,3 +170,17 @@ def test_qdrant_path_empty_env_file_value_falls_back(tmp_path):
     loaded = load(cfg)
     assert loaded.qdrant_path_override is None
     assert loaded.qdrant_path == Path("/q")
+
+
+def test_env_injection_does_not_change_qdrant_path(tmp_path, monkeypatch):
+    # Инъекция ключей config/.env (t_a7d01588) ортогональна QDRANT_PATH-фиксу:
+    # даже если config/.env содержит QDRANT_PATH и инъекция кладёт его в os.environ,
+    # резолвер обязан читать .env (read_env_raw), а не process-env; результат тот же.
+    from firmware.src.chat_api import _inject_env_file
+    env_file = tmp_path / ".env"; env_file.write_text("QDRANT_PATH=/interface/qdrant\n", encoding="utf-8")
+    cfg = tmp_path / "config.yaml"; cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    _inject_env_file(env_file)   # кладёт QDRANT_PATH=/interface/qdrant в os.environ
+    assert loaded.qdrant_path_override == "/interface/qdrant"
+    assert loaded.qdrant_path == Path("/interface/qdrant")
+    monkeypatch.delenv("QDRANT_PATH", raising=False)   # не оставлять загрязнение

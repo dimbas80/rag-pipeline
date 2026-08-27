@@ -102,16 +102,13 @@ fi
 
 # Read-only выгрузка текущих конфигов LXC в staging (для консолидации/плана).
 if [[ "$REMOTE_AVAILABLE" == "1" ]]; then
-  mkdir -p "$STAGE/remote/config" "$STAGE/remote/interface_RAG" "$STAGE/remote/CMY" "$STAGE/remote/BSI"
+  mkdir -p "$STAGE/remote/config" "$STAGE/remote/CMY" "$STAGE/remote/BSI"
   while IFS='|' read -r src dst; do
     # NB: < /dev/null — иначе ssh съедает остаток stdin heredoc цикла
     ssh_lxc "cat '$src' 2>/dev/null" < /dev/null > "$dst" || true
   done <<FILES
 /root/RAG/config/.env|$STAGE/remote/config/.env
-/root/RAG/interface_RAG/.env|$STAGE/remote/interface_RAG/.env
-/root/RAG/Create_Markdown_YA/firmware/src/.env|$STAGE/remote/CMY/.env
 /root/RAG/Create_Markdown_YA/firmware/src/providers.yaml|$STAGE/remote/CMY/providers.yaml
-/root/RAG/Build_Search_index/firmware/src/.env|$STAGE/remote/BSI/.env
 /root/RAG/Build_Search_index/firmware/src/providers.yaml|$STAGE/remote/BSI/providers.yaml
 FILES
 fi
@@ -119,7 +116,7 @@ fi
 # --- 1. Бэкап текущих конфигов прода ---
 say "1. Бэкап конфигов прода (копия перед изменением)"
 TS="$(date +%s)"
-cat <<REMOTE | run_remote_script "бэкап в $CONFIG_DIR.bak.$TS (config/ + interface_RAG/.env + CMY/.env+providers.yaml + BSI/.env+providers.yaml)"
+cat <<REMOTE | run_remote_script "бэкап в $CONFIG_DIR.bak.$TS (config/ + interface_RAG/.env + CMY/.env+providers.yaml+.env.root + BSI/.env+providers.yaml+.env.root)"
 set -e
 TS="$TS"
 BK="$CONFIG_DIR.bak.\$TS"
@@ -130,7 +127,9 @@ for pair in \
     "CMY:/root/RAG/Create_Markdown_YA/firmware/src/.env:.env" \
     "CMY:/root/RAG/Create_Markdown_YA/firmware/src/providers.yaml:providers.yaml" \
     "BSI:/root/RAG/Build_Search_index/firmware/src/.env:.env" \
-    "BSI:/root/RAG/Build_Search_index/firmware/src/providers.yaml:providers.yaml"; do
+    "BSI:/root/RAG/Build_Search_index/firmware/src/providers.yaml:providers.yaml" \
+    "CMY:/root/RAG/Create_Markdown_YA/.env:.env.root" \
+    "BSI:/root/RAG/Build_Search_index/.env:.env.root"; do
   sub="\${pair%%:*}"; rest="\${pair#*:}"; src="\${rest%%:*}"; name="\${rest##*:}"
   if [ -f "\$src" ]; then cp -a "\$src" "\$BK/\$sub/\$name"; fi
 done
@@ -199,6 +198,12 @@ rm -rf /root/RAG/Create_Markdown_YA/firmware/src/tmp \
        /root/RAG/Create_Markdown_YA/firmware/src/__pycache__
 # Build_Search_index: остаётся симлинк providers.yaml; удаляем мусор
 rm -f  /root/RAG/Build_Search_index/firmware/src/.env
+# Корневые .env пайплайнов — legacy остатки решений 18–19 (Build_Search_index/.env
+# был источником заражения QDRANT_PATH). request_bot.py, который их читал, не
+# разворачивается (исключён из rsync) и не запущен; при будущем запуске бота ключи
+# подавать через systemd Environment=/EnvironmentFile= (отдельная задача).
+rm -f  /root/RAG/Create_Markdown_YA/.env
+rm -f  /root/RAG/Build_Search_index/.env
 rm -rf /root/RAG/Build_Search_index/firmware/src/__pycache__ \
        /root/RAG/Build_Search_index/firmware/src/telegram_bot/__pycache__
 rm -f  /root/RAG/Build_Search_index/firmware/src/telegram_bot/bot.log*

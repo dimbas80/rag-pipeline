@@ -7,8 +7,7 @@
 
 Источники (приоритет значения — первый по списку):
   .env:   remote/config/.env (общий конфиг интерфейса на LXC, решение №29)
-          > remote/interface_RAG/.env > remote/CMY/.env > remote/BSI/.env
-          > dev config/.env (интерфейс dev) > dev CMY/.env > dev BSI/.env.
+          > dev config/.env (интерфейс dev, решение №29).
           Ключи объединяются, не удаляются.
   providers.yaml:  эталон — «полный» вариант (с ролями build_search_index,
           remote BSI > dev BSI); доливаются отсутствующие провайдеры/модели
@@ -125,20 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copy2(dev_cmy / "firmware/src/create_markdown_config.yaml", out / "create_markdown_config.yaml")
     shutil.copy2(dev_bsi / "firmware/src/search_config.yaml", out / "search_config.yaml")
 
-    # --- .env: объединение, приоритет config/.env (LXC) > legacy > dev, ключи не удаляются ---
+    # --- .env: объединение, приоритет remote/config/.env > dev config/.env, ключи не удаляются ---
     env_sources: list[tuple[str, Path]] = []
     if remote:
-        env_sources += [
-            ("remote/config/.env", remote / "config/.env"),
-            ("remote/interface_RAG/.env", remote / "interface_RAG/.env"),
-            ("remote/CMY/.env", remote / "CMY/.env"),
-            ("remote/BSI/.env", remote / "BSI/.env"),
-        ]
-    env_sources += [
-        ("dev config/.env", DEV_ROOT / "config/.env"),
-        ("dev CMY/.env", dev_cmy / "firmware/src/.env"),
-        ("dev BSI/.env", dev_bsi / ".env"),
-    ]
+        env_sources.append(("remote/config/.env", remote / "config/.env"))
+    env_sources.append(("dev config/.env", DEV_ROOT / "config/.env"))
     env_sources = [(label, path) for label, path in env_sources if path.exists()]
     merged_env, ordered_keys = merge_env(env_sources)
     env_path = out / ".env"

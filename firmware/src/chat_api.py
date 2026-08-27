@@ -1,6 +1,7 @@
 """Per-WebSocket chat adapter around Build_Search_index.qa_graph."""
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,12 @@ try:
 except ImportError:  # direct `uvicorn app:app` from firmware/src
     from deploy_config import DeployConfig
 
+# Паттерн импорта read_env_raw — дословно как в jobs.py:13-15 (оба варианта запуска).
+try:
+    from firmware.src.config_ui import read_env_raw
+except ImportError:  # pragma: no cover - direct `uvicorn app:app` from firmware/src
+    from config_ui import read_env_raw
+
 
 def _pipeline_paths(cfg: DeployConfig) -> None:
     root = cfg.build_search_index_dir
@@ -20,6 +27,19 @@ def _pipeline_paths(cfg: DeployConfig) -> None:
             sys.path.insert(0, value)
 
 
+def _inject_env_file(env_file) -> None:
+    """Инъекция ключей <config_dir>/.env в os.environ (override, как jobs.build_env).
+
+    Единый источник API-ключей in-process чата: пайплайновый get_api_key()
+    (llm_providers.py) резолвит ключи голым load_dotenv(setdefault) →
+    os.environ.get. Положив ключи config/.env заранее с override, гарантируем,
+    что чат видит те же ключи, что subprocess (build_env). Повторный вызов
+    идемпотентен; ключи, которых нет в .env, из os.environ НЕ удаляются
+    (systemd Environment= на проде сохраняется).
+    """
+    os.environ.update(read_env_raw(env_file))
+
+
 @dataclass
 class ChatSession:
     """Own exactly one QAGraph and its interrupt/checkpointer state."""
@@ -27,6 +47,9 @@ class ChatSession:
     cfg: DeployConfig
 
     def __post_init__(self) -> None:
+        # ДО импорта пайплайна (qa_graph→llm_providers) и ДО первого graph.run() —
+        # гарантированно раньше load_dotenv() внутри get_api_key().
+        _inject_env_file(self.cfg.env_file)
         _pipeline_paths(self.cfg)
         from qa_graph import QAGraph, QAGraphConfig
 
