@@ -8,12 +8,12 @@
 
 # Project State
 
-_Last updated: 2026-08-26 — by: orchestrator — единый конфиг create_markdown_config.yaml (config_ai.yaml+rag_config.yaml), reg_extract=только prompt (модель из ai_postprocess), каталог documents удалён → per-doc <stem>_reg.yaml
+_Last updated: 2026-08-27 — by: orchestrator — vision fallback при отсутствии primary-ключа выровнен под ai_postprocess (коммит 82f0451, review PASS)
 
 ## Working functionality
 
 - PDF/DOCX/DOC → Markdown pipeline работает через Yandex Vision OCR (модуль `firmware/src/create_markdown.py`); AI-режимы используют единый конфиг `create_markdown_config.yaml` (заменил `config_ai.yaml` + `rag_config.yaml`).
-- **Vision/AI fallback (2026-08-25):** пустой ответ или явный отказ распознать (HTTP 400/401/403, фразы «не смог распознать» RU/EN) → автоматический переход на fallback-провайдера; в `_call_vision_api` и `_call_ai_api`.
+- **Vision/AI fallback (2026-08-25, расширено 2026-08-27):** пустой ответ, явный отказ распознать (HTTP 400/401/403, «не смог распознать» RU/EN) или отсутствие primary-ключа → переход на fallback-провайдера; в `_call_vision_api` и `_call_ai_api`. Vision выровнен под ai_postprocess: при пустом primary-ключе `recognize_tables_vision` больше не пропускается целиком (guard'ы `if vision_api_key:` в `process_file` и `_process_json_native_pages` сняты).
 - Для входного `.md` в `Markdown/<stem>/` флаг `--rag` выполняет только RAG-индексацию без OCR и без изменения проверенного Markdown/`image/`.
 - RAG v2 строит токен-ориентированные чанки Qwen3, `{stem}_chunks.jsonl` и `{stem}_assets.json`; производные файлы записываются атомарно.
 - **Многостраничные таблицы** (полный цикл): `extract_table_images()` группирует вырезки пространственно (продолжение на след. странице + подписи «Продолжение/Окончание таблицы N») → `component_images` в `tmp/<stem>/table_images.json`; `_merge_by_component_images()` склеивает части в одну MD-таблицу; `_build_asset_registry()` восстанавливает `image_paths` (все компоненты) по имени файла после снятия ID-маркеров AI-постобработкой.
@@ -53,6 +53,7 @@ _Last updated: 2026-08-26 — by: orchestrator — единый конфиг cre
 
 ## Recent decisions
 
+- **Vision fallback при отсутствии primary-ключа (2026-08-27, коммит `82f0451`):** vision-путь выровнен под `ai_postprocess` — при пустом primary-ключе переход на fallback вместо пропуска шага. `_call_vision_api`: ранний `if not api_key: return None` удалён, primary обёрнут в `if api_key:`; сняты guard'ы `if vision_api_key:` в `process_file` и `_process_json_native_pages`. Тест `test_vision_missing_primary_key_goes_to_fallback`. Цепочка coder `t_909f75f3` → reviewer `t_8fc318ab` PASS. Регрессия: 394 passed (без `test_gap_filling.py`), `test_api_fallback.py` 15 passed.
 - **Основная ветка → `main` (2026-08-25):** рабочая `refactor/json-pipeline` переименована в `main`; старая `master` была строгим предком (fast-forward), удалена без потерь. wt/*-ветки и `.worktrees/` очищены (`git worktree remove`). Бэкап — `Create_Markdown_YA_backup_20260825_065518.bundle` + ветки `backup/master`, `backup/refactor-json-pipeline`.
 - **Переименование `pipeline.py` → `create_markdown.py` (2026-08-25, коммит `e39ffeb`):** `git mv` (R100); модуль теперь `create_markdown`; обновлены импорты/патчи во всех `firmware/tests`, CLI в `README.md`/`AGENTS.md`/`docs/`, комментарий в `config_ai.yaml`.
 - **Vision/AI fallback (2026-08-25, коммиты `7f8e508`+`e5bb0a0`):** `400/401/403` → немедленный fallback без retry; общий `_is_recognition_failure()` (пустой ответ + regex RU/EN «не смог распознать») → fallback; в `_call_vision_api` и `_call_ai_api`. Fallback-провайдеры в конфиге: `table_vision`→anymodel/glm-4.6v, `ai_postprocess`→provod/deepseek-v4-pro.
