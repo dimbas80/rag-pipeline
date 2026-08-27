@@ -91,12 +91,15 @@ def test_qdrant_path_default_when_no_override(tmp_path):
 
 
 def test_qdrant_path_override_from_process_env(tmp_path, monkeypatch):
+    # process-env QDRANT_PATH БЕЗ записи в .env интерфейса → override отсутствует,
+    # путь = дефолт. process-env больше НЕ создаёт override (фикс решения №29).
     cfg = tmp_path / "config.yaml"
     cfg.write_text(_config(), encoding="utf-8")
     monkeypatch.setenv("QDRANT_PATH", "/env/qdrant")
     loaded = load(cfg)
-    assert loaded.qdrant_path == Path("/env/qdrant")
-    assert loaded.qdrant_path_override == "/env/qdrant"
+    assert loaded.qdrant_path_override is None
+    assert loaded.qdrant_path == Path("/q")
+    assert loaded.qdrant_path == loaded.qdrant_path_default
 
 
 def test_qdrant_path_override_from_env_file(tmp_path):
@@ -109,14 +112,54 @@ def test_qdrant_path_override_from_env_file(tmp_path):
     assert loaded.qdrant_path_override == "/dotenv/qdrant"
 
 
-def test_qdrant_path_process_env_beats_env_file(tmp_path, monkeypatch):
+def test_qdrant_path_env_file_beats_process_env(tmp_path, monkeypatch):
+    # Инвертированный приоритет (фикс решения №29): и .env интерфейса с QDRANT_PATH,
+    # и QDRANT_PATH в process-env (заражение пайплайна) → побеждает .env интерфейса.
     cfg = tmp_path / "config.yaml"
     env_file = tmp_path / ".env"
     env_file.write_text("QDRANT_PATH=/dotenv/qdrant\n", encoding="utf-8")
     cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
     monkeypatch.setenv("QDRANT_PATH", "/proc/qdrant")
     loaded = load(cfg)
-    assert loaded.qdrant_path == Path("/proc/qdrant")
+    assert loaded.qdrant_path_override == "/dotenv/qdrant"
+    assert loaded.qdrant_path == Path("/dotenv/qdrant")
+
+
+def test_qdrant_path_ignores_process_env_pollution(tmp_path, monkeypatch):
+    # Ровно сценарий бага: пайплайн голым load_dotenv() положил QDRANT_PATH из СВОЕГО
+    # .env в os.environ процесса → интерфейс обязан продолжать использовать .env
+    # интерфейса (не прод-путь пайплайна).
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("QDRANT_PATH=/interface/qdrant\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    # «Пайплайн загрязнил» process-env: load_dotenv положил QDRANT_PATH из СВОЕГО .env
+    monkeypatch.setenv("QDRANT_PATH", "/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data")
+    assert loaded.qdrant_path_override == "/interface/qdrant"   # .env интерфейса победил
+    assert loaded.qdrant_path == Path("/interface/qdrant")      # НЕ прод-путь
+
+
+def test_qdrant_path_survives_load_dotenv(tmp_path, monkeypatch):
+    # Интеграция: НАСТОЯЩИЙ load_dotenv (то, что реально мутирует os.environ в
+    # get_api_key() пайплайна) против фикстуры .env пайплайна с QDRANT_PATH=/mnt/sdb/…
+    # → cfg.qdrant_path не сменился на прод-путь (см. §5.3(а) архитектуры).
+    from dotenv import load_dotenv
+    env_file = tmp_path / ".env"
+    env_file.write_text("QDRANT_PATH=/interface/qdrant\n", encoding="utf-8")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    pipeline_env = tmp_path / "pipeline" / ".env"
+    pipeline_env.parent.mkdir(parents=True)
+    pipeline_env.write_text(
+        "QDRANT_PATH=/mnt/sdb/!База_ГОСТ/Markdown/qdrant_data\nDEEPSEEK_API_KEY=sk-x\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("QDRANT_PATH", raising=False)  # чистый старт, как на dev-сервере
+    load_dotenv(dotenv_path=pipeline_env)             # эмулирует get_api_key() пайплайна
+    assert loaded.qdrant_path_override == "/interface/qdrant"
+    assert loaded.qdrant_path == Path("/interface/qdrant")
 
 
 def test_qdrant_path_empty_env_file_value_falls_back(tmp_path):

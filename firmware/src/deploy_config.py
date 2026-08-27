@@ -33,15 +33,14 @@ class DeployConfig:
 
     @property
     def qdrant_path_override(self) -> str | None:
-        """QDRANT_PATH: process-env > .env. None — override отсутствует.
+        """QDRANT_PATH: только из .env интерфейса (<config_dir>/.env, пишет UI через
+        config_ui.write_env). process-env НЕ читается: пайплайн голым load_dotenv()
+        засоряет os.environ значением QDRANT_PATH из СВОЕГО .env — это не источник
+        истины для интерфейса. None — override отсутствует.
 
-        Чтение .env ленивое, без кэша (файл крошечный, доступ 1–2 раза на
-        запрос); приоритет задан решением №29 (персистентная папка Qdrant).
+        Чтение .env ленивое, без кэша (файл крошечный, доступ 1–2 раза на запрос).
         """
-        override = os.environ.get("QDRANT_PATH")
-        if not override:
-            override = read_env_raw(self.env_file).get("QDRANT_PATH")
-        return override or None
+        return read_env_raw(self.env_file).get("QDRANT_PATH") or None
 
     @property
     def qdrant_path(self) -> Path:

@@ -280,3 +280,15 @@ def test_put_qdrant_settings_rejects_relative_path(monkeypatch, tmp_path):
     monkeypatch.setattr(app, "cfg", cfg)
     client = TestClient(app.app)
     assert client.put("/api/settings/qdrant", json={"path": "relative/path"}).status_code == 400
+
+
+def test_put_qdrant_settings_normalizes_dotdot_path(monkeypatch, tmp_path):
+    # LOW из ревью: абсолютный путь с компонентами «..» нормализуется (resolve),
+    # чтобы /tmp/../etc не сохранялся в .env как есть.
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.put("/api/settings/qdrant", json={"path": "/tmp/../etc"})
+    assert response.status_code == 200
+    assert app.config_ui.read_env_raw(tmp_path / ".env")["QDRANT_PATH"] == str(Path("/etc"))
+    assert response.json()["path"] == str(Path("/etc"))

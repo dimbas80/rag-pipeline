@@ -332,6 +332,10 @@ def update_qdrant(payload: QdrantPathUpdate):
     path = (payload.path or "").strip()
     if path and not Path(path).is_absolute():
         raise HTTPException(400, "Путь должен быть абсолютным")
+    if path:
+        # Нормализация после проверки абсолютности: /tmp/../etc → /etc, чтобы
+        # путь с компонентами «..» не сохранялся в .env как есть.
+        path = str(Path(path).resolve())
     config_ui.write_env(cfg.env_file, {"QDRANT_PATH": path})
     return settings_qdrant()
 
