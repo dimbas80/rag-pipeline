@@ -29,3 +29,32 @@ def add_provider(providers_path, name, base_url, api_key_env, models):
     if any(item.get("api_key_env") == api_key_env for item in providers.values()): raise ValueError("api_key_env уже используется")
     providers[name] = {"base_url": base_url.rstrip("/"), "api_key_env": api_key_env, "models": {m: tag_model(m) for m in models}}
     write_yaml(providers_path, data); return providers[name]
+
+
+def refresh_all_models(providers_path, env=None):
+    """«Обновить» (решение №11): /v1/models для каждого провайдера с ключом.
+
+    Обновляет models (теги по имени) в едином providers.yaml. Ошибка по одному
+    провайдеру не роняет остальных — возвращает {provider: {ok, models|error}}.
+    """
+    env = dict(env or {})
+    data = read_yaml(providers_path)
+    providers = data.setdefault("providers", {})
+    result = {}
+    changed = False
+    for name, provider in list(providers.items()):
+        api_key_env = provider.get("api_key_env") if isinstance(provider, dict) else None
+        api_key = env.get(api_key_env) if api_key_env else None
+        if not api_key:
+            result[name] = {"ok": False, "error": "нет ключа"}
+            continue
+        try:
+            models = scan_and_tag_models(provider["base_url"], api_key)
+            provider["models"] = {item["name"]: item["tag"] for item in models}
+            changed = True
+            result[name] = {"ok": True, "models": provider["models"]}
+        except Exception as exc:
+            result[name] = {"ok": False, "error": str(exc)}
+    if changed:
+        write_yaml(providers_path, data)
+    return result

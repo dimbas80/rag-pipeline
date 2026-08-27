@@ -2,22 +2,24 @@ active: dev
 dev:
   host: 127.0.0.1
   port: 8081
+  config_dir: /root/projects/interface_RAG/config
   upload: {base_dir: /root/projects/interface_RAG/uploads, max_mb: 500}
   pipelines:
     create_markdown_dir: /root/projects/Create_Markdown_YA/firmware/src
     build_search_index_dir: /root/projects/Build_Search_index/firmware/src
   qdrant: {path: /root/projects/interface_RAG/uploads/qdrant_data, collection: technical_standard, write_enabled: false}
-  env_file: /root/projects/interface_RAG/.env
+  env_file: /root/projects/interface_RAG/config/.env
   base_markdown: /root/projects/interface_RAG/uploads/Markdown
 prod:
   host: 0.0.0.0
   port: 80
+  config_dir: /root/RAG/config
   upload: {base_dir: /mnt/sdb/!База_ГОСТ, max_mb: 500}
   pipelines:
-    create_markdown_dir: /opt/Create_Markdown_YA/firmware/src
-    build_search_index_dir: /opt/Build_Search_index/firmware/src
+    create_markdown_dir: /root/RAG/Create_Markdown_YA/firmware/src
+    build_search_index_dir: /root/RAG/Build_Search_index/firmware/src
   qdrant: {path: /mnt/sdb/!База_ГОСТ/Markdown/qdrant_data, collection: technical_standard, write_enabled: true}
-  env_file: /opt/interface_RAG/.env
+  env_file: /root/RAG/config/.env
   base_markdown: /mnt/sdb/!База_ГОСТ/Markdown
 prompts:
   registration_vision: 'Извлеки JSON: document_id, title, domain_hint, document_type. Если неизвестно — null.'

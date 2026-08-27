@@ -1,1 +1,229 @@
-<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>interface_RAG</title><link rel="stylesheet" href="/static/style.css"></head><body><nav><button data-tab="chat">Чат</button><button data-tab="documents">Добавить документ</button><button data-tab="settings">Настройки</button></nav><main><section id="chat"><h1>Чат</h1><textarea id="query" placeholder="Введите вопрос"></textarea><button id="ask">Спросить</button><pre id="answer"></pre></section><section id="documents" hidden><h1>Добавить документ</h1><input id="file" type="file"><button id="upload">Загрузить</button><pre id="doc-status"></pre><button id="register" disabled>Зарегистрировать документ</button><button id="convert" disabled>Конвертировать</button><button id="index" disabled>Добавить в базу</button><button id="stop">Стоп</button><pre id="job-log"></pre></section><section id="settings" hidden><h1>Настройки</h1><div id="settings-panel"><h2>Провайдеры и роли</h2><button id="settings-refresh">Обновить</button><button id="add-provider">Добавить провайдера</button><div><label>Chat <select id="chat-model"></select></label><select id="chat-fallback"></select><button id="save-chat-model">Сохранить</button></div><div><label>Vision <select id="vision-model"></select></label><select id="vision-fallback"></select><button id="save-vision-model">Сохранить</button></div><div><label>Embedding <select id="embedding-model"></select></label><select id="embedding-fallback"></select><button id="save-embedding-model">Сохранить</button></div><div><label>Rerank <select id="rerank-model"></select></label><select id="rerank-fallback"></select><button id="save-rerank-model">Сохранить</button></div><pre id="providers-view"></pre><h2>.env</h2><pre id="env-view"></pre><textarea id="env-values" placeholder="KEY=value"></textarea><button id="save-env">Сохранить env</button></div><dialog id="provider-dialog"><h2>Добавить провайдера</h2><label>Имя <input id="provider-name"></label><label>API key <input id="provider-key" type="password"></label><label>Base URL <input id="provider-url" placeholder="https://service.example/v1"></label><pre id="provider-scan-result"></pre><button id="provider-test">Тест</button><button id="provider-add" disabled>Добавить</button><button id="provider-cancel">Отмена</button></dialog></section></main><script src="/static/app.js"></script></body></html>
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Оркестратор ГОСТ-базы — OCR→Markdown и семантический поиск</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <img class="brand-icon" src="/static/favicon.svg" alt="">
+      <div>
+        <h1>Оркестратор ГОСТ-базы</h1>
+        <p class="subtitle">Загрузка нормативных документов (ГОСТ / СП / СО / СНиП / ПУЭ) с распознаванием
+        OCR→Markdown и семантическим поиском по базе. Три раздела: чат по базе, добавление документа, настройки.</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="chat">Чат</button>
+      <button class="tab" data-tab="documents">Добавить документ</button>
+      <button class="tab" data-tab="settings">Настройки</button>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ================= ЧАТ ================= -->
+  <section id="chat" class="tab-panel">
+    <div class="chat-layout">
+      <div class="chat-main">
+        <div class="page-head">
+          <h2>Чат по базе ГОСТ</h2>
+          <p class="muted">Вопрос на естественном языке — ответ с цитатами и иллюстрациями из документов.</p>
+        </div>
+        <textarea id="query" placeholder="Введите вопрос, например: «Допустимые токовые нагрузки для кабелей с медными жилами»"></textarea>
+        <div class="chat-actions">
+          <button id="ask" class="btn primary">Спросить</button>
+          <button id="show-docs" class="btn">Показать документы в базе</button>
+          <span id="chat-status" class="status-line"></span>
+        </div>
+        <div id="answer"></div>
+        <div id="reply-row" class="reply-row" hidden>
+          <input id="reply-input" placeholder="Ответ на уточняющий вопрос…">
+          <button id="reply-send" class="btn primary">Отправить</button>
+        </div>
+      </div>
+      <aside class="chat-side">
+        <div class="card">
+          <h4>Документы в базе</h4>
+          <div id="base-docs" class="muted small">Нажмите «Показать документы в базе».</div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ================= ДОБАВИТЬ ДОКУМЕНТ ================= -->
+  <section id="documents" class="tab-panel" hidden>
+    <div class="page-head">
+      <h2>Добавить документ</h2>
+      <p class="muted">Одна страница из трёх областей: загрузка → регистрация → конвертация и добавление в базу.
+      Кнопки следующих шагов активируются после завершения предыдущих.</p>
+    </div>
+
+    <!-- Область 1: загрузка -->
+    <div class="area" id="area-upload">
+      <div class="area-head"><span class="area-step">1</span><h3>Загрузка файла</h3><span class="area-note">PDF / DOCX / DOC / MD</span></div>
+      <div class="area-body">
+        <div class="action-row">
+          <input id="file" type="file" accept=".pdf,.docx,.doc,.md">
+          <button id="upload" class="btn primary">Загрузить документ</button>
+        </div>
+        <div id="doc-status" class="status-line"></div>
+      </div>
+    </div>
+
+    <!-- Область 2: регистрация (статичная форма) -->
+    <div class="area" id="area-register">
+      <div class="area-head"><span class="area-step">2</span><h3>Регистрация документа</h3><span class="area-note">обязательные поля помечены <span class="req">*</span></span></div>
+      <div class="area-body">
+        <form id="reg-form" autocomplete="off">
+          <div class="form-grid">
+
+            <div class="field">
+              <label for="reg-document_id">Обозначение документа <span class="req">*</span>
+                <span class="hint" title="Официальное обозначение документа. Пример: ГОСТ 18410—73. Используется в слаге и как идентификатор в базе.">?</span></label>
+              <input id="reg-document_id" name="document_id" type="text" placeholder="document_id">
+            </div>
+
+            <div class="field">
+              <label for="reg-document_type">Тип документа <span class="req">*</span>
+                <span class="hint" title="ГОСТ / СП / СО / СНиП / ПУЭ. Определяется по обозначению; можно выбрать вручную.">?</span></label>
+              <select id="reg-document_type" name="document_type">
+                <option value=""></option>
+                <option>ГОСТ</option>
+                <option>СП</option>
+                <option>СО</option>
+                <option>СНиП</option>
+                <option>ПУЭ</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="reg-title">Заголовок документа <span class="req">*</span>
+                <span class="hint" title="Название документа как написано на титульном листе. Пример: Кабели силовые с пластмассовой изоляцией.">?</span></label>
+              <input id="reg-title" name="title" type="text" placeholder="title">
+            </div>
+
+            <div class="field">
+              <label for="reg-domain">Тематика <span class="req">*</span>
+                <span class="hint" title="Одно слово тематики — используется в слаге документа. Пример: Кабели.">?</span></label>
+              <input id="reg-domain" name="domain" type="text" placeholder="domain">
+            </div>
+
+            <div class="field">
+              <label for="reg-document_id_alt">Старое обозначение
+                <span class="hint" title="Предыдущее обозначение при переиздании. Пример: СНиП 2.08.01-89 (после переиздания — СП 54.13330).">?</span></label>
+              <input id="reg-document_id_alt" name="document_id_alt" type="text" placeholder="document_id_alt">
+            </div>
+
+            <div class="field">
+              <label for="reg-edition">Год издания <span class="req">*</span>
+                <span class="hint" title="Год издания или утверждения (последняя группа цифр в обозначении; две цифры интерпретируются как век). Пример: 1980.">?</span></label>
+              <input id="reg-edition" name="edition" type="number" min="1900" max="2100" step="1" placeholder="edition">
+            </div>
+
+            <div class="field">
+              <label for="reg-date_enacted">Дата введения в действие <span class="req">*</span>
+                <span class="hint" title="Дата, с которой документ введён в действие. Формат ГГГГ-ММ-ДД. Пример: 1980-07-01.">?</span></label>
+              <input id="reg-date_enacted" name="date_enacted" type="date" placeholder="date_enacted">
+            </div>
+
+            <div class="field">
+              <label for="reg-date_amended">Дата последнего изменения
+                <span class="hint" title="Дата внесения последнего изменения. Формат ГГГГ-ММ-ДД.">?</span></label>
+              <input id="reg-date_amended" name="date_amended" type="date" placeholder="date_amended">
+            </div>
+
+            <div class="field">
+              <label for="reg-amended_by">Чем изменён
+                <span class="hint" title="Обозначение документа, которым внесено изменение. Пример: Изм. 1.">?</span></label>
+              <input id="reg-amended_by" name="amended_by" type="text" placeholder="amended_by">
+            </div>
+
+            <div class="field">
+              <label for="reg-source_file">Исходный файл <span class="req">*</span>
+                <span class="hint" title="Имя загруженного файла. Заполняется автоматически, не редактируется.">?</span></label>
+              <input id="reg-source_file" name="source_file" type="text" placeholder="source_file" readonly>
+            </div>
+
+            <div class="field">
+              <label for="reg-status">Статус
+                <span class="hint" title="active — документ действует; inactive — не действует. При inactive заполняются поля ниже.">?</span></label>
+              <select id="reg-status" name="status">
+                <option value="active">active — действует</option>
+                <option value="inactive">inactive — не действует</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="reg-status_reason">Причина недействования
+                <span class="hint" title="Обязательно при статусе inactive. Пример: заменён на ГОСТ 31996-2012.">?</span></label>
+              <input id="reg-status_reason" name="status_reason" type="text" placeholder="status_reason">
+            </div>
+
+            <div class="field">
+              <label for="reg-replaced_by_document_id">Заменён документом (обозначение)
+                <span class="hint" title="Официальный номер документа-преемника (при inactive). Пример: ГОСТ 31996-2012.">?</span></label>
+              <input id="reg-replaced_by_document_id" name="replaced_by_document_id" type="text" placeholder="replaced_by_document_id">
+            </div>
+
+            <div class="field">
+              <label for="reg-replaced_by_doc_key">Заменён документом (ключ)
+                <span class="hint" title="Слаг документа-преемника в базе (при inactive). Пример: GOST_31996_kabeli.">?</span></label>
+              <input id="reg-replaced_by_doc_key" name="replaced_by_doc_key" type="text" placeholder="replaced_by_doc_key">
+            </div>
+
+            <div class="field field-wide">
+              <label for="reg-ignore_sections">Игнорируемые разделы
+                <span class="hint" title="Разделы, исключаемые из индексации (через запятую). По умолчанию: Предисловие, Содержание.">?</span></label>
+              <input id="reg-ignore_sections" name="ignore_sections" type="text" placeholder="ignore_sections (через запятую)">
+            </div>
+
+          </div>
+          <div class="form-actions">
+            <button id="register" type="button" class="btn primary" disabled>Зарегистрировать документ</button>
+            <span id="reg-status" class="status-line"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Область 3: конвертация и индексация -->
+    <div class="area" id="area-progress">
+      <div class="area-head"><span class="area-step">3</span><h3>Конвертация и добавление в базу</h3><span class="area-note">лог процесса — цветом выделены ошибки и предупреждения</span></div>
+      <div class="area-body">
+        <div class="action-row">
+          <button id="convert" class="btn primary" disabled>Конвертировать в Markdown</button>
+          <button id="index" class="btn primary" disabled>Добавить документ в базу</button>
+          <button id="stop" class="btn danger" disabled>Стоп</button>
+          <span class="spacer"></span>
+          <a id="md-view" class="btn link" hidden target="_blank" rel="noopener">Просмотр .md</a>
+          <a id="md-download" class="btn link" hidden download>Скачать .md</a>
+        </div>
+        <pre id="job-log" class="log"></pre>
+        <div id="md-preview" class="md-preview" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= НАСТРОЙКИ ================= -->
+  <section id="settings" class="tab-panel" hidden>
+    <div class="page-head">
+      <h2>Настройки</h2>
+      <p class="muted">Провайдеры и модели, ключи API, параметры поискового графа. Единая кнопка «Сохранить»
+      записывает все секции одним действием; «Обновить модели» запрашивает списки моделей у провайдеров.</p>
+    </div>
+    <div id="settings-root"></div>
+  </section>
+
+</main>
+
+<script src="/static/settings.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

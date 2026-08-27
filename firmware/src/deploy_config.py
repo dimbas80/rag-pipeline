@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class DeployConfig:
     host: str
     port: int
+    config_dir: Path
     upload_base_dir: Path
     upload_max_mb: int
     create_markdown_dir: Path
@@ -26,6 +27,21 @@ class DeployConfig:
     environment: str
 
     @property
+    def providers_path(self) -> Path:
+        """Единый реестр провайдеров в общем каталоге конфигов."""
+        return self.config_dir / "providers.yaml"
+
+    @property
+    def create_markdown_config_path(self) -> Path:
+        """Единый конфиг Create_Markdown_YA (промпты + RAG-секции)."""
+        return self.config_dir / "create_markdown_config.yaml"
+
+    @property
+    def search_config_path(self) -> Path:
+        """Единый конфиг узлов поискового графа."""
+        return self.config_dir / "search_config.yaml"
+
+    @property
     def pipeline_env(self) -> dict[str, str]:
         return {"INTERFACE_RAG_ENV": self.environment}
 
@@ -36,7 +52,7 @@ def load(path: str | Path | None = None) -> DeployConfig:
     section = raw.get(env)
     if not isinstance(section, dict):
         raise ValueError(f"Неизвестная среда деплоя: {env}")
-    required = ("upload", "pipelines", "qdrant", "env_file", "base_markdown")
+    required = ("config_dir", "upload", "pipelines", "qdrant", "base_markdown")
     missing = [key for key in required if key not in section]
     if missing:
         raise ValueError(f"В конфигурации {env} отсутствуют поля: {', '.join(missing)}")
@@ -44,13 +60,17 @@ def load(path: str | Path | None = None) -> DeployConfig:
         missing = [key for key in keys if key not in section[group]]
         if missing:
             raise ValueError(f"В конфигурации {env}.{group} отсутствуют поля: {', '.join(missing)}")
+    config_dir = Path(section["config_dir"])
+    # Инвариант: env_file всегда указывает на <config_dir>/.env (единый каталог конфигов).
+    env_file = Path(section.get("env_file") or config_dir / ".env")
     return DeployConfig(
         host=str(section.get("host", "127.0.0.1")), port=int(section.get("port", 8081)),
+        config_dir=config_dir,
         upload_base_dir=Path(section["upload"]["base_dir"]), upload_max_mb=int(section["upload"]["max_mb"]),
         create_markdown_dir=Path(section["pipelines"]["create_markdown_dir"]),
         build_search_index_dir=Path(section["pipelines"]["build_search_index_dir"]),
         qdrant_path=Path(section["qdrant"]["path"]), collection=str(section["qdrant"]["collection"]),
-        write_enabled=bool(section["qdrant"]["write_enabled"]), env_file=Path(section["env_file"]),
+        write_enabled=bool(section["qdrant"]["write_enabled"]), env_file=env_file,
         base_markdown=Path(section["base_markdown"]), prompts=raw.get("prompts", {}),
         model_tags=raw.get("model_tags", {}), environment=env,
     )

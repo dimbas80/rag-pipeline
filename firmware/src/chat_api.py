@@ -34,8 +34,8 @@ class ChatSession:
             QAGraphConfig(
                 qdrant_path=str(self.cfg.qdrant_path),
                 collection=self.cfg.collection,
-                providers_path=str(self.cfg.build_search_index_dir / "providers.yaml"),
-                search_config_path=str(self.cfg.build_search_index_dir / "search_config.yaml"),
+                providers_path=str(self.cfg.providers_path),
+                search_config_path=str(self.cfg.search_config_path),
             )
         )
 

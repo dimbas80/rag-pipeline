@@ -1,8 +1,32 @@
-<div id="settings-panel">
-<h2>Провайдеры и роли</h2><button id="settings-refresh">Обновить</button><pre id="providers-view"></pre>
-<div class="model-section"><label>Основная чат-модель <select id="chat-model"></select></label><label>Fallback <select id="chat-fallback"></select></label><button id="save-chat-model">Сохранить</button></div>
-<div class="model-section"><label>Vision (таблицы и регистрация) <select id="vision-model"></select></label><label>Fallback <select id="vision-fallback"></select></label><button id="save-vision-model">Сохранить</button></div>
-<div class="model-section"><label>Embedding <select id="embedding-model"></select></label><label>Fallback <select id="embedding-fallback"></select></label></div>
-<div class="model-section"><label>Rerank <select id="rerank-model"></select></label><label>Fallback <select id="rerank-fallback"></select></label></div>
-<h2>.env</h2><pre id="env-view"></pre><textarea id="env-values" placeholder="KEY=value"></textarea><button id="save-env">Сохранить env</button>
-</div>
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Настройки — Оркестратор ГОСТ-базы</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="standalone">
+
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <img class="brand-icon" src="/static/favicon.svg" alt="">
+      <div>
+        <h1>Настройки</h1>
+        <p class="subtitle">Провайдеры и модели, ключи API, параметры поискового графа.
+        Единая кнопка «Сохранить» записывает все секции одним действием.</p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <a class="standalone-back" href="/">← к инструменту (три раздела)</a>
+  <div id="settings-root"></div>
+</main>
+
+<script src="/static/settings.js"></script>
+<script>window.initSettings();</script>
+</body>
+</html>

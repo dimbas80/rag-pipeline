@@ -9,7 +9,10 @@ def mask_key(value: str | None) -> str:
     return "••••" + value[-4:]
 
 def read_yaml(path):
-    return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 def write_yaml(path, data, comments_preserving=False):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +47,8 @@ def read_env_raw(path):
     return result
 
 def write_env(path, values):
-    path = Path(path); current = {}
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    current = {}
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):

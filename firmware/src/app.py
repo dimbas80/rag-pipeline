@@ -17,13 +17,13 @@ from pydantic import BaseModel
 
 try:  # supports both documented package and legacy module invocation
     from firmware.src.deploy_config import load
-    from firmware.src.jobs import JobRunner
+    from firmware.src.jobs import JobRunner, build_env
     from firmware.src import config_ui, registration, providers_api
     from firmware.src.chat_api import ChatSession
     from firmware.src import qdrant_api
 except ImportError:  # pragma: no cover - only for direct `uvicorn app:app`
     from deploy_config import load
-    from jobs import JobRunner
+    from jobs import JobRunner, build_env
     import config_ui, registration, providers_api
     from chat_api import ChatSession
     import qdrant_api
@@ -97,6 +97,7 @@ async def upload(file: UploadFile = File(...)):
 def state(sid):
     s = _session(sid)
     return {**s, "source": str(s["source"]), "reg": str(s["reg"]), "md": str(s["md"]),
+            "reg_exists": s["reg"].exists(), "md_exists": s["md"].exists(),
             "can_index": s["reg"].exists() and s["md"].exists() and cfg.write_enabled}
 
 
@@ -118,7 +119,7 @@ def registration_state(sid):
 def registration_prefill(sid):
     s = _session(sid)
     image_bytes = registration.extract_first_page(s["source"])
-    fields = registration.vision_prefill(image_bytes, config=cfg.prompts, providers_path=cfg.create_markdown_dir / "providers.yaml", env=os.environ | config_ui.read_env_raw(cfg.env_file)) if image_bytes else {}
+    fields = registration.vision_prefill(image_bytes, config=cfg.prompts, providers_path=cfg.providers_path, env=build_env(cfg.env_file)) if image_bytes else {}
     fields.setdefault("domain", fields.get("domain_hint"))
     fields["slug"] = registration.make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), ()) if fields.get("document_id") else None
     return {"fields": fields, "image_available": bool(image_bytes)}
@@ -127,8 +128,8 @@ def registration_prefill(sid):
 @app.post("/api/documents/{sid}/convert")
 def convert(sid):
     s = _session(sid)
-    providers = _combined_providers()
-    env = os.environ | config_ui.read_env_raw(cfg.env_file)
+    providers = config_ui.read_yaml(cfg.providers_path)
+    env = build_env(cfg.env_file)
     missing = []
     for role in ("table_vision", "ai_postprocess"):
         spec = providers.get("roles", {}).get("create_markdown", {}).get(role)
@@ -141,9 +142,9 @@ def convert(sid):
     if missing:
         raise HTTPException(400, "Настройте vision и чат-модель и добавьте API-ключи")
     src = cfg.create_markdown_dir / "create_markdown.py"
-    argv = [sys.executable, str(src), "-i", str(s["source"]), "--ai", "--config",
-            str(cfg.create_markdown_dir / "create_markdown_config.yaml"), "--providers-config",
-            str(cfg.create_markdown_dir / "providers.yaml")]
+    argv = [sys.executable, str(src), "-i", str(s["source"]), "--ai",
+            "--config", str(cfg.create_markdown_config_path),
+            "--providers-config", str(cfg.providers_path)]
     return runner.start(argv, cwd=str(cfg.create_markdown_dir), env=env, kind="convert").__dict__
 
 @app.post("/api/documents/{sid}/index")
@@ -151,9 +152,13 @@ def index_document(sid, _payload: IndexRequest | None = None):
     s = _session(sid)
     if not (s["md"].is_file() and s["reg"].is_file() and cfg.write_enabled):
         raise HTTPException(400, "Завершите предыдущие шаги: требуются .md, _reg.yaml и разрешённая запись в Qdrant")
-    rag = [sys.executable, str(cfg.create_markdown_dir / "create_markdown.py"), "-i", str(s["md"]), "--rag", "--config", str(cfg.create_markdown_dir / "create_markdown_config.yaml"), "--providers-config", str(cfg.create_markdown_dir / "providers.yaml")]
-    index = [sys.executable, str(cfg.build_search_index_dir / "create_index.py"), str(s["md"].parent), "--qdrant-path", str(cfg.qdrant_path.resolve()), "--collection", cfg.collection, "--strict"]
-    env = os.environ | config_ui.read_env_raw(cfg.env_file)
+    rag = [sys.executable, str(cfg.create_markdown_dir / "create_markdown.py"), "-i", str(s["md"]), "--rag",
+           "--config", str(cfg.create_markdown_config_path),
+           "--providers-config", str(cfg.providers_path)]
+    index = [sys.executable, str(cfg.build_search_index_dir / "create_index.py"), str(s["md"].parent),
+             "--qdrant-path", str(cfg.qdrant_path.resolve()), "--collection", cfg.collection, "--strict",
+             "--providers_config", str(cfg.providers_path)]
+    env = build_env(cfg.env_file)
     first = runner.start_sequence([rag, index], cwd=str(cfg.create_markdown_dir), env=env, kind="index")
     return first.__dict__
 
@@ -217,68 +222,27 @@ def image(doc_dir: str, rel_path: str):
     return FileResponse(path)
 
 
-def _providers_path():
-    return cfg.create_markdown_dir / "providers.yaml"
-
-def _search_providers_path():
-    return cfg.build_search_index_dir / "providers.yaml"
-
-def _combined_providers():
-    """Expose one UI document while retaining each pipeline's role file."""
-    create = config_ui.read_yaml(_providers_path())
-    search = config_ui.read_yaml(_search_providers_path())
-    merged = dict(create)
-    merged["providers"] = dict(create.get("providers", {}))
-    merged["providers"].update(search.get("providers", {}))
-    roles = dict(create.get("roles", {}))
-    roles["build_search_index"] = dict(search.get("roles", {}).get("build_search_index", {}))
-    merged["roles"] = roles
-    return merged
-
-def _write_combined(data):
-    roles = data.get("roles", {})
-    create_roles = {"create_markdown": dict(roles.get("create_markdown", {}))}
-    search_roles = {"build_search_index": dict(roles.get("build_search_index", {}))}
-
-    def used_providers(role_data):
-        names = {spec.get("provider") for spec in role_data.values()
-                 if isinstance(spec, dict) and spec.get("provider")}
-        return {name: data.get("providers", {}).get(name)
-                for name in names if name in data.get("providers", {})}
-
-    create_used = used_providers(create_roles["create_markdown"])
-    search_used = used_providers(search_roles["build_search_index"])
-    # Newly added providers may not have a role yet. Keep those in the
-    # create-markdown registry so they remain available to the settings UI,
-    # while role-owned providers stay in exactly one pipeline file.
-    unassigned = {name: spec for name, spec in data.get("providers", {}).items()
-                  if name not in create_used and name not in search_used}
-    create = {key: value for key, value in data.items() if key not in {"roles", "providers"}}
-    create["providers"] = {**create_used, **unassigned}
-    create["roles"] = create_roles
-    search = {key: value for key, value in data.items() if key not in {"roles", "providers"}}
-    search["providers"] = search_used
-    search["roles"] = search_roles
-    config_ui.write_yaml(_providers_path(), create)
-    config_ui.write_yaml(_search_providers_path(), search)
+# Единый общий конфиг: интерфейс читает/пишет ТОЛЬКО файлы из cfg.config_dir
+# (providers.yaml, create_markdown_config.yaml, search_config.yaml, .env). Никаких
+# копий в каталогах пайплайнов; пайплайнам конфиги передаются CLI-ключами (§4.9).
 
 @app.get("/api/settings/providers")
 def settings_providers():
-    return _combined_providers()
+    return config_ui.read_yaml(cfg.providers_path)
 
 @app.put("/api/settings/providers")
 def update_providers(payload: dict):
     config_ui.validate_providers(payload)
-    _write_combined(payload)
+    config_ui.write_yaml(cfg.providers_path, payload)
     return payload
 
 @app.put("/api/settings/providers/roles")
 def update_provider_roles(payload: dict):
-    data = _combined_providers()
+    data = config_ui.read_yaml(cfg.providers_path)
     kind = payload.get("kind")
     config_ui.sync_role_models(data, payload.get("spec", {}), kind)
     config_ui.validate_providers(data)
-    _write_combined(data)
+    config_ui.write_yaml(cfg.providers_path, data)
     return data
 
 @app.post("/api/settings/providers/scan")
@@ -292,14 +256,19 @@ def scan_provider(payload: ProviderScan):
 def add_provider(payload: ProviderAdd):
     models = [item if isinstance(item, str) else item.name for item in payload.models]
     try:
-        result = providers_api.add_provider(_providers_path(), payload.name, payload.base_url, payload.api_key_env, models)
-        _write_combined(_combined_providers())
-        return result
+        return providers_api.add_provider(cfg.providers_path, payload.name, payload.base_url, payload.api_key_env, models)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+@app.post("/api/settings/providers/refresh")
+def refresh_providers():
+    try:
+        return providers_api.refresh_all_models(cfg.providers_path, build_env(cfg.env_file))
+    except Exception as exc:
+        raise HTTPException(502, f"Не удалось обновить модели: {exc}") from exc
+
 def _config_path(kind):
-    return (cfg.build_search_index_dir if kind == "search" else cfg.create_markdown_dir) / ("search_config.yaml" if kind == "search" else "create_markdown_config.yaml")
+    return cfg.search_config_path if kind == "search" else cfg.create_markdown_config_path
 
 @app.get("/api/settings/search-config")
 def get_search_config(): return config_ui.read_yaml(_config_path("search"))
@@ -320,7 +289,9 @@ def get_env_config(): return config_ui.read_env(cfg.env_file)
 
 @app.put("/api/settings/env")
 def put_env_config(payload: EnvUpdate):
-    values = dict(payload.values)
+    # Значения, которые выглядят как маска (••••…), приходят из UI без изменений —
+    # их нельзя записывать, иначе реальный ключ затрётся маской (§9.5, решение №15).
+    values = {k: v for k, v in payload.values.items() if v and not v.startswith("••••")}
     values.update({key: "" for key in payload.delete})
     config_ui.write_env(cfg.env_file, values)
     return config_ui.read_env(cfg.env_file)
@@ -330,7 +301,7 @@ def settings_collections(): return {"collections": qdrant_api.list_collections(c
 
 @app.get("/api/settings/status")
 def settings_status():
-    providers = _combined_providers()
+    providers = config_ui.read_yaml(cfg.providers_path)
     roles = providers.get("roles", {})
     required = (("create_markdown", "table_vision"), ("create_markdown", "ai_postprocess"), ("create_markdown", "registration_vision"), ("build_search_index", "query_processing"), ("build_search_index", "embedding"), ("build_search_index", "rerank"))
     return {"environment": cfg.environment, "write_enabled": cfg.write_enabled, "roles": {f"{p}.{r}": bool(roles.get(p, {}).get(r)) for p, r in required}}

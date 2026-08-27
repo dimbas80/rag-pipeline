@@ -9,6 +9,24 @@ import uuid
 from dataclasses import dataclass, field
 from queue import Queue
 
+try:  # supports both documented package and legacy module invocation
+    from firmware.src.config_ui import read_env_raw
+except ImportError:  # pragma: no cover - direct `uvicorn app:app` from firmware/src
+    from config_ui import read_env_raw
+
+
+def build_env(env_file=None) -> dict[str, str]:
+    """Окружение для subprocess пайплайнов (§8.2 архитектуры).
+
+    Ключи из общего `.env` инжектируются поверх текущего окружения и имеют
+    приоритет (пайплайны грузят свои `.env` через setdefault/override=False).
+    """
+    env = dict(os.environ)
+    if env_file:
+        env.update(read_env_raw(env_file))
+    return env
+
+
 @dataclass
 class Job:
     id: str

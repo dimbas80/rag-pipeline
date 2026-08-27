@@ -2,9 +2,21 @@ from pathlib import Path
 import yaml
 import pytest
 from firmware.src.config_ui import (
+    read_yaml, read_env,
     validate_providers, validate_search_config, validate_reg_record,
     write_env, read_env_raw, sync_role_models,
 )
+
+
+def test_read_yaml_missing_returns_empty(tmp_path):
+    assert read_yaml(tmp_path / "missing.yaml") == {}
+
+
+def test_write_env_creates_parent_dir(tmp_path):
+    path = tmp_path / "deep" / "dir" / ".env"
+    write_env(path, {"A": "one"})
+    assert read_env_raw(path) == {"A": "one"}
+    assert read_env(path) == {"A": "••••one"}
 
 
 def test_validate_configs_and_sync_roles(tmp_path):

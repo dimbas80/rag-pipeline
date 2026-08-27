@@ -1,175 +1,197 @@
 # interface_RAG — План реализации (для Coder)
 
 > Сопутствующий документ: `docs/architecture/architecture.md` (обязательно прочитать перед началом).
-> Порядок этапов ниже построен так, чтобы каждый этап давал проверяемый результат и зависел только от
-> предыдущих. Критерии готовности каждого этапа обязательны перед переходом дальше.
+> Эта версия плана описывает **реворк** (единый общий конфиг + чистый прод + новый UI) поверх уже
+> работающего web-ui. Фаза 1 (конфиг + деплой) и Фаза 2 (UI) — отдельные задачи Coder'а; порядок
+> этапов ниже даёт проверяемый результат на каждом шаге.
 
 ---
 
-## Конвенции
+## Конвенции (обновлены под реворк)
 
 - Код — `firmware/src/`, тесты — `firmware/tests/`, статика — `firmware/src/static/`.
-- Python ≥ 3.11, venv в корне репозитория. Зависимости: `firmware/src/requirements.txt` (веб) —
-  список §2.7 архитектуры (`fastapi`, `uvicorn[standard]`, `python-multipart`, `pyyaml`,
-  `python-dotenv`, `requests`, `pydantic`, `pymupdf`, `qdrant-client`, `fastembed`,
-  `langgraph>=1.2`, `transformers>=4.51.0`, `httpx`, `beautifulsoup4`, `tqdm`).
-- Все пути — только из `deploy_config.DeployConfig` (никаких хардкодов). Dev-значения в `config.yaml`.
-- Каждый запуск пайплайна — `subprocess.Popen(argv: list[str], shell=False)` (см. §9 архитектуры).
-- Атомарные записи — temp + `os.replace`; конфиги веба дополнительно пишут `.bak` перед перезаписью.
-- Логи/комментарии — русский; type hints; `snake_case` (конвенция пайплайнов-соседей).
+- Python ≥ 3.11, venv в корне. Зависимости — `firmware/src/requirements.txt` (список §2.7 архитектуры).
+- **Все пути конфигов/пайплайнов — только из `deploy_config.DeployConfig`**; новый источник —
+  `config_dir` (общий каталог конфигов). Никаких хардкодов.
+- Каждый запуск пайплайна — `subprocess.Popen(argv: list[str], shell=False)`; env — инъекция
+  `os.environ | read_env_raw(config_dir/".env")` (§8.2 архитектуры).
+- Конфиги пишутся атомарно (temp + `os.replace`) + `.bak`; ключи `.env` маскируются в UI.
+- Логи/комментарии — русский; type hints; `snake_case`.
 
 ---
 
-## Этап 1. Каркас: конфиг + deploy_config + структура репо
+## Фаза 1 (зад. t_7ee33160) — единый общий конфиг + deploy-скрипт
+
+### Этап 1.1 — `config_dir` в конфиге и `deploy_config`
 
 **Файлы:**
-- `config.yaml` (секции `dev:`/`prod:`, `active: dev`, `prompts.registration_vision`, `model_tags` — §8
-  архитектуры).
-- `firmware/src/deploy_config.py` — `DeployConfig` (dataclass) + `load()` (env `INTERFACE_RAG_ENV`
-  переопределяет `active`; валидация обязательных полей: `pipelines.*`, `qdrant.path`, `upload.base_dir`,
-  `base_markdown`, `env_file`).
-- `firmware/src/requirements.txt`.
-- `firmware/src/.gitignore`-дополнение (игнор `__pycache__`, `.env`, `uploads/`, `.bak`).
-- `firmware/tests/test_deploy_config.py`.
+- `config.yaml` — добавить `config_dir` в секции `dev:` (`/root/projects/interface_RAG/config`) и
+  `prod:` (`/root/RAG/config`); `env_file` переключить на `<config_dir>/.env` (§8.1 архитектуры).
+- `firmware/src/deploy_config.py` — добавить поле `config_dir: Path` в `DeployConfig` и производные
+  свойства `providers_path` / `create_markdown_config_path` / `search_config_path`; в `load()` добавить
+  `config_dir` в список обязательных.
+- `firmware/tests/test_deploy_config.py` — дополнить: `config_dir` обязателен; производные пути
+  указывают на `<config_dir>/<имя>`; `INTERFACE_RAG_ENV=prod` даёт prod-секцию.
 
-**Критерии готовности:**
-- `deploy_config.load()` возвращает полный конфиг для dev; переключение `INTERFACE_RAG_ENV=prod` даёт
-  prod-секцию.
-- Тест: отсутствие обязательного поля → ошибка с понятным текстом; dev-значения совпадают с config.yaml.
+**Критерии:** `deploy_config.load()` возвращает `config_dir`; `env_file == config_dir/".env"`;
+тесты зелёные.
 
----
-
-## Этап 2. config_ui + llm_client + providers_api (без FastAPI)
+### Этап 1.2 — консолидация чтения/записи в один `providers.yaml`
 
 **Файлы:**
-- `firmware/src/config_ui.py` — `read_yaml`, `write_yaml` (с `.bak`, гейт `yaml.safe_load`),
-  `read_env`/`write_env` (маскирование), `mask_key`, валидаторы: `validate_providers`,
-  `validate_search_config` (nodes, temperature/max_tokens), `validate_reg_record`.
-- `firmware/src/llm_client.py` — `resolve_role`, `chat_completion`, `vision_completion`,
-  `run_with_fallback` (OpenAI-совместимо; vision через `image_url` data-URI).
-- `firmware/src/providers_api.py` — `scan_models(base_url, api_key)`, `tag_model(name)`
-  (правила `config.model_tags`, порядок §4.2), `add_provider(...)`.
-- `firmware/tests/test_config_ui.py`, `test_providers_api.py`, `test_llm_client.py` (LLM-вызовы мокаются).
+- `firmware/src/app.py` — **удалить** `_providers_path()`/`_search_providers_path()`/
+  `_combined_providers()`/`_write_combined()`; заменить на единый файл `cfg.providers_path`
+  (= `<config_dir>/providers.yaml`):
+  - `GET/PUT /api/settings/providers` — читать/писать один файл (валидация `validate_providers`).
+  - `PUT /api/settings/providers/roles` — `sync_role_models` по одному файлу.
+  - `POST /api/settings/providers/add` — `add_provider(cfg.providers_path, ...)` + запись
+    `api_key_env` в `.env`.
+  - `_config_path(kind)` → `cfg.search_config_path` / `cfg.create_markdown_config_path`.
+  - `registration.vision_prefill` — `providers_path=cfg.providers_path`.
+  - `GET /api/settings/env` / `PUT` — `cfg.env_file` (уже так, путь сменился на `<config_dir>/.env`).
+- `firmware/src/config_ui.py` — без изменений API (уже атомарно + `.bak` + маски); убедиться, что
+  `write_yaml`/`write_env` корректно пишут в несуществующий `config_dir` (создаёт родителя).
 
-**Критерии готовности:**
-- `write_yaml` сохраняет структуру/комментарии неразрушимо для целевых файлов (проверить на копии
-  реального `providers.yaml`); `.bak` создаётся; битый YAML не пишется (гейт).
-- `tag_model` даёт ожидаемые теги для имён из реального `providers.yaml` (§4.2: embedding/rerank/vision/
-  chat).
-- `add_provider` отклоняет дубль `api_key_env` и невалидный `base_url`.
+**Критерии:** настройки читают/пишут один `providers.yaml` в `config_dir`; при сохранении роли
+(`sync_role_models`) в файле появляется только одна секция `roles` с обеими ветками
+`create_markdown` и `build_search_index`.
 
----
-
-## Этап 3. jobs.py — запуск пайплайнов, лог, стрим, стоп
-
-**Файлы:**
-- `firmware/src/jobs.py` — `Job`, `JobRunner` (§3.1 архитектуры): `start(argv, cwd, env, kind)`,
-  `stop`, `get`, `subscribe` (очередь событий для SSE); чтение stdout/stderr построчно в буфер + очередь;
-  `stop` = SIGTERM → 5s → SIGKILL; сериализация N=1.
-- `firmware/tests/test_jobs.py` — фейковый argv (например `python3 -c`), проверка лог-строк, стопа,
-  exit-кода.
-
-**Критерии готовности:**
-- Запуск фейковой долгой команды; `subscribe` получает строки; `stop` переводит в `stopped`, процесс убит.
-- env инжектируется (проверить, что дочерний процесс видит переменную из `read_env`).
-- Нет `shell=True` нигде (assert в тесте на структуру argv).
-
----
-
-## Этап 4. registration.py — вырезка 1-й страницы + vision + slug + запись reg
+### Этап 1.3 — argv пайплайнов на общий конфиг + явный `--providers_config` в индексации
 
 **Файлы:**
-- `firmware/src/registration.py` — `extract_first_page` (PyMuPDF; DOCX/DOC → libreoffice headless → PDF;
-  иначе None), `vision_prefill` (роль `create_markdown.registration_vision`, промпт из конфига),
-  `make_slug` (точная реплика `_reg_make_slug`: префикс-карта, номер, транслит, коллизии `_2`),
-  `write_reg_yaml` (рендер `documents.<slug>` по порядку полей §2.3 + `.bak` + гейт).
-- `firmware/tests/test_registration.py` — slug (префикс/номер/транслит/коллизия), рендер YAML
-  (совпадает с форматом пайплайна; `yaml.safe_load` корректен), fallback при отсутствии vision.
+- `firmware/src/app.py`:
+  - `convert()`: `--config <config_dir>/create_markdown_config.yaml`,
+    `--providers-config <config_dir>/providers.yaml` (§8.4).
+  - `index_document()`: фаза 1 (`--rag`) с теми же двумя ключами; фаза 2 (`create_index.py`) —
+    **добавить** `--providers_config <config_dir>/providers.yaml` (underscore) к текущим
+    `--qdrant-path/--collection/--strict` (§8.4). Сейчас этот флаг в индексации отсутствует —
+    обязателен для единого конфига.
+- `firmware/src/chat_api.py` — `QAGraphConfig(providers_path=cfg.providers_path,
+  search_config_path=cfg.search_config_path, ...)` (сейчас указывает на `build_search_index_dir/...`).
 
-**Критерии готовности:**
-- Сгенерированный `<stem>_reg.yaml` парсится `yaml.safe_load`, секция `documents.<slug>` содержит все
-  поля §2.3, `source_file` = имя файла, `status: active`.
-- Slug для `ГОСТ 839—80`+`Кабели` → `GOST_839_kabel`; коллизия → суффикс.
-- `write_reg_yaml` на существующем файле делает `.bak` и не повреждает чужие записи (тест на копии
-  реального reg-файла).
+**Критерии:** argv содержит точные пути из §8.4; `chat_api` не трогает каталог пайплайна для
+конфигов. Тест: мок `runner.start`/`start_sequence`, assert на состав argv (пути из `config_dir`).
 
----
-
-## Этап 5. qdrant_api + chat_api — импорт qa_graph
+### Этап 1.4 — кнопка «Обновить» (refresh моделей)
 
 **Файлы:**
-- `firmware/src/qdrant_api.py` — `list_collections`, `distinct_documents` (open/close на запрос).
-- `firmware/src/chat_api.py` — `sys.path` к `Build_Search_index/firmware/src` (+ `telegram_bot`),
-  `ChatSession` (один `QAGraph` на сессию), `answer`/`resume`, `select_images` (приоритет бота через
-  `telegram_bot.asset_helpers`), `list_documents`.
-- `firmware/tests/test_chat_api.py` — мок `QAGraph.run/resume`; проверка: interrupt → clarification,
-  final_answer → answer; `select_images` выбирает только процитированные/явные ассеты.
+- `firmware/src/providers_api.py` — `refresh_all_models(providers_path, env) -> dict`: для каждого
+  провайдера с ключом из `env` вызвать `scan_models`; обновить `models` (теги по имени); ошибки по
+  одному провайдеру не роняют остальные (возврат `{provider: {ok, models|error}}`).
+- `firmware/src/app.py` — `POST /api/settings/providers/refresh` (вызывает `refresh_all_models` с
+  `read_env_raw(cfg.env_file)`).
+- `firmware/tests/test_providers_api.py` — мок `scan_models`; проверка обновления моделей и изоляции
+  ошибок.
 
-**Критерии готовности:**
-- Импорт `from qa_graph import QAGraph, QAGraphConfig` работает с dev-конфигом (qdrant_path/collection/
-  providers_path/search_config_path из deploy_config).
-- Мок-тест: answer → dict с final_answer+cited_chunk_ids+images; interrupt → clarification.
-- `distinct_documents` возвращает уникальные `document_id` (тест на in-memory fake Qdrant или моке).
+**Критерии:** refresh обновляет список моделей без потери провайдеров/ролей; частичная ошибка не
+прерывает остальных.
 
----
+### Этап 1.5 — deploy-скрипт `scripts/deploy.sh` (dry-run обязателен)
 
-## Этап 6. app.py — FastAPI-роуты, SSE, WebSocket, статика
+**Файлы:** `scripts/deploy.sh` (bash). Флаг `--dry-run` (по умолчанию). Константы: `LXC=192.0.2.21`,
+`LXC_ROOT=/root/RAG`, `CONFIG_DIR=/root/RAG/config`.
 
-**Файлы:**
-- `firmware/src/app.py` — маршруты §7 архитектуры; `DocumentSession` (in-memory) с gating §4.4;
-  SSE `GET /api/jobs/{id}/events`; WebSocket `ws /ws/chat` (§6); `GET /api/files/...`,
-  `GET /api/images/...` (безопасная отдача §9); `mount /static`.
-- `firmware/src/static/index.html`, `app.js`, `style.css` — три вкладки (Чат / Добавить документ /
-  Настройки), wizard-состояние, SSE-клиент (EventSource), WS-клиент, маскированные поля ключей.
-- `firmware/tests/test_app.py` — TestClient: загрузка, register (мок vision), convert/index (мок jobs),
-  gating (index без `.md`/reg → 4xx + сообщение), файлы (traversal отклоняется), settings (маски).
+Порядок (см. §4.10 архитектуры):
+1. `--dry-run` → печатать план без изменений (что будет забекаплено/скопировано/симлинкнуто).
+2. Бэкап: `ssh root@$LXC "cp -a $CONFIG_DIR $CONFIG_DIR.bak.$(date +%s)"` (и копии `providers.yaml`/
+   `.env` из каталогов пайплайнов, если ещё существуют).
+3. Консолидация в `$CONFIG_DIR/`: эталон `providers.yaml` — «полный» вариант (Build_Search_index, с
+   ролями `build_search_index`); долить провайдеров/модели из варианта Create_Markdown_YA; `.env` —
+   собрать все 8 ключей БЕЗ затирания реальных значений (порядок приоритета: значение с LXC >
+   значение с dev, ключи не удаляются).
+4. rsync манифеста (§8.3) → `/root/RAG/{interface_RAG,Create_Markdown_YA,Build_Search_index}/`
+   (исключая `.git docs workflows .hermes tests .pytest_cache README* __pycache__ tmp bot.log* request_bot.py .env`).
+5. Симлинк: `ssh root@$LXC "ln -sfn $CONFIG_DIR/providers.yaml $LXC_ROOT/Build_Search_index/firmware/src/providers.yaml"`.
+6. Рестарт: `ssh root@$LXC "systemctl restart interface-rag.service"`.
+7. Smoke: `ssh root@$LXC "curl -sf http://127.0.0.1/ -o /dev/null -w '%{http_code}'"` → ожидаем `200`.
 
-**Критерии готовности:**
-- `uvicorn app:app` стартует; открывается `index.html`, три вкладки работают.
-- Wizard: кнопка «Добавить в базу» неактивна без `.md`+`_reg.yaml` и при `write_enabled=false`.
-- `GET /api/images/../../etc/passwd`-подобный запрос → 404/400 (нет выхода за `base_markdown`).
-- SSE доставляет строки лога фейковой задачи; «Стоп» прерывает.
-
----
-
-## Этап 7. Интеграционные smoke-тесты на реальных пайплайнах
-
-**Файлы:** `firmware/tests/test_integration.py` (помечены `@pytest.mark.integration`, запускаются явно).
-
-**Критерии готовности (прогон вручную на dev):**
-1. Положить тестовый PDF в `uploads/`; шаг 3 → появляется `Markdown/<stem>/<stem>.md` + `image/`.
-2. Шаг 2 регистрация → `Markdown/<stem>/<stem>_reg.yaml` (валидный).
-3. `create_markdown.py -i Markdown/<stem>/<stem>.md --rag` → `<stem>_chunks.jsonl` + `<stem>_assets.json`.
-4. `create_index.py Markdown/<stem>/ --qdrant-path <dev> --collection technical_standard --strict` →
-   «Готово: N чанков» (только в dev-базу).
-5. Чат: вопрос по документу → ответ с цитатами (картинки — при доступности `base_markdown`).
-6. `GET /api/documents-in-base` → документ в списке.
+**Критерии приёмки фазы 1:**
+- `python3 -m pytest firmware/tests -q` — зелёные (обновлены/добавлены под `config_dir`).
+- `scripts/deploy.sh --dry-run` отрабатывает без ошибок и печатает корректный план (бэкап +
+  консолидация + rsync-манифест + симлинк + рестарт + smoke). Реальный деплой НЕ выполняется
+  (его запустит оркестратор после ревью).
+- НЕ выполнять `git restore/checkout/stash`; не трогать пайплайны.
 
 ---
 
-## Итоговые критерии приёмки (весь проект)
+## Фаза 2 (зад. t_14fb20d5) — реворк UI
 
-- [ ] Три раздела UI работают; wizard gating по шагам и по наличию файлов (§4.4).
-- [ ] Пайплайны не изменены (`git status` в обоих репозиториях чистый относительно старта).
-- [ ] Ни одного хардкода пути в `firmware/src/` (кроме `__file__`-относительных дефолтов).
-- [ ] Все subprocess-вызовы — argv-списком, `shell=False`.
-- [ ] Конфиги пишутся атомарно с `.bak`; ключи `.env` маскированы в UI.
-- [ ] «Стоп» прерывает локальный процесс (SIGTERM→SIGKILL).
-- [ ] Dev не пишет в боевую базу (`write_enabled=false`, кнопка индексации заблокирована).
-- [ ] `python -m pytest firmware/tests/ -q` зелёный (интеграционные — отдельным прогоном).
+### Этап 2.1 — шапка и оформление
+
+**Файлы:** `firmware/src/static/index.html`, `static/style.css`, `static/favicon.svg`.
+- `<title>` с понятным названием (напр. «Оркестратор ГОСТ-базы: OCR→Markdown и семантический поиск»);
+  `<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">`; заголовок + подзаголовок на
+  странице (§4.8). Единый стиль трёх вкладок (шрифты/отступы/цвета).
+
+### Этап 2.2 — «Добавить документ» одной страницей (3 области)
+
+**Файлы:** `static/index.html`, `static/app.js`, `static/style.css`, `firmware/src/registration.py`
+(если нужен экспорт `FIELDS` для рендера формы).
+- Три визуальные области: **Загрузка / Регистрация (форма) / Лог и прогресс** (НЕ пошаговые модалки).
+- Форма регистрации — статичная, ВСЕ поля `documents.<slug>` (`registration.FIELDS`, §2.3):
+  русское название + комментарий (назначение + пример, tooltip), обязательные помечены `*`
+  (`_REG_COMPLETENESS_FIELDS`), placeholder = имя поля. Vision-prefill заполняет определённые поля
+  (редактируемы). Кнопка «Зарегистрировать документ» внизу области.
+- Gating шагов сохраняется (кнопки следующих шагов активны после предыдущего, §4.4).
+- MD-вьювер: после конвертации — кнопка/ссылка `GET /api/files/markdown/<stem>` (просмотр/скачивание).
+
+### Этап 2.3 — Настройки (без сырых дампов, единая «Сохранить»)
+
+**Файлы:** `static/index.html`, `static/app.js`, `static/style.css`; backend — из фазы 1.
+- Убрать `providers-view`/`env-view` (raw `<pre>` дампы) — только структурированные поля (ключи
+  маскированы).
+- Вверху — единая **«Сохранить»** (собирает все секции в один батч) и **«Обновить»**
+  (`POST /api/settings/providers/refresh`).
+- Секции chat/vision/embedding/rerank: подпись «Основная модель» + чекбокс «Fallback» (настройки
+  fallback видны только при включённом чекбоксе) + пояснение роли (tooltip/подпись); в списках
+  vision/embedding/rerank — только модели с соответствующим тегом.
+- Секция «Параметры графа» (`search_config.yaml`: analyze_query, reformulate_query,
+  ask_clarification, generate_answer) с комментариями назначения.
+- Yandex OCR — отдельная секция (ключи). «Добавить провайдера» — модалка (имя/api key/base_url;
+  «Тест»/«Добавить»/«Отмена»).
+- Синхронные роли сохраняются (§4.1/§4.3).
+
+**Критерии приёмки фазы 2:**
+- `python3 -m pytest firmware/tests -q` — зелёные.
+- Локальный запуск `INTERFACE_RAG_ENV=dev` (порт 8081): три вкладки открываются; настройки
+  сохраняются одной кнопкой; fallback по чекбоксу; параметры графа редактируются; MD-вьювер отдаёт `.md`.
+- В интерфейсе нет raw-дампов конфигов; ключи маскированы.
+
+---
+
+## Итоговые критерии приёмки (весь реворк)
+
+- [ ] Один общий каталог конфигов (dev `.../interface_RAG/config`, prod `/root/RAG/config`):
+  `providers.yaml`, `create_markdown_config.yaml`, `search_config.yaml`, `.env`.
+- [ ] Пайплайнам конфиг передаётся только CLI-ключами (`--config`, `--providers-config`,
+  `--providers_config`); `.env` — инъекция в `env` subprocess.
+- [ ] `create_index.py` получает явный `--providers_config <config_dir>/providers.yaml`.
+- [ ] `chat_api` использует `providers_path`/`search_config_path` из `config_dir`.
+- [ ] Пайплайны не изменены (`git status` чистый относительно старта); симлинк на проде создаётся
+  deploy-скриптом, не вручную.
+- [ ] Deploy-скрипт имеет `--dry-run`; бэкап + консолидация + rsync-манифест + симлинк + рестарт + smoke.
+- [ ] UI: шапка (title+favicon+подзаголовок), «Добавить документ» одной страницей (3 области, статичная
+  форма), MD-вьювер, настройки без raw-дампов с единой «Сохранить» + «Обновить», fallback по чекбоксу,
+  пояснения ролей, параметры графа.
+- [ ] `python3 -m pytest firmware/tests -q` — зелёный (интеграционные — отдельным прогоном).
 
 ---
 
 ## Замечания и ловушки для Coder
 
 1. **Имя RAG-файлов**: пайплайн пишет `<stem>_chunks.jsonl` / `<stem>_assets.json` (НЕ `rag_chunks.jsonl`).
-   Не доверять help-строке `create_markdown.py` (§2.1).
-2. **`--reg` (TTY) не использовать** — веб пишет `<stem>_reg.yaml` сам (registration.py). Не вызывать
-   `create_markdown.py --reg` из веба.
-3. **`--collection` и `--qdrant-path` для `create_index.py` передавать явно**, иначе интерактивный выбор
-   коллекции и относительный путь (§2.2).
-4. **Qdrant-замок**: не держать `QdrantClient` открытым между запросами (открыть→прочитать→закрыть).
-5. **QAGraph на WebSocket-сессию**, не глобальный синглтон (изоляция `thread_id`).
-6. **`BASE_MARKDOWN`** в `qa_graph.py` захардкожен — не менять; картинки на dev могут не резолвиться (§10).
-7. **Токенизатор HF** скачивается при первом `--rag`; на LXC нужен доступ к HF или предзагруженный кэш.
-8. **Vision-роль** `create_markdown.registration_vision` — новая, аддитивная; пайплайны её игнорируют (§4.1).
+2. **`--reg` (TTY) не использовать** — веб пишет `<stem>_reg.yaml` сам (`registration.py`).
+3. **`--collection`/`--qdrant-path`/`--providers_config` для `create_index.py` передавать явно**;
+   `--providers_config` — через underscore (в `create_markdown.py` — дефис: `--providers-config`).
+4. **Импорт-тайм `providers.yaml`**: `create_index.py:53` и `search.py:38` грузят `firmware/src/providers.yaml`
+   при импорте → на проде нужен симлинк на `<config_dir>/providers.yaml` (иначе падение при старте).
+5. **Qdrant-замок**: не держать `QdrantClient` открытым между запросами.
+6. **QAGraph на WebSocket-сессию**, не глобальный синглтон.
+7. **`BASE_MARKDOWN`** в `qa_graph.py` захардкожен — не менять.
+8. **Токенизатор HF** скачивается при первом `--rag`; на LXC нужен доступ к HF или предзагруженный кэш
+   (`HF_HOME`).
+9. **Vision-роль** `create_markdown.registration_vision` — новая, аддитивная; пайплайны её игнорируют.
+10. **Не `git restore/checkout/stash` конфигов** — на dev есть незакоммиченные правки пользователя
+    (`config.yaml` модифицирован).
+11. **Дефис vs underscore в флагах**: `create_markdown.py` — `--providers-config`; `create_index.py` и
+    `qa_graph.py` — `--providers_config`.
