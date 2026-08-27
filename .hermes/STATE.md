@@ -5,36 +5,42 @@
 
 # Project State — interface_RAG
 
-_Last updated: 2026-08-27 — by: orchestrator — task: реворк после приёмки (единый конфиг + UI)_
+_Last updated: 2026-08-27 — by: orchestrator — task: реворк после приёмки завершён и задеплоен_
 
 ## Working functionality
 
 - Веб-оркестратор (FastAPI + vanilla JS) поверх Create_Markdown_YA и
   Build_Search_index: upload → регистрация → convert → index (SSE-логи, Stop),
   WS-чат с цитатами и картинками, настройки провайдеров/ролей/.env.
-- Развёрнут на LXC `192.0.2.21:80` (systemd `interface-rag.service`, prod,
-  write_enabled). Доступ к проду: `sshpass -p root ssh root@192.0.2.21`.
+- Реворк после приёмки (решения 10–19) реализован: два независимых PASS-ревью,
+  33 теста passed, задеплоен на LXC. Шапка/фавикон/подзаголовок; регистрация —
+  статичная форма со всеми полями и комментариями; MD-вьювер; настройки —
+  единая «Сохранить» + «Обновить модели» (реальный опрос провайдеров), fallback
+  по чекбоксу, пояснения ролей, параметры графа, ключи маскированы, без дампов.
+- Единый общий конфиг: dev `/root/projects/interface_RAG/config`, prod
+  `/root/RAG/config` (`providers.yaml`, `create_markdown_config.yaml`,
+  `search_config.yaml`, `.env`). Пишет только интерфейс; пайплайнам передаётся
+  CLI-ключами (`--providers-config` CMY, `--providers_config` BSI) + инжект
+  `.env` в subprocess. На проде симлинк BSI `providers.yaml → /root/RAG/config/`
+  (импорт-тайм загрузка в Build_Search_index).
+- Прод: чистая структура `/root/RAG` (пайплайны + веб + config/, без docs/tests/
+  .git/.hermes/.env в папках). Развёрнут на LXC `192.0.2.21:80` (systemd
+  `interface-rag.service`, prod, write_enabled). Доступ: `sshpass -p root ssh
+  root@192.0.2.21`.
 
-## Known issues (устранение — текущий реворк)
+## Known issues
 
-- Прод содержит полную структуру проекта (`docs/`, `tests/`, `.pytest_cache/`) —
-  нужны только пайплайны + веб + общие конфиги.
-- `providers.yaml` продублирован в обоих пайплайнах, `.env` — в 4 местах; нужен
-  единый общий конфиг, передаваемый пайплайнам CLI-ключами.
-- UI: нет фавиконки/названия/подзаголовка; регистрация — disabled-кнопки без
-  формы с комментариями; нет MD-вьювера; настройки показывают сырые дампы
-  конфигов, 5 кнопок «Сохранить», fallback без чекбокса, нет пояснений ролей,
-  нет параметров графа, «Обновить» не опрашивает провайдеров.
+- (нет — реворк закрыл предыдущие)
 
 ## In progress
 
-- Реворк: architect (`t_1247387a`) → coder фаза 1 конфиг/деплой (`t_7ee33160`)
-  → coder фаза 2 UI (`t_14fb20d5`) → reviewer (`t_a88ac826`).
+- (нет активных задач)
 
 ## Planned / backlog
 
-- Передеплой на LXC после PASS (реальный деплой выполняет оркестратор).
-- Smoke-тест на реальных данных после передеплоя.
+- Полный e2e на проде на реальном PDF (upload → convert → index → вопрос в чате)
+  — пишет в боевой Qdrant; выполняется по явному запросу пользователя.
+- Прибрать orphan uvicorn на dev (порты 8099/8081) при следующем деплое.
 
 ## Recent decisions
 
@@ -42,5 +48,9 @@ _Last updated: 2026-08-27 — by: orchestrator — task: реворк после
   wizard), единый «Сохранить» + «Обновить», fallback по чекбоксу, пояснения
   ролей, параметры графа, без дампов конфигов, фавикон/шапка, MD-вьювер,
   чистая структура прода, единый общий конфиг через CLI-ключи.
+- Единый конфиг — один каталог, пишет только интерфейс; эталон `providers.yaml`
+  — remote BSI (чтобы 222 модели из теста «Обновить» не утекли на прод).
+- Секреты в git: `.gitignore` = `config/.env`, `*.bak`, `uploads/`; перед
+  коммитом контролируется отсутствие `.env`/`.bak`.
 
 Полные требования — `docs/product/requirements.md`; решения — `docs/product/decision-log.md`.
