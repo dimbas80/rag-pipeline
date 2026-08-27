@@ -18,6 +18,13 @@ try:
 except ImportError:  # pragma: no cover - direct `uvicorn app:app` from firmware/src
     from config_ui import read_env_raw
 
+# Fallback-текст для пустого/пробельного ответа графа (решение 33). НЕ импортируем
+# константу из qa_graph — это другая репа; текст продублирован намеренно.
+_EMPTY_ANSWER_FALLBACK = (
+    "К сожалению, не удалось сформулировать ответ по вашему запросу. "
+    "Попробуйте переформулировать вопрос или уточнить номер документа."
+)
+
 
 def _pipeline_paths(cfg: DeployConfig) -> None:
     root = cfg.build_search_index_dir
@@ -80,6 +87,12 @@ class ChatSession:
         answer = result.get("final_answer")
         if answer is None:
             return {"type": "error", "text": "Граф не вернул ответ"}
+        if not str(answer).strip():
+            # Пустой/пробельный answer (решение 33): fallback-текст обычным пузырём,
+            # НЕ error и НЕ пустой пузырь. Покрывает и resume-путь, где пустой ответ
+            # может прийти, минуя guard в generate_answer.
+            return {"type": "answer", "answer": _EMPTY_ANSWER_FALLBACK,
+                    "cited_chunk_ids": [], "sources": [], "images": []}
         cited = result.get("cited_chunk_ids") or []
         images = select_images(result.get("search_results") or [], "", str(answer), cited, self.cfg.base_markdown)
         return {

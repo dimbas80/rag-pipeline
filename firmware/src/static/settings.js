@@ -55,11 +55,12 @@
     generate_answer: "Формирование ответа: генерация итогового ответа с цитатами по найденным фрагментам."
   };
 
-  // Канонические ключи .env (секция «Yandex OCR» и «Прочие ключи»).
+  // Канонические ключи .env (секции «Yandex OCR» и «Телеграм»).
   var KNOWN_ENV = [
     { key: "YANDEX_API_KEY", label: "Yandex API ключ", section: "yandex" },
     { key: "YANDEX_FOLDER_ID", label: "Yandex Folder ID", section: "yandex" },
-    { key: "TELEGRAM_BOT_TOKEN", label: "Telegram Bot Token", section: "other" }
+    { key: "TELEGRAM_BOT_TOKEN", label: "Telegram Bot Token", section: "telegram" },
+    { key: "TELEGRAM_ALLOWED_USERS", label: "Допустимые чаты (ID через запятую)", section: "telegram" }
   ];
 
   // Сайдбар настроек (решение №27): разделы и порядок в меню.
@@ -67,7 +68,7 @@
     { id: "providers", label: "Провайдеры и роли" },
     { id: "yandex", label: "Yandex OCR" },
     { id: "provider-keys", label: "Ключи API провайдеров" },
-    { id: "other-keys", label: "Прочие ключи" },
+    { id: "telegram", label: "Телеграм" },
     { id: "graph", label: "Параметры графа" },
     { id: "qdrant", label: "Папка Qdrant" }
   ];
@@ -161,7 +162,7 @@
           sectionHtml("providers", renderProvidersCard()) +
           sectionHtml("yandex", renderYandexCard()) +
           sectionHtml("provider-keys", renderProviderKeysCard()) +
-          sectionHtml("other-keys", renderOtherKeysCard()) +
+          sectionHtml("telegram", renderOtherKeysCard()) +
           sectionHtml("graph", renderGraphCard()) +
           sectionHtml("qdrant", renderQdrantCard()) +
           '<div id="refresh-results" hidden></div>' +
@@ -291,10 +292,11 @@
   }
 
   function renderOtherKeysCard() {
-    var otherRows = KNOWN_ENV.filter(function (item) { return item.section === "other"; })
+    var otherRows = KNOWN_ENV.filter(function (item) { return item.section === "telegram"; })
       .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
-    return '<section class="settings-card"><h3>Прочие ключи</h3>' +
-      '<div class="env-grid">' + (otherRows || '<div class="muted small">Прочие ключи не настроены.</div>') +
+    return '<section class="settings-card"><h3>Телеграм</h3>' +
+      '<p class="muted">Настройки Телеграм-бота (interface-rag-bot.service). Изменения применяются после перезапуска бота: systemctl restart interface-rag-bot.service (не hot-apply).</p>' +
+      '<div class="env-grid">' + (otherRows || '<div class="muted small">Телеграм-ключи не настроены.</div>') +
       "</div></section>";
   }
 

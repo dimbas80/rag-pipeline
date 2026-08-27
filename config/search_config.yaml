@@ -10,4 +10,4 @@ nodes:
     max_tokens: 512
   generate_answer:
     temperature: 0
-    max_tokens: 2048
+    max_tokens: 4096

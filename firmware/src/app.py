@@ -79,7 +79,8 @@ def index():
 @app.post("/api/documents")
 async def upload(file: UploadFile = File(...)):
     name = Path(file.filename or "").name
-    if name != file.filename or Path(name).suffix.lower() not in {".pdf", ".docx", ".doc", ".md"}:
+    suffix = Path(name).suffix.lower()
+    if name != file.filename or suffix not in {".pdf", ".docx", ".doc", ".md"}:
         raise HTTPException(400, "Недопустимый файл")
     if len(name) > 255:
         raise HTTPException(400, "Слишком длинное имя")
@@ -87,13 +88,25 @@ async def upload(file: UploadFile = File(...)):
     data = await file.read(limit + 1)
     if len(data) > limit:
         raise HTTPException(413, "Файл превышает допустимый размер")
-    fs_perms.ensure_dir(cfg.upload_base_dir)
-    target = cfg.upload_base_dir / name
-    fs_perms.write_bytes(target, data, 0o666)  # файлы базы — 0666 (решение №22)
-    sid, stem = uuid.uuid4().hex, Path(name).stem
-    sessions[sid] = {"session_id": sid, "name": name, "stem": stem, "source": target,
-                     "reg": cfg.base_markdown / stem / f"{stem}_reg.yaml",
-                     "md": cfg.base_markdown / stem / f"{stem}.md"}
+    stem = Path(name).stem
+    md_path = cfg.base_markdown / stem / f"{stem}.md"
+    if suffix == ".md":
+        # Решение 39: .md кладём сразу в канонический Markdown/<stem>/<stem>.md,
+        # НЕ в корень upload_base_dir (не оставляем <stem>.md/<stem>_ai.md в корне базы).
+        # Если файл уже в базе — НЕ пересохраняем (переиндексация существующего).
+        if md_path.exists():
+            source = md_path          # существующий .md — индексируем его как есть
+        else:
+            fs_perms.ensure_dir(md_path.parent)          # 0777 (решение №22)
+            fs_perms.write_bytes(md_path, data, 0o666)   # 0666 (решение №22)
+            source = md_path
+    else:
+        fs_perms.ensure_dir(cfg.upload_base_dir)
+        source = cfg.upload_base_dir / name
+        fs_perms.write_bytes(source, data, 0o666)  # файлы базы — 0666 (решение №22)
+    sid = uuid.uuid4().hex
+    sessions[sid] = {"session_id": sid, "name": name, "stem": stem, "source": source,
+                     "reg": cfg.base_markdown / stem / f"{stem}_reg.yaml", "md": md_path}
     return {"session_id": sid, "stem": stem}
 
 
@@ -143,6 +156,14 @@ def registration_prefill(sid):
 @app.post("/api/documents/{sid}/convert")
 def convert(sid):
     s = _session(sid)
+    if Path(s["name"]).suffix.lower() == ".md":
+        # Решение 39: .md уже лежит в Markdown/<stem>/<stem>.md (загружен на шаге upload).
+        # OCR/AI-постобработка не требуется; пересохранение не выполняется. Возвращаем
+        # мгновенно-завершённую job (единая инфраструктура SSE/лога), затем index.
+        return runner.start(
+            [sys.executable, "-c",
+             "print('md уже готов — конвертация не требуется (переиндексация без пересохранения)')"],
+            kind="convert").__dict__
     providers = config_ui.read_yaml(cfg.providers_path)
     env = build_env(cfg.env_file)
     missing = []

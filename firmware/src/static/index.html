@@ -89,14 +89,14 @@
             <div class="field">
               <label for="reg-document_type">Тип документа <span class="req">*</span>
                 <span class="hint" title="ГОСТ / СП / СО / СНиП / ПУЭ. Определяется по обозначению; можно выбрать вручную.">?</span></label>
-              <select id="reg-document_type" name="document_type">
-                <option value=""></option>
-                <option>ГОСТ</option>
-                <option>СП</option>
-                <option>СО</option>
-                <option>СНиП</option>
-                <option>ПУЭ</option>
-              </select>
+              <input id="reg-document_type" name="document_type" type="text" list="document-type-list" placeholder="ГОСТ / СП / СО / СНиП / ПУЭ">
+              <datalist id="document-type-list">
+                <option value="ГОСТ">
+                <option value="СП">
+                <option value="СО">
+                <option value="СНиП">
+                <option value="ПУЭ">
+              </datalist>
             </div>
 
             <div class="field">

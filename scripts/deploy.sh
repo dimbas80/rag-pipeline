@@ -158,29 +158,40 @@ EXCLUDES=(
   --exclude='.git/' --exclude='docs/' --exclude='workflows/' --exclude='.hermes/'
   --exclude='tests/' --exclude='.pytest_cache/' --exclude='README*'
   --exclude='__pycache__/' --exclude='*.pyc' --exclude='tmp/'
-  --exclude='bot.log*' --exclude='request_bot.py' --exclude='.env'
+  --exclude='bot.log*' --exclude='.env'
 )
 
 run_local "rsync interface_RAG: config.yaml → /root/RAG/interface_RAG/" \
   rsync -az -e "$RSYNC_E" "${EXCLUDES[@]}" "$DEV_ROOT/config.yaml" "root@$LXC:/root/RAG/interface_RAG/"
 run_local "rsync interface_RAG: firmware/src/ → /root/RAG/interface_RAG/firmware/" \
   rsync -az -e "$RSYNC_E" "${EXCLUDES[@]}" "$DEV_ROOT/firmware/src" "root@$LXC:/root/RAG/interface_RAG/firmware/"
-run_local "rsync Create_Markdown_YA: create_markdown.py → /root/RAG/Create_Markdown_YA/firmware/src/" \
-  rsync -az -e "$RSYNC_E" "$DEV_CMY/firmware/src/create_markdown.py" "root@$LXC:/root/RAG/Create_Markdown_YA/firmware/src/"
-run_local "rsync Build_Search_index: create_index/qa_graph/search/llm_providers → /root/RAG/Build_Search_index/firmware/src/" \
+run_local "rsync interface_RAG: firmware/__init__.py (маркер пакета) → /root/RAG/interface_RAG/firmware/" \
+  rsync -az -e "$RSYNC_E" "$DEV_ROOT/firmware/__init__.py" "root@$LXC:/root/RAG/interface_RAG/firmware/"
+run_local "rsync Create_Markdown_YA: create_markdown.py + requirements.txt → /root/RAG/Create_Markdown_YA/firmware/src/" \
+  rsync -az -e "$RSYNC_E" \
+    "$DEV_CMY/firmware/src/create_markdown.py" \
+    "$DEV_CMY/firmware/src/requirements.txt" \
+    "root@$LXC:/root/RAG/Create_Markdown_YA/firmware/src/"
+run_local "rsync Build_Search_index: create_index/qa_graph/search/llm_providers + requirements.txt → /root/RAG/Build_Search_index/firmware/src/" \
   rsync -az -e "$RSYNC_E" \
     "$DEV_BSI/firmware/src/create_index.py" \
     "$DEV_BSI/firmware/src/qa_graph.py" \
     "$DEV_BSI/firmware/src/search.py" \
     "$DEV_BSI/firmware/src/llm_providers.py" \
+    "$DEV_BSI/firmware/src/requirements.txt" \
     "root@$LXC:/root/RAG/Build_Search_index/firmware/src/"
-run_local "rsync Build_Search_index: telegram_bot/asset_helpers.py → /root/RAG/Build_Search_index/firmware/src/telegram_bot/" \
-  rsync -az -e "$RSYNC_E" "$DEV_BSI/firmware/src/telegram_bot/asset_helpers.py" "root@$LXC:/root/RAG/Build_Search_index/firmware/src/telegram_bot/"
+run_local "rsync Build_Search_index: telegram_bot/{asset_helpers,request_bot}.py → /root/RAG/Build_Search_index/firmware/src/telegram_bot/" \
+  rsync -az -e "$RSYNC_E" \
+    "$DEV_BSI/firmware/src/telegram_bot/asset_helpers.py" \
+    "$DEV_BSI/firmware/src/telegram_bot/request_bot.py" \
+    "root@$LXC:/root/RAG/Build_Search_index/firmware/src/telegram_bot/"
 
-# --- 4. Симлинк импорт-тайм providers.yaml + очистка устаревших копий конфигов ---
-say "4. Симлинк providers.yaml (импорт-тайм BSI) + очистка устаревших копий"
+# --- 4. Симлинк импорт-тайм providers.yaml/search_config.yaml + очистка устаревших копий конфигов ---
+say "4. Симлинк providers.yaml/search_config.yaml (импорт-тайм BSI) + очистка устаревших копий"
 run_remote "симлинк $CONFIG_DIR/providers.yaml → Build_Search_index/firmware/src/providers.yaml" \
   "ln -sfn $CONFIG_DIR/providers.yaml /root/RAG/Build_Search_index/firmware/src/providers.yaml"
+run_remote "симлинк $CONFIG_DIR/search_config.yaml → Build_Search_index/firmware/src/search_config.yaml" \
+  "ln -sfn $CONFIG_DIR/search_config.yaml /root/RAG/Build_Search_index/firmware/src/search_config.yaml"
 
 cat <<REMOTE | run_remote_script "очистка dev-артефактов и старых копий конфигов (после бэкапа)"
 set -e
@@ -190,23 +201,32 @@ rm -rf /root/RAG/interface_RAG/docs /root/RAG/interface_RAG/tests \
        /root/RAG/interface_RAG/.pytest_cache /root/RAG/interface_RAG/workflows \
        /root/RAG/interface_RAG/.hermes /root/RAG/interface_RAG/.gitignore \
        /root/RAG/interface_RAG/README.md \
+       /root/RAG/interface_RAG/firmware/include /root/RAG/interface_RAG/firmware/lib \
+       /root/RAG/interface_RAG/firmware/__pycache__ \
        /root/RAG/interface_RAG/firmware/src/__pycache__
 # Create_Markdown_YA: у пайплайна нет своих копий конфигов (всё через CLI-ключи)
 rm -f  /root/RAG/Create_Markdown_YA/firmware/src/.env \
        /root/RAG/Create_Markdown_YA/firmware/src/providers.yaml
 rm -rf /root/RAG/Create_Markdown_YA/firmware/src/tmp \
        /root/RAG/Create_Markdown_YA/firmware/src/__pycache__
-# Build_Search_index: остаётся симлинк providers.yaml; удаляем мусор
+# Build_Search_index: остаются симлинки providers.yaml/search_config.yaml; удаляем мусор
 rm -f  /root/RAG/Build_Search_index/firmware/src/.env
 # Корневые .env пайплайнов — legacy остатки решений 18–19 (Build_Search_index/.env
-# был источником заражения QDRANT_PATH). request_bot.py, который их читал, не
-# разворачивается (исключён из rsync) и не запущен; при будущем запуске бота ключи
-# подавать через systemd Environment=/EnvironmentFile= (отдельная задача).
+# был источником заражения QDRANT_PATH). request_bot.py разворачивается и запущен
+# как systemd-сервис interface-rag-bot.service; ключи он получает из
+# /root/RAG/config/.env (EnvironmentFile) — корневые .env больше не нужны.
 rm -f  /root/RAG/Create_Markdown_YA/.env
 rm -f  /root/RAG/Build_Search_index/.env
-rm -rf /root/RAG/Build_Search_index/firmware/src/__pycache__ \
+rm -rf /root/RAG/Build_Search_index/example /root/RAG/Build_Search_index/snapshots \
+       /root/RAG/Build_Search_index/.worktrees \
+       /root/RAG/Build_Search_index/firmware/src/__pycache__ \
        /root/RAG/Build_Search_index/firmware/src/telegram_bot/__pycache__
 rm -f  /root/RAG/Build_Search_index/firmware/src/telegram_bot/bot.log*
+# Глубокая чистка: __pycache__ любой вложенности + README*/AGENTS.md/*.gitkeep
+find /root/RAG/interface_RAG /root/RAG/Create_Markdown_YA /root/RAG/Build_Search_index \
+     -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+find /root/RAG/interface_RAG /root/RAG/Create_Markdown_YA /root/RAG/Build_Search_index \
+     \( -name '*.gitkeep' -o -name 'AGENTS.md' -o -name 'README*' \) -delete 2>/dev/null || true
 echo "CLEANED"
 REMOTE
 
@@ -214,6 +234,22 @@ REMOTE
 say "5. Рестарт systemd $SERVICE"
 run_remote "systemctl restart $SERVICE" "systemctl restart $SERVICE"
 run_remote "проверка is-active $SERVICE" "systemctl is-active $SERVICE"
+
+# --- 5.5. Телеграм-бот как systemd-сервис (решение 36) ---
+# Зависимость python-telegram-bot в общем venv (prerequisite старта бота).
+say "5.5. systemd-юнит Телеграм-бота interface-rag-bot.service"
+run_remote "установить python-telegram-bot в общий venv" \
+  "/root/RAG/venv/bin/pip install --quiet 'python-telegram-bot>=21'"
+# Юнит-шаблон из репозитория → LXC, затем install в /etc/systemd/system/.
+run_local "rsync interface_RAG: interface-rag-bot.service (шаблон юнита) → LXC /root/RAG/" \
+  rsync -az -e "$RSYNC_E" "$DEV_ROOT/scripts/interface-rag-bot.service" \
+    "root@$LXC:/root/RAG/interface-rag-bot.service"
+run_remote "установить юнит бота: cp → /etc/systemd/system/interface-rag-bot.service" \
+  "cp /root/RAG/interface-rag-bot.service /etc/systemd/system/interface-rag-bot.service && chmod 644 /etc/systemd/system/interface-rag-bot.service"
+run_remote "daemon-reload" "systemctl daemon-reload"
+run_remote "enable бота" "systemctl enable interface-rag-bot.service"
+run_remote "restart бота" "systemctl restart interface-rag-bot.service"
+run_remote "is-active бота" "systemctl is-active interface-rag-bot.service"
 
 # --- 6. Smoke-тест (цикл ожидания готовности порта) ---
 # uvicorn может стартовать дольше, чем systemd показывает is-active → ждём HTTP 200.

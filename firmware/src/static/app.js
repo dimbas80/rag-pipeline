@@ -299,7 +299,7 @@
         fillField("reg-document_id", fields.document_id);
         fillField("reg-title", fields.title);
         fillField("reg-domain", fields.domain || fields.domain_hint);
-        fillSelect("reg-document_type", fields.document_type);
+        fillInput("reg-document_type", fields.document_type);
         // Автоопределение года издания из обозначения (последняя группа цифр).
         var edition = extractEdition(fields.document_id);
         if (edition) fillField("reg-edition", edition);
@@ -373,6 +373,25 @@
     });
   }
 
+  // Заполнение input с <datalist> (решение 38): значение нормализуется по опциям
+  // datalist регистронезависимо (как fillSelect по <option>), иначе ставится как есть.
+  function fillInput(id, value) {
+    if (value == null || value === "") return;
+    var input = $(id);
+    if (!input) return;
+    var datalist = input.getAttribute("list") ? document.getElementById(input.getAttribute("list")) : null;
+    if (datalist) {
+      var lower = String(value).trim().toLowerCase();
+      for (var i = 0; i < datalist.options.length; i++) {
+        if (String(datalist.options[i].value).toLowerCase() === lower) {
+          input.value = datalist.options[i].value;
+          return;
+        }
+      }
+    }
+    input.value = String(value);
+  }
+
   function extractEdition(documentId) {
     if (!documentId) return "";
     var match = String(documentId).match(/(\d{2,4})(?!\d)/g);
@@ -389,7 +408,7 @@
     var prefixes = ["ГОСТ", "СНиП", "ПУЭ", "СП", "СО"];
     for (var i = 0; i < prefixes.length; i++) {
       if (text.indexOf(prefixes[i]) === 0) {
-        fillSelect("reg-document_type", prefixes[i]);
+        fillInput("reg-document_type", prefixes[i]);
         return;
       }
     }

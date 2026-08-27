@@ -53,6 +53,9 @@ def _fake_cfg(tmp_path):
         search_config_path = tmp_path / "search_config.yaml"
         create_markdown_dir = tmp_path / "cm"
         build_search_index_dir = tmp_path / "bsi"
+        upload_base_dir = tmp_path / "upload"
+        upload_max_mb = 500
+        base_markdown = tmp_path / "Markdown"
         qdrant_path_default = tmp_path / "qdrant_data"
         collection = "technical_standard"
         write_enabled = True
@@ -85,7 +88,7 @@ def test_convert_argv_uses_config_dir(monkeypatch, tmp_path):
     cfg = _fake_cfg(tmp_path)
     cfg.env_file.write_text("K=v\n", encoding="utf-8")
     monkeypatch.setattr(app, "cfg", cfg)
-    monkeypatch.setattr(app, "_session", lambda sid: {"source": tmp_path / "doc.pdf"})
+    monkeypatch.setattr(app, "_session", lambda sid: {"name": "doc.pdf", "source": tmp_path / "doc.pdf"})
     monkeypatch.setattr(app.config_ui, "read_yaml", lambda _: _fake_providers())
     captured = {}
     def fake_start(argv, cwd=None, env=None, kind="convert"):
@@ -292,3 +295,72 @@ def test_put_qdrant_settings_normalizes_dotdot_path(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert app.config_ui.read_env_raw(tmp_path / ".env")["QDRANT_PATH"] == str(Path("/etc"))
     assert response.json()["path"] == str(Path("/etc"))
+
+
+# --- решение 39: .md → канонический Markdown/<stem>/<stem>.md при upload ---
+
+def test_upload_md_places_into_canonical_markdown(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.post("/api/documents",
+                           files={"file": ("ГОСТ 1.md", b"# content", "text/markdown")})
+    assert response.status_code == 200
+    session = app.sessions[response.json()["session_id"]]
+    canonical = tmp_path / "Markdown" / "ГОСТ 1" / "ГОСТ 1.md"
+    assert session["source"] == canonical
+    assert session["md"] == canonical
+    assert canonical.is_file()
+    assert canonical.read_bytes() == b"# content"
+    # в корне upload_base_dir файл НЕ остаётся (не <stem>.md и не <stem>_ai.md)
+    assert not (tmp_path / "upload" / "ГОСТ 1.md").exists()
+
+
+def test_upload_md_does_not_overwrite_existing(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    canonical = tmp_path / "Markdown" / "doc" / "doc.md"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_text("OLD CONTENT", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.post("/api/documents",
+                           files={"file": ("doc.md", b"NEW CONTENT", "text/markdown")})
+    assert response.status_code == 200
+    assert canonical.read_text(encoding="utf-8") == "OLD CONTENT"  # переиндексация без пересохранения
+    session = app.sessions[response.json()["session_id"]]
+    assert session["source"] == canonical
+
+
+def test_upload_pdf_still_uses_upload_base_dir(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.post("/api/documents",
+                           files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")})
+    assert response.status_code == 200
+    session = app.sessions[response.json()["session_id"]]
+    target = tmp_path / "upload" / "doc.pdf"
+    assert session["source"] == target
+    assert target.is_file()
+    assert session["md"] == tmp_path / "Markdown" / "doc" / "doc.md"  # канон для index
+
+
+def test_convert_md_is_noop_instant_job(monkeypatch, tmp_path):
+    import sys
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    monkeypatch.setattr(app, "_session", lambda sid: {"name": "doc.md"})
+    def boom(*a, **k):
+        raise AssertionError("read_yaml не должен вызываться для .md (проверка провайдеров пропускается)")
+    monkeypatch.setattr(app.config_ui, "read_yaml", boom)
+    captured = {}
+    def fake_start(argv, cwd=None, env=None, kind="convert"):
+        captured["argv"] = list(argv)
+        captured["kind"] = kind
+        return type("J", (), {"__dict__": {"id": "j-md"}})()
+    monkeypatch.setattr(app.runner, "start", fake_start)
+    result = app.convert("x")
+    assert result["id"] == "j-md"
+    assert captured["kind"] == "convert"
+    assert captured["argv"][0] == sys.executable
+    assert "-c" in captured["argv"]  # мгновенно-завершённая job без OCR/AI

@@ -2,6 +2,7 @@ import os
 from firmware.src.chat_api import select_images
 from firmware.src.chat_api import ChatSession
 from firmware.src.chat_api import _inject_env_file
+from firmware.src.chat_api import _EMPTY_ANSWER_FALLBACK
 
 def test_select_images_returns_urls(monkeypatch, tmp_path):
     import sys, types
@@ -94,3 +95,32 @@ def test_inject_env_file_preserves_unrelated_env(tmp_path, monkeypatch):
 
 def test_inject_env_file_missing_file_noop(tmp_path):
     _inject_env_file(tmp_path / "does_not_exist.env")   # не должно падать
+
+
+# --- пустой/пробельный answer → fallback-текст (решение 33) ---
+
+def test_format_empty_answer_returns_fallback_bubble(monkeypatch, tmp_path):
+    session = _format_session(tmp_path)
+    monkeypatch.setattr("firmware.src.chat_api.select_images", lambda *args: [])
+    result = session._format({"final_answer": "", "cited_chunk_ids": ["c1"],
+                              "search_results": [{"chunk_id": "c1"}]})
+    assert result["type"] == "answer"                      # НЕ error, НЕ пустой пузырь
+    assert result["answer"] == _EMPTY_ANSWER_FALLBACK
+    assert result["cited_chunk_ids"] == []
+    assert result["sources"] == []
+    assert result["images"] == []
+
+def test_format_whitespace_answer_returns_fallback_bubble(monkeypatch, tmp_path):
+    session = _format_session(tmp_path)
+    monkeypatch.setattr("firmware.src.chat_api.select_images", lambda *args: [])
+    result = session._format({"final_answer": "   \n\t ", "cited_chunk_ids": [],
+                              "search_results": []})
+    assert result["type"] == "answer"
+    assert result["answer"] == _EMPTY_ANSWER_FALLBACK
+
+def test_format_non_string_answer_guard_does_not_crash(monkeypatch, tmp_path):
+    # str(answer).strip() — безопасен и для нестроковых значений (если граф отдаст None — уже error).
+    session = _format_session(tmp_path)
+    monkeypatch.setattr("firmware.src.chat_api.select_images", lambda *args: [])
+    result = session._format({"final_answer": None, "cited_chunk_ids": [], "search_results": []})
+    assert result["type"] == "error"                       # None по-прежнему error (как было)
