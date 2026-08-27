@@ -1,41 +1,39 @@
 <!--
   STATE.md — current snapshot of this project's state.
-  Git-tracked. History of changes/decisions lives in `git log -- STATE.md`,
-  not inline in this file — keep this file a SNAPSHOT, not a changelog.
-  When something here changes, overwrite the relevant section and commit;
-  don't append a dated entry and leave the old one below it.
+  Git-tracked. History lives in `git log -- .hermes/STATE.md`, not inline.
 -->
 
-# Project State
+# Project State — interface_RAG
 
-_Last updated: YYYY-MM-DD — by: <profile> — task: <task_id or "-">_
+_Last updated: 2026-08-27 — by: orchestrator — task: — (requirements stage)_
 
 ## Working functionality
 
-<!-- What currently works, verified. Not aspirational. -->
-- ...
+- (ничего — проект на этапе требований, реализация не начата)
 
 ## Known issues
 
-<!-- Confirmed problems, not yet fixed. One line each: what's wrong,
-     where, how it was found. Link to a workflow task if one exists. -->
-- **[symptom]** — location: `path:line` or component — found via: user
-  report / review / test — task: `workflows/{task_id}/` (if any)
+- (нет)
 
 ## In progress
 
-<!-- What's actively being worked on right now, and by which task. -->
-- `{task_id}` — assignee: `<profile>` — objective: ...
+- (нет)
 
 ## Planned / backlog
 
-<!-- Known next work, not yet started. Not a full backlog dump —
-     just enough for the Orchestrator to plan the next delegation. -->
-- ...
+- Discovery/architecture: схема `<stem>_reg.yaml`, публичный интерфейс `qa_graph.py`,
+  определение capabilities моделей при «добавить провайдера».
+- Architect → Coder → Reviewer (web-ui поверх CLI обоих пайплайнов).
+- Деплой на LXC `192.0.2.21` (порт 80, systemd, smoke-тест).
 
 ## Recent decisions
 
-<!-- Only decisions that change how future work should be done
-     (architecture choices, rejected approaches, policy changes).
-     Not a log of completed tasks — that's what git history is for. -->
-- ...
+- Имя проекта `interface_RAG`; пайплайны не сливаем — тонкий веб-оркестратор.
+- Прод LXC `192.0.2.21:80`, без авторизации; запись в Qdrant — только прод.
+- «Добавить документ» — wizard по шагам; «Добавить в базу» только при `.md` +
+  `<stem>_reg.yaml`.
+- Добавление провайдера → сканирование моделей + теги в `providers.yaml`.
+- Основная чат-модель = дефолт для `ai_postprocess` и `query_processing` синхронно.
+- «Показать документы в базе» — distinct-метаданные из Qdrant.
+
+Полные требования — `docs/product/requirements.md`; решения — `docs/product/decision-log.md`.
