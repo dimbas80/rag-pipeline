@@ -15,7 +15,11 @@
     currentJob: null,
     eventSource: null,
     rolesConfigured: false,
-    ws: null
+    ws: null,
+    chat: {
+      awaitingClarification: false,
+      history: [] // [{role: "user"|"assistant", text, images?, sources?}]
+    }
   };
 
   /* ---------- утилиты ---------- */
@@ -75,7 +79,7 @@
     });
   });
 
-  /* ---------- чат ---------- */
+  /* ---------- чат (одно окно, единственный ввод внизу — решение №25) ---------- */
   var pendingQuery = null;
 
   function chatSend(type, text) {
@@ -84,6 +88,44 @@
       return;
     }
     state.ws.send(JSON.stringify({ type: type, text: text }));
+  }
+
+  function scrollChat() {
+    var box = $("chat-messages");
+    if (box) box.scrollTop = box.scrollHeight;
+  }
+
+  function addBubble(role, text, extras) {
+    var wrap = document.createElement("div");
+    wrap.className = "chat-bubble " + role;
+    var textEl = document.createElement("div");
+    textEl.className = "chat-bubble-text";
+    textEl.textContent = text || "";
+    wrap.appendChild(textEl);
+    if (extras) {
+      if (extras.images && extras.images.length) {
+        var imagesBox = document.createElement("div");
+        imagesBox.className = "chat-bubble-images";
+        extras.images.forEach(function (image) {
+          var img = document.createElement("img");
+          img.src = image.url;
+          img.alt = image.caption || "Изображение";
+          imagesBox.appendChild(img);
+        });
+        wrap.appendChild(imagesBox);
+      }
+      if (extras.sources && extras.sources.length) {
+        var sourcesBox = document.createElement("div");
+        sourcesBox.className = "chat-bubble-sources";
+        sourcesBox.textContent = "Источники: " + extras.sources
+          .map(function (s) { return s.title || s.document_id || s.chunk_id; })
+          .filter(Boolean).slice(0, 5).join("; ");
+        wrap.appendChild(sourcesBox);
+      }
+    }
+    $("chat-messages").appendChild(wrap);
+    scrollChat();
+    return wrap;
   }
 
   function openChat() {
@@ -97,32 +139,20 @@
     };
     state.ws.onmessage = function (event) {
       var message = JSON.parse(event.data);
-      var answer = $("answer");
       if (message.type === "answer") {
-        answer.textContent = message.answer || "";
-        (message.images || []).forEach(function (image) {
-          var img = document.createElement("img");
-          img.src = image.url;
-          img.alt = image.caption || "Изображение";
-          answer.appendChild(img);
+        addBubble("assistant", message.answer || "", {
+          images: message.images || [],
+          sources: message.sources || []
         });
-        if (message.sources && message.sources.length) {
-          var wrap = document.createElement("div");
-          wrap.className = "answer-source";
-          wrap.textContent = "Источники: " + message.sources
-            .map(function (s) { return s.title || s.document_id || s.chunk_id; })
-            .filter(Boolean).slice(0, 5).join("; ");
-          answer.appendChild(wrap);
-        }
-        $("reply-row").hidden = true;
+        state.chat.awaitingClarification = false;
         setStatus("chat-status", "", "");
       } else if (message.type === "clarification") {
-        answer.textContent = "Уточняющий вопрос: " + (message.text || "");
-        $("reply-row").hidden = false;
-        $("reply-input").focus();
+        addBubble("assistant", "Уточняющий вопрос: " + (message.text || ""));
+        state.chat.awaitingClarification = true;
+        $("chat-input").focus();
       } else if (message.type === "error") {
-        answer.textContent = "Ошибка: " + (message.text || message);
-        $("reply-row").hidden = true;
+        addBubble("assistant", "Ошибка: " + (message.text || message));
+        state.chat.awaitingClarification = false;
         setStatus("chat-status", "", "");
       } else if (message.type === "node") {
         setStatus("chat-status", "Обрабатывается узел: " + message.node, "");
@@ -130,26 +160,24 @@
     };
   }
 
-  $("ask").addEventListener("click", function () {
-    var query = $("query").value.trim();
-    if (!query) return;
-    $("answer").textContent = "Думаю…";
-    if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
-      pendingQuery = query;
-      openChat();
-    } else {
-      chatSend("query", query);
-    }
-  });
-
-  $("reply-send").addEventListener("click", function () {
-    var text = $("reply-input").value.trim();
+  function sendChat() {
+    var input = $("chat-input");
+    var text = input.value.trim();
     if (!text) return;
-    chatSend("reply", text);
-    $("reply-input").value = "";
-  });
-  $("reply-input").addEventListener("keydown", function (event) {
-    if (event.key === "Enter") $("reply-send").click();
+    // Один ввод: при ожидании уточняющего ответа отправляем reply, иначе query.
+    var type = state.chat.awaitingClarification ? "reply" : "query";
+    addBubble("user", text);
+    input.value = "";
+    if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {
+      if (type === "query") { pendingQuery = text; openChat(); }
+    } else {
+      chatSend(type, text);
+    }
+  }
+
+  $("chat-send").addEventListener("click", sendChat);
+  $("chat-input").addEventListener("keydown", function (event) {
+    if (event.key === "Enter") sendChat();
   });
 
   $("show-docs").addEventListener("click", async function () {
@@ -243,7 +271,7 @@
       state.sid = result.session_id;
       state.stem = result.stem;
       fillField("reg-source_file", file.name);
-      setStatus("doc-status", "Файл загружен. Распознаю первую страницу для автозаполнения формы…");
+      setStatus("doc-status", "Файл загружен. Заполняю форму регистрации…");
       await prefillRegistration();
       state.rolesConfigured = await rolesReady();
       await updateGates();
@@ -261,22 +289,69 @@
     try {
       var result = await api("/api/documents/" + state.sid + "/register/prefill", { method: "POST" });
       var fields = result.fields || {};
-      fillField("reg-document_id", fields.document_id);
-      fillField("reg-title", fields.title);
-      fillField("reg-domain", fields.domain || fields.domain_hint);
-      fillSelect("reg-document_type", fields.document_type);
-      // Автоопределение года издания из обозначения (последняя группа цифр).
-      var edition = extractEdition(fields.document_id);
-      if (edition) fillField("reg-edition", edition);
-      if (!$("reg-document_type").value) deriveTypeFromId();
-      if (!result.image_available) {
-        setStatus("reg-status", "Распознать первую страницу не удалось — заполните форму вручную.", "warn");
+      if (result.source === "reg_yaml") {
+        // Существующий <stem>_reg.yaml: восстановить ВСЕ поля (решение №28, без OCR).
+        fillAllRegistrationFields(fields);
       } else {
-        setStatus("reg-status", "Распознанные поля заполнены — проверьте и отредактируйте.", "ok");
+        // Vision-prefill: только распознанные поля.
+        fillField("reg-document_id", fields.document_id);
+        fillField("reg-title", fields.title);
+        fillField("reg-domain", fields.domain || fields.domain_hint);
+        fillSelect("reg-document_type", fields.document_type);
+        // Автоопределение года издания из обозначения (последняя группа цифр).
+        var edition = extractEdition(fields.document_id);
+        if (edition) fillField("reg-edition", edition);
+        if (!$("reg-document_type").value) deriveTypeFromId();
+      }
+      if (result.source === "reg_yaml") {
+        setStatus("reg-feedback", "Поля восстановлены из существующей регистрации (_reg.yaml) — проверьте и при необходимости отредактируйте.", "ok");
+      } else if (!result.image_available) {
+        setStatus("reg-feedback", "Распознать первую страницу не удалось — заполните форму вручную.", "warn");
+      } else {
+        setStatus("reg-feedback", "Распознанные поля заполнены — проверьте и отредактируйте.", "ok");
       }
     } catch (error) {
-      setStatus("reg-status", "Распознавание недоступно (" + error.message + ") — заполните вручную.", "warn");
+      setStatus("reg-feedback", "Автозаполнение недоступно (" + error.message + ") — заполните вручную.", "warn");
     }
+  }
+
+  // Маппинг полей формы ↔ ключей записи _reg.yaml (архитектура §10.2).
+  var REG_FIELD_MAP = {
+    "reg-document_id": "document_id",
+    "reg-document_id_alt": "document_id_alt",
+    "reg-document_type": "document_type",
+    "reg-domain": "domain",
+    "reg-title": "title",
+    "reg-edition": "edition",
+    "reg-date_enacted": "date_enacted",
+    "reg-date_amended": "date_amended",
+    "reg-amended_by": "amended_by",
+    "reg-status": "status",
+    "reg-status_reason": "status_reason",
+    "reg-replaced_by_document_id": "replaced_by_document_id",
+    "reg-replaced_by_doc_key": "replaced_by_doc_key",
+    "reg-ignore_sections": "ignore_sections"
+    // source_file не восстанавливается: поле readonly и отражает фактически
+    // загруженный файл (backend всё равно перезаписывает его при регистрации).
+  };
+
+  function fillAllRegistrationFields(fields) {
+    Object.keys(REG_FIELD_MAP).forEach(function (id) {
+      var key = REG_FIELD_MAP[id];
+      var value = fields[key];
+      if (id === "reg-ignore_sections") {
+        value = Array.isArray(value) ? value.join(", ") : (value == null ? "" : value);
+      } else if (id === "reg-status") {
+        fillSelect(id, value || "active");
+        return;
+      } else if ((id === "reg-date_enacted" || id === "reg-date_amended") && typeof value === "string") {
+        // input[type=date] требует ГГГГ-ММ-ДД; из YAML может прийти datetime.
+        var dateMatch = value.match(/^(\d{4}-\d{2}-\d{2})/);
+        if (dateMatch) value = dateMatch[1];
+      }
+      var input = $(id);
+      if (input) input.value = value == null ? "" : String(value);
+    });
   }
 
   function fillField(id, value) {
@@ -353,24 +428,22 @@
     var fields = collectRegistrationFields();
     var missing = validateRegistration(fields);
     if (missing.length) {
-      setStatus("reg-status", "Заполните обязательные поля: " + missing.join(", ") + ".", "err");
+      setStatus("reg-feedback", "Заполните обязательные поля: " + missing.join(", ") + ".", "err");
       return;
     }
     $("register").disabled = true;
-    setStatus("reg-status", "Сохраняю регистрацию…");
+    setStatus("reg-feedback", "Сохраняю регистрацию…");
     try {
       var result = await api("/api/documents/" + state.sid + "/register", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fields: fields })
       });
-      setStatus("reg-status", "Документ зарегистрирован: " + result.slug + " ✓", "ok");
+      // Решение №21: сообщение об успехе регистрации — только возле кнопки.
+      setStatus("reg-feedback", "Документ зарегистрирован: " + result.slug + " ✓", "ok");
       await updateGates();
-      if (!$("convert").disabled) {
-        setStatus("doc-status", "Регистрация завершена. Можно конвертировать в Markdown.", "ok");
-      }
     } catch (error) {
-      setStatus("reg-status", "Ошибка регистрации: " + error.message, "err");
+      setStatus("reg-feedback", "Ошибка регистрации: " + error.message, "err");
       $("register").disabled = false;
     }
   });

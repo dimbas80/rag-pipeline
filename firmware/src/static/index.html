@@ -36,21 +36,17 @@
           <h2>Чат по базе ГОСТ</h2>
           <p class="muted">Вопрос на естественном языке — ответ с цитатами и иллюстрациями из документов.</p>
         </div>
-        <textarea id="query" placeholder="Введите вопрос, например: «Допустимые токовые нагрузки для кабелей с медными жилами»"></textarea>
-        <div class="chat-actions">
-          <button id="ask" class="btn primary">Спросить</button>
-          <button id="show-docs" class="btn">Показать документы в базе</button>
-          <span id="chat-status" class="status-line"></span>
+        <div id="chat-messages" class="chat-messages"></div>
+        <div class="chat-input-row">
+          <input id="chat-input" type="text" placeholder="Введите вопрос…" autocomplete="off">
+          <button id="chat-send" class="btn primary">Отправить</button>
         </div>
-        <div id="answer"></div>
-        <div id="reply-row" class="reply-row" hidden>
-          <input id="reply-input" placeholder="Ответ на уточняющий вопрос…">
-          <button id="reply-send" class="btn primary">Отправить</button>
-        </div>
+        <span id="chat-status" class="status-line"></span>
       </div>
       <aside class="chat-side">
         <div class="card">
           <h4>Документы в базе</h4>
+          <button id="show-docs" class="btn">Показать документы в базе</button>
           <div id="base-docs" class="muted small">Нажмите «Показать документы в базе».</div>
         </div>
       </aside>
@@ -155,8 +151,8 @@
               <label for="reg-status">Статус
                 <span class="hint" title="active — документ действует; inactive — не действует. При inactive заполняются поля ниже.">?</span></label>
               <select id="reg-status" name="status">
-                <option value="active">active — действует</option>
-                <option value="inactive">inactive — не действует</option>
+                <option value="active">активный</option>
+                <option value="inactive">не активный</option>
               </select>
             </div>
 
@@ -181,13 +177,13 @@
             <div class="field field-wide">
               <label for="reg-ignore_sections">Игнорируемые разделы
                 <span class="hint" title="Разделы, исключаемые из индексации (через запятую). По умолчанию: Предисловие, Содержание.">?</span></label>
-              <input id="reg-ignore_sections" name="ignore_sections" type="text" placeholder="ignore_sections (через запятую)">
+              <input id="reg-ignore_sections" name="ignore_sections" type="text" value="Предисловие, Содержание" placeholder="ignore_sections (через запятую)">
             </div>
 
           </div>
           <div class="form-actions">
             <button id="register" type="button" class="btn primary" disabled>Зарегистрировать документ</button>
-            <span id="reg-status" class="status-line"></span>
+            <span id="reg-feedback" class="status-line"></span>
           </div>
         </form>
       </div>

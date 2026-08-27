@@ -62,11 +62,24 @@
     { key: "TELEGRAM_BOT_TOKEN", label: "Telegram Bot Token", section: "other" }
   ];
 
+  // Сайдбар настроек (решение №27): разделы и порядок в меню.
+  var NAV_SECTIONS = [
+    { id: "providers", label: "Провайдеры и роли" },
+    { id: "yandex", label: "Yandex OCR" },
+    { id: "provider-keys", label: "Ключи API провайдеров" },
+    { id: "other-keys", label: "Прочие ключи" },
+    { id: "graph", label: "Параметры графа" },
+    { id: "qdrant", label: "Папка Qdrant" }
+  ];
+
   var state = {
     providers: { providers: {}, roles: {} },
     env: {},
     search: { nodes: {} },
     status: {},
+    qdrant: { path: "", default: "", overridden: false },
+    activeSection: "providers",
+    qdrantReset: false,
     loaded: false,
     busy: false
   };
@@ -95,12 +108,15 @@
         api("/api/settings/providers"),
         api("/api/settings/env"),
         api("/api/settings/search-config"),
-        api("/api/settings/status")
+        api("/api/settings/status"),
+        api("/api/settings/qdrant")
       ]);
       state.providers = results[0] || { providers: {}, roles: {} };
       state.env = results[1] || {};
       state.search = results[2] || { nodes: {} };
       state.status = results[3] || {};
+      state.qdrant = results[4] || { path: "", default: "", overridden: false };
+      state.qdrantReset = false;
       state.loaded = true;
       render();
     } catch (error) {
@@ -114,10 +130,15 @@
   }
 
   /* ---------- рендер ---------- */
+  function sectionHtml(id, inner) {
+    return '<div class="settings-section" data-section="' + id + '"' +
+      (id === state.activeSection ? "" : " hidden") + ">" + inner + "</div>";
+  }
+
   function render() {
     var root = $("settings-root");
     if (!root) return;
-    root.innerHTML =
+    var html =
       '<div class="settings-toolbar">' +
         '<button id="settings-save" class="btn primary">Сохранить</button>' +
         '<button id="settings-refresh" class="btn">Обновить модели</button>' +
@@ -128,15 +149,50 @@
         '<span class="badge ' + (state.status.write_enabled ? "ok" : "warn") + '">Qdrant запись: ' +
           (state.status.write_enabled ? "разрешена" : "запрещена (dev)") + '</span>' +
       "</div>" +
-      renderProvidersCard() +
-      renderEnvCard() +
-      renderGraphCard() +
-      '<div id="refresh-results" hidden></div>';
+      '<div class="settings-layout">' +
+        '<nav class="settings-nav">' +
+          NAV_SECTIONS.map(function (section) {
+            return '<button type="button" data-section="' + section.id + '"' +
+              (section.id === state.activeSection ? ' class="active"' : "") + ">" +
+              esc(section.label) + "</button>";
+          }).join("") +
+        "</nav>" +
+        '<div class="settings-content">' +
+          sectionHtml("providers", renderProvidersCard()) +
+          sectionHtml("yandex", renderYandexCard()) +
+          sectionHtml("provider-keys", renderProviderKeysCard()) +
+          sectionHtml("other-keys", renderOtherKeysCard()) +
+          sectionHtml("graph", renderGraphCard()) +
+          sectionHtml("qdrant", renderQdrantCard()) +
+          '<div id="refresh-results" hidden></div>' +
+        "</div>" +
+      "</div>";
 
+    root.innerHTML = html;
     bindToolbar();
     bindRoleControls();
     bindGraphInputs();
     bindEnvInputs();
+    bindQdrantControls();
+    bindSettingsNav();
+  }
+
+  function bindSettingsNav() {
+    document.querySelectorAll(".settings-nav button").forEach(function (button) {
+      button.addEventListener("click", function () {
+        state.activeSection = button.getAttribute("data-section");
+        applySectionVisibility();
+      });
+    });
+  }
+
+  function applySectionVisibility() {
+    document.querySelectorAll(".settings-section").forEach(function (section) {
+      section.hidden = section.getAttribute("data-section") !== state.activeSection;
+    });
+    document.querySelectorAll(".settings-nav button").forEach(function (button) {
+      button.classList.toggle("active", button.getAttribute("data-section") === state.activeSection);
+    });
   }
 
   function modelOptions(tag) {
@@ -211,36 +267,52 @@
     "</div>";
   }
 
-  function renderEnvCard() {
+  function renderYandexCard() {
+    var yandexRows = KNOWN_ENV.filter(function (item) { return item.section === "yandex"; })
+      .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
+    return '<section class="settings-card"><h3>Yandex OCR</h3>' +
+      '<p class="muted">Ключи распознавания Yandex Vision OCR (используются при конвертации PDF/DOCX).</p>' +
+      '<div class="env-grid">' + yandexRows + "</div></section>";
+  }
+
+  function renderProviderKeysCard() {
     var providers = state.providers.providers || {};
     var providerKeys = [];
     Object.keys(providers).forEach(function (name) {
       var envName = providers[name].api_key_env;
       if (envName) providerKeys.push({ key: envName, label: "Ключ провайдера «" + name + "»" });
     });
-
-    var yandexRows = KNOWN_ENV.filter(function (item) { return item.section === "yandex"; })
-      .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
-    var otherRows = KNOWN_ENV.filter(function (item) { return item.section === "other"; })
-      .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
     var providerRows = providerKeys
       .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], true); }).join("");
-
-    var html = "";
-    html += '<section class="settings-card"><h3>Yandex OCR</h3>' +
-      '<p class="muted">Ключи распознавания Yandex Vision OCR (используются при конвертации PDF/DOCX).</p>' +
-      '<div class="env-grid">' + yandexRows + "</div></section>";
-
-    html += '<section class="settings-card"><h3>Ключи API провайдеров</h3>' +
+    return '<section class="settings-card"><h3>Ключи API провайдеров</h3>' +
       '<p class="muted">Ключи, на которые ссылаются провайдеры из providers.yaml (api_key_env). Значения не отображаются — только маска.</p>' +
       '<div class="env-grid">' + (providerRows || '<div class="muted small">Провайдеры не настроены — добавьте их кнопкой «Добавить провайдера».</div>') +
       "</div></section>";
+  }
 
-    if (otherRows) {
-      html += '<section class="settings-card"><h3>Прочие ключи</h3>' +
-        '<div class="env-grid">' + otherRows + "</div></section>";
-    }
-    return html;
+  function renderOtherKeysCard() {
+    var otherRows = KNOWN_ENV.filter(function (item) { return item.section === "other"; })
+      .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
+    return '<section class="settings-card"><h3>Прочие ключи</h3>' +
+      '<div class="env-grid">' + (otherRows || '<div class="muted small">Прочие ключи не настроены.</div>') +
+      "</div></section>";
+  }
+
+  function renderQdrantCard() {
+    var q = state.qdrant || { path: "", default: "", overridden: false };
+    var hint = q.overridden
+      ? "Указан override (QDRANT_PATH в .env); дефолт из config.yaml: " + esc(q.default)
+      : "Используется дефолт из config.yaml: " + esc(q.default);
+    return '<section class="settings-card"><h3>Папка Qdrant</h3>' +
+      '<p class="muted">База семантического поиска. Путь сохраняется в .env (QDRANT_PATH) и передаётся пайплайну через --qdrant-path. Пустая строка = вернуться к дефолту.</p>' +
+      '<div class="env-row" data-qdrant-row>' +
+        '<label>Путь к базе Qdrant <code>QDRANT_PATH</code></label>' +
+        '<div class="env-inputs">' +
+          '<input type="text" id="qdrant-path-input" value="' + esc(q.path) + '" placeholder="' + esc(q.default) + '">' +
+          '<button type="button" id="qdrant-reset" class="btn ghost">Сбросить к дефолту</button>' +
+        "</div>" +
+        '<div class="field-help">' + hint + "</div>" +
+      "</div></section>";
   }
 
   function renderGraphCard() {
@@ -315,6 +387,20 @@
         // Новое значение снимает «удалить»
         if (input.value.trim() && deleteCheck) deleteCheck.checked = false;
       });
+    });
+  }
+
+  function bindQdrantControls() {
+    var reset = $("qdrant-reset");
+    if (reset) reset.addEventListener("click", function () {
+      var input = $("qdrant-path-input");
+      if (input && state.qdrant) input.value = state.qdrant.default || "";
+      state.qdrantReset = true;
+      setStatus("Сброс к дефолту — нажмите «Сохранить», чтобы применить.", "warn");
+    });
+    var input = $("qdrant-path-input");
+    if (input) input.addEventListener("input", function () {
+      state.qdrantReset = false;
     });
   }
 
@@ -413,6 +499,21 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(env)
       });
+      // 4. Папка Qdrant (решение №29) — только если изменилась или запрошен сброс.
+      var qdrantInput = $("qdrant-path-input");
+      if (qdrantInput) {
+        var wantReset = state.qdrantReset;
+        state.qdrantReset = false;
+        var currentPath = state.qdrant ? state.qdrant.path : "";
+        var inputPath = qdrantInput.value.trim();
+        if (wantReset || inputPath !== currentPath) {
+          await api("/api/settings/qdrant", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: wantReset ? "" : inputPath })
+          });
+        }
+      }
       await loadSettings();
       if (roleErrors.length) {
         setStatus("Сохранено, но не все роли записаны: " + roleErrors.join("; "), "warn");
