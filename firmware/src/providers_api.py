@@ -1,7 +1,10 @@
 from __future__ import annotations
 import re
 import requests
-from .config_ui import read_yaml, write_yaml
+try:
+    from firmware.src.config_ui import read_yaml, write_yaml
+except ImportError:
+    from config_ui import read_yaml, write_yaml
 
 def tag_model(name, rules=None):
     n = name.lower(); rules = rules or {"embedding": ["embedding", "embed"], "rerank": ["rerank", "reranker"], "vision": ["vision", "-vl", "vl-", "4.5v", "4.6v", "4v", "-v-flash", "llava", "gpt-4o"]}
@@ -14,6 +17,10 @@ def scan_models(base_url, api_key, timeout=20):
     response = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout)
     response.raise_for_status()
     return [item.get("id", "") for item in response.json().get("data", []) if item.get("id")]
+
+
+def scan_and_tag_models(base_url, api_key, timeout=20):
+    return [{"name": name, "tag": tag_model(name)} for name in scan_models(base_url, api_key, timeout)]
 
 def add_provider(providers_path, name, base_url, api_key_env, models):
     if not re.match(r"^https?://[^\s]+$", base_url): raise ValueError("Некорректный base_url")

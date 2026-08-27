@@ -18,6 +18,7 @@ class Job:
     exit_code: int | None = None
     log_buffer: list[str] = field(default_factory=list)
     pid: int | None = None
+    phases: list[list[str]] | None = None
 
 class JobRunner:
     def __init__(self, max_running: int = 1):
@@ -36,6 +37,49 @@ class JobRunner:
         threading.Thread(target=self._run, args=(job, cwd, env), daemon=True).start()
         return job
 
+    def start_sequence(self, phases, cwd=None, env=None, kind="sequence") -> Job:
+        if not phases or any(not isinstance(argv, list) or not argv for argv in phases):
+            raise ValueError("phases должны быть непустым списком argv")
+        if any(any(not isinstance(x, str) for x in argv) for argv in phases):
+            raise ValueError("argv должен содержать только строки")
+        job = Job(uuid.uuid4().hex, kind, list(phases[0]))
+        job.phases = [list(argv) for argv in phases]
+        with self._lock:
+            self.jobs[job.id] = job
+            self._queues[job.id] = []
+        threading.Thread(target=self._run_sequence, args=(job, cwd, env), daemon=True).start()
+        return job
+
+    def _emit(self, job, line):
+        with self._lock:
+            job.log_buffer.append(line)
+            queues = list(self._queues.get(job.id, []))
+        for queue in queues:
+            queue.put(line)
+
+    def _run_sequence(self, job, cwd, env):
+        with self._slots:
+            with self._lock: job.status = "running"
+            try:
+                for index, argv in enumerate(job.phases, 1):
+                    self._emit(job, f"[phase {index}/{len(job.phases)}] started")
+                    process = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                               text=True, bufsize=1)
+                    job.pid = process.pid; job._process = process
+                    for line in iter(process.stdout.readline, ""):
+                        self._emit(job, line.rstrip("\n"))
+                    process.wait(); job.exit_code = process.returncode
+                    if process.returncode != 0:
+                        with self._lock: job.status = "error"
+                        self._emit(job, f"[phase {index}/{len(job.phases)}] failed ({process.returncode})")
+                        return
+                    self._emit(job, f"[phase {index}/{len(job.phases)}] done")
+                with self._lock: job.status = "done"
+            except Exception as exc:
+                self._emit(job, str(exc))
+                with self._lock: job.status = "error"
+
     def _run(self, job, cwd, env):
         with self._slots:
             with self._lock: job.status = "running"
@@ -45,8 +89,7 @@ class JobRunner:
                 job._process = process
                 for line in iter(process.stdout.readline, ""):
                     line = line.rstrip("\n")
-                    with self._lock: job.log_buffer.append(line); queues = list(self._queues.get(job.id, []))
-                    for queue in queues: queue.put(line)
+                    self._emit(job, line)
                 process.wait()
                 with self._lock:
                     job.exit_code = process.returncode
