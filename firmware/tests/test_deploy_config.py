@@ -77,3 +77,53 @@ def test_missing_group_fails(tmp_path):
     cfg.write_text("active: dev\ndev: {}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="отсутствуют"):
         load(cfg)
+
+
+# --- решение №29: qdrant_path как свойство (env > .env > config.yaml) ---
+
+def test_qdrant_path_default_when_no_override(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_config(), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.qdrant_path == Path("/q")
+    assert loaded.qdrant_path_default == Path("/q")
+    assert loaded.qdrant_path_override is None
+
+
+def test_qdrant_path_override_from_process_env(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_config(), encoding="utf-8")
+    monkeypatch.setenv("QDRANT_PATH", "/env/qdrant")
+    loaded = load(cfg)
+    assert loaded.qdrant_path == Path("/env/qdrant")
+    assert loaded.qdrant_path_override == "/env/qdrant"
+
+
+def test_qdrant_path_override_from_env_file(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("QDRANT_PATH=/dotenv/qdrant\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.qdrant_path == Path("/dotenv/qdrant")
+    assert loaded.qdrant_path_override == "/dotenv/qdrant"
+
+
+def test_qdrant_path_process_env_beats_env_file(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("QDRANT_PATH=/dotenv/qdrant\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    monkeypatch.setenv("QDRANT_PATH", "/proc/qdrant")
+    loaded = load(cfg)
+    assert loaded.qdrant_path == Path("/proc/qdrant")
+
+
+def test_qdrant_path_empty_env_file_value_falls_back(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("QDRANT_PATH=\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.qdrant_path_override is None
+    assert loaded.qdrant_path == Path("/q")

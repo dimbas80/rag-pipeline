@@ -18,13 +18,13 @@ from pydantic import BaseModel
 try:  # supports both documented package and legacy module invocation
     from firmware.src.deploy_config import load
     from firmware.src.jobs import JobRunner, build_env
-    from firmware.src import config_ui, registration, providers_api
+    from firmware.src import config_ui, registration, providers_api, fs_perms
     from firmware.src.chat_api import ChatSession
     from firmware.src import qdrant_api
 except ImportError:  # pragma: no cover - only for direct `uvicorn app:app`
     from deploy_config import load
     from jobs import JobRunner, build_env
-    import config_ui, registration, providers_api
+    import config_ui, registration, providers_api, fs_perms
     from chat_api import ChatSession
     import qdrant_api
 
@@ -59,6 +59,9 @@ class EnvUpdate(BaseModel):
     values: dict[str, str] = {}
     delete: list[str] = []
 
+class QdrantPathUpdate(BaseModel):
+    path: str = ""
+
 
 def _session(sid: str) -> dict:
     value = sessions.get(sid)
@@ -83,9 +86,9 @@ async def upload(file: UploadFile = File(...)):
     data = await file.read(limit + 1)
     if len(data) > limit:
         raise HTTPException(413, "Файл превышает допустимый размер")
-    cfg.upload_base_dir.mkdir(parents=True, exist_ok=True)
+    fs_perms.ensure_dir(cfg.upload_base_dir)
     target = cfg.upload_base_dir / name
-    target.write_bytes(data)
+    fs_perms.write_bytes(target, data, 0o666)  # файлы базы — 0666 (решение №22)
     sid, stem = uuid.uuid4().hex, Path(name).stem
     sessions[sid] = {"session_id": sid, "name": name, "stem": stem, "source": target,
                      "reg": cfg.base_markdown / stem / f"{stem}_reg.yaml",
@@ -104,7 +107,7 @@ def state(sid):
 @app.post("/api/documents/{sid}/register")
 def register(sid, payload: Registration):
     s = _session(sid)
-    s["reg"].parent.mkdir(parents=True, exist_ok=True)
+    fs_perms.ensure_dir(s["reg"].parent)  # каталог базы — 0777 (решение №22)
     slug = registration.write_reg_yaml(s["reg"], {**payload.fields, "source_file": s["name"]})
     return {"slug": slug}
 
@@ -117,12 +120,23 @@ def registration_state(sid):
 
 @app.post("/api/documents/{sid}/register/prefill")
 def registration_prefill(sid):
+    """Prefill формы регистрации (решение №28).
+
+    Если `<stem>_reg.yaml` уже существует — вернуть его поля БЕЗ распознавания
+    (`source="reg_yaml"`); иначе — vision-prefill первой страницы (`source="vision"`).
+    """
     s = _session(sid)
+    record = registration.read_reg_record(s["reg"])
+    if record is not None:
+        fields = dict(record)
+        fields["slug"] = registration.read_reg_slug(s["reg"])
+        return {"fields": fields, "source": "reg_yaml", "exists": True,
+                "image_available": bool(s["source"].is_file())}
     image_bytes = registration.extract_first_page(s["source"])
     fields = registration.vision_prefill(image_bytes, config=cfg.prompts, providers_path=cfg.providers_path, env=build_env(cfg.env_file)) if image_bytes else {}
     fields.setdefault("domain", fields.get("domain_hint"))
     fields["slug"] = registration.make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), ()) if fields.get("document_id") else None
-    return {"fields": fields, "image_available": bool(image_bytes)}
+    return {"fields": fields, "source": "vision", "exists": False, "image_available": bool(image_bytes)}
 
 
 @app.post("/api/documents/{sid}/convert")
@@ -298,6 +312,28 @@ def put_env_config(payload: EnvUpdate):
 
 @app.get("/api/settings/collections")
 def settings_collections(): return {"collections": qdrant_api.list_collections(cfg.qdrant_path)}
+
+@app.get("/api/settings/qdrant")
+def settings_qdrant():
+    """Текущая папка Qdrant (решение №29): эффективный путь, дефолт, override."""
+    return {
+        "path": str(cfg.qdrant_path),
+        "default": str(cfg.qdrant_path_default),
+        "overridden": cfg.qdrant_path_override is not None,
+    }
+
+@app.put("/api/settings/qdrant")
+def update_qdrant(payload: QdrantPathUpdate):
+    """Задать папку Qdrant персистентно (QDRANT_PATH в .env).
+
+    Пустая строка = сбросить override (вернуться к дефолту из config.yaml).
+    Запись идёт через config_ui.write_env → .env остаётся 0600.
+    """
+    path = (payload.path or "").strip()
+    if path and not Path(path).is_absolute():
+        raise HTTPException(400, "Путь должен быть абсолютным")
+    config_ui.write_env(cfg.env_file, {"QDRANT_PATH": path})
+    return settings_qdrant()
 
 @app.get("/api/settings/status")
 def settings_status():

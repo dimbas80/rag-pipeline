@@ -16,13 +16,16 @@ def read_yaml(path):
 
 def write_yaml(path, data, comments_preserving=False):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists(): shutil.copy2(path, path.with_name(path.name + ".bak"))
+    if path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+        os.chmod(path.with_name(path.name + ".bak"), 0o600)  # конфиги — owner-only (решение №22)
     content = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
         f.write(content); tmp = Path(f.name)
     try:
         yaml.safe_load(tmp.read_text(encoding="utf-8"))
         os.replace(tmp, path)
+        os.chmod(path, 0o600)  # после атомарной замены — ограничительные права
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -55,6 +58,7 @@ def write_env(path, values):
                 k, v = line.split("=", 1); current[k] = v
             elif line: current[line] = None
         shutil.copy2(path, path.with_name(path.name + ".bak"))
+        os.chmod(path.with_name(path.name + ".bak"), 0o600)  # .env.bak — owner-only (решение №22)
     # Empty values are an explicit deletion request; omitted keys are retained.
     current.update({str(k): v for k, v in values.items()})
     for key, value in list(current.items()):
@@ -66,6 +70,7 @@ def write_env(path, values):
     tmp = Path(tmp_name)
     text = "\n".join(f"{k}={v}" for k, v in current.items() if v is not None) + "\n"
     tmp.write_text(text, encoding="utf-8"); os.replace(tmp, path)
+    os.chmod(path, 0o600)  # .env — всегда owner-only (решение №22)
 
 
 def validate_providers(data):

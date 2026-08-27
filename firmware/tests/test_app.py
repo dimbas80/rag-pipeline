@@ -53,10 +53,21 @@ def _fake_cfg(tmp_path):
         search_config_path = tmp_path / "search_config.yaml"
         create_markdown_dir = tmp_path / "cm"
         build_search_index_dir = tmp_path / "bsi"
-        qdrant_path = tmp_path / "qdrant_data"
+        qdrant_path_default = tmp_path / "qdrant_data"
         collection = "technical_standard"
         write_enabled = True
         env_file = tmp_path / ".env"
+        prompts = {}
+
+        # Повторяют поведение DeployConfig (решение №29): override читается
+        # лениво из .env, чтобы settings_qdrant() видел свежезаписанный путь.
+        @property
+        def qdrant_path_override(self):
+            return app.config_ui.read_env_raw(self.env_file).get("QDRANT_PATH") or None
+
+        @property
+        def qdrant_path(self):
+            return Path(self.qdrant_path_override) if self.qdrant_path_override else self.qdrant_path_default
     return Cfg()
 
 
@@ -161,3 +172,111 @@ def test_state_reports_reg_and_md_existence(monkeypatch, tmp_path):
     assert response["reg_exists"] is False
     assert response["md_exists"] is True
     assert response["can_index"] is False
+
+
+# --- решение №28: prefill из _reg.yaml без OCR ---
+
+def _prefill_session(tmp_path, sid="s1"):
+    return {
+        "session_id": sid,
+        "stem": "doc",
+        "name": "doc.pdf",
+        "source": tmp_path / "doc.pdf",
+        "reg": tmp_path / "doc_reg.yaml",
+        "md": tmp_path / "doc.md",
+    }
+
+
+def test_registration_prefill_reads_reg_yaml_without_ocr(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    session = _prefill_session(tmp_path)
+    monkeypatch.setitem(app.sessions, session["session_id"], session)
+    (tmp_path / "doc.pdf").write_bytes(b"%PDF-fake")
+    app.registration.write_reg_yaml(
+        tmp_path / "doc_reg.yaml",
+        {"document_id": "ГОСТ 18410-73", "document_type": "ГОСТ", "domain": "Кабели",
+         "title": "T", "edition": 1973, "date_enacted": "1973-01-01", "source_file": "doc.pdf",
+         "status": "active", "ignore_sections": ["Предисловие"]},
+    )
+    calls = []
+    monkeypatch.setattr(app.registration, "extract_first_page", lambda *a, **k: calls.append("ocr") or b"png")
+    monkeypatch.setattr(app.registration, "vision_prefill", lambda *a, **k: calls.append("vision") or {})
+    response = app.registration_prefill("s1")
+    assert response["source"] == "reg_yaml"
+    assert response["exists"] is True
+    assert response["fields"]["document_id"] == "ГОСТ 18410-73"
+    assert response["fields"]["ignore_sections"] == ["Предисловие"]
+    assert response["fields"]["slug"] is not None
+    assert not calls  # OCR/vision не вызывались
+
+
+def test_registration_prefill_falls_back_to_vision(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    session = _prefill_session(tmp_path)
+    monkeypatch.setitem(app.sessions, session["session_id"], session)
+    (tmp_path / "doc.pdf").write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(app.registration, "extract_first_page", lambda src: b"png")
+    monkeypatch.setattr(
+        app.registration, "vision_prefill",
+        lambda image, **k: {"document_id": "ГОСТ 1", "title": "T", "domain_hint": "Д", "document_type": "ГОСТ"},
+    )
+    response = app.registration_prefill("s1")
+    assert response["source"] == "vision"
+    assert response["exists"] is False
+    assert response["fields"]["document_id"] == "ГОСТ 1"
+    assert response["fields"]["domain"] == "Д"
+
+
+def test_registration_prefill_vision_skipped_without_image(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    session = _prefill_session(tmp_path)
+    monkeypatch.setitem(app.sessions, session["session_id"], session)
+    monkeypatch.setattr(app.registration, "extract_first_page", lambda src: None)
+    calls = []
+    monkeypatch.setattr(app.registration, "vision_prefill", lambda *a, **k: calls.append(1) or {})
+    response = app.registration_prefill("s1")
+    assert response["source"] == "vision"
+    assert response["image_available"] is False
+    assert not calls
+
+
+# --- решение №29: папка Qdrant через /api/settings/qdrant ---
+
+def test_get_qdrant_settings_reports_path_default_and_override(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    response = app.settings_qdrant()
+    assert response["path"] == str(tmp_path / "qdrant_data")
+    assert response["default"] == str(tmp_path / "qdrant_data")
+    assert response["overridden"] is False
+
+
+def test_put_qdrant_settings_writes_env(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.put("/api/settings/qdrant", json={"path": "/mnt/sdb/qdrant_data"})
+    assert response.status_code == 200
+    assert app.config_ui.read_env_raw(tmp_path / ".env")["QDRANT_PATH"] == "/mnt/sdb/qdrant_data"
+    assert response.json()["overridden"] is True
+    assert response.json()["path"] == "/mnt/sdb/qdrant_data"
+
+
+def test_put_qdrant_settings_empty_resets_override(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    (tmp_path / ".env").write_text("QDRANT_PATH=/old/path\n", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.put("/api/settings/qdrant", json={"path": ""})
+    assert response.status_code == 200
+    assert "QDRANT_PATH" not in app.config_ui.read_env_raw(tmp_path / ".env")
+
+
+def test_put_qdrant_settings_rejects_relative_path(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    assert client.put("/api/settings/qdrant", json={"path": "relative/path"}).status_code == 400

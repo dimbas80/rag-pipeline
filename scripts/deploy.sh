@@ -102,11 +102,12 @@ fi
 
 # Read-only выгрузка текущих конфигов LXC в staging (для консолидации/плана).
 if [[ "$REMOTE_AVAILABLE" == "1" ]]; then
-  mkdir -p "$STAGE/remote/interface_RAG" "$STAGE/remote/CMY" "$STAGE/remote/BSI"
+  mkdir -p "$STAGE/remote/config" "$STAGE/remote/interface_RAG" "$STAGE/remote/CMY" "$STAGE/remote/BSI"
   while IFS='|' read -r src dst; do
     # NB: < /dev/null — иначе ssh съедает остаток stdin heredoc цикла
     ssh_lxc "cat '$src' 2>/dev/null" < /dev/null > "$dst" || true
   done <<FILES
+/root/RAG/config/.env|$STAGE/remote/config/.env
 /root/RAG/interface_RAG/.env|$STAGE/remote/interface_RAG/.env
 /root/RAG/Create_Markdown_YA/firmware/src/.env|$STAGE/remote/CMY/.env
 /root/RAG/Create_Markdown_YA/firmware/src/providers.yaml|$STAGE/remote/CMY/providers.yaml

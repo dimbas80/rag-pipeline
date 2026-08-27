@@ -1,7 +1,12 @@
 from __future__ import annotations
-import json, os, re, shutil, subprocess, tempfile
+import json, os, re, subprocess, tempfile
 from pathlib import Path
 import yaml
+
+try:  # supports both documented package and legacy module invocation
+    from firmware.src import fs_perms
+except ImportError:  # pragma: no cover - direct module usage from firmware/src
+    import fs_perms
 
 FIELDS = ["document_id", "document_id_alt", "document_type", "domain", "title", "edition", "date_enacted", "date_amended", "amended_by", "source_file", "status", "status_reason", "replaced_by_document_id", "replaced_by_doc_key", "ignore_sections"]
 PREFIX = {"ГОСТ":"GOST", "СП":"SP", "СО":"SO", "СНиП":"SNIP", "ПУЭ":"PUE"}
@@ -52,14 +57,74 @@ def vision_prefill(image_bytes, *, config=None, providers_path=None, env=None):
     except Exception:
         return {}
 
+def _load_reg_docs(reg_path):
+    """Прочитать `<stem>_reg.yaml` → (slug, record) единственной записи.
+
+    Возвращает (None, None), если файла нет/пусто/структура не та.
+    """
+    reg_path = Path(reg_path)
+    if not reg_path.is_file():
+        return None, None
+    try:
+        data = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+    docs = data.get("documents") if isinstance(data, dict) else None
+    if not isinstance(docs, dict) or not docs:
+        return None, None
+    slug = next(iter(docs))
+    record = docs[slug]
+    if not isinstance(record, dict):
+        return None, None
+    return slug, record
+
+
+def read_reg_record(reg_path) -> dict | None:
+    """Плоская запись documents.<first-slug> или None (файла нет/пусто).
+
+    Используется prefill'ом (решение №28): если `_reg.yaml` уже существует —
+    вернуть его поля БЕЗ распознавания первой страницы.
+    """
+    _, record = _load_reg_docs(reg_path)
+    return dict(record) if record is not None else None
+
+
+def read_reg_slug(reg_path) -> str | None:
+    """Ключ-слаг единственной записи `_reg.yaml` (или None)."""
+    slug, _ = _load_reg_docs(reg_path)
+    return slug
+
+
 def write_reg_yaml(reg_path, fields):
-    reg_path = Path(reg_path); reg_path.parent.mkdir(parents=True, exist_ok=True)
-    if reg_path.exists(): shutil.copy2(reg_path, reg_path.with_name(reg_path.name + ".bak"))
+    """Upsert ровно одной записи документа в `<stem>_reg.yaml` (решение №24).
+
+    - ключ-слаг СОХРАНЯЕТСЯ при повторной регистрации (стабильность chunk_id);
+    - в файле всегда ровно одна запись `documents.<slug>` (исторические дубли
+      схлопываются в первый ключ);
+    - каталог — 0777, файл и `.bak` — 0666 (решение №22, через fs_perms).
+    """
+    reg_path = Path(reg_path)
+    fs_perms.ensure_dir(reg_path.parent)
+    if reg_path.exists():
+        fs_perms.chmod_copy(reg_path, reg_path.with_name(reg_path.name + ".bak"), 0o666)
     data = yaml.safe_load(reg_path.read_text(encoding="utf-8")) if reg_path.exists() else {}
-    data = data if isinstance(data, dict) else {}; docs = data.setdefault("documents", {})
-    slug = fields.get("slug") or make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), docs)
-    record = {key: fields.get(key) for key in FIELDS}; record["source_file"] = fields.get("source_file", reg_path.stem.removesuffix("_reg")); record["status"] = fields.get("status", "active"); record["ignore_sections"] = fields.get("ignore_sections", ["Предисловие", "Содержание"])
-    docs[slug] = record
-    tmp = reg_path.with_suffix(reg_path.suffix + ".tmp")
-    tmp.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8"); yaml.safe_load(tmp.read_text(encoding="utf-8")); tmp.replace(reg_path)
+    data = data if isinstance(data, dict) else {}
+    docs = data.get("documents")
+    docs = docs if isinstance(docs, dict) else {}
+    # Upsert: существующий slug (из формы/префилла или первый ключ файла)
+    # важнее, чем заново вычисленный — иначе ломаются chunk_id в Qdrant.
+    if fields.get("slug"):
+        slug = str(fields["slug"])
+    elif docs:
+        slug = next(iter(docs))
+    else:
+        slug = make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), docs)
+    record = {key: fields.get(key) for key in FIELDS}
+    record["source_file"] = fields.get("source_file", reg_path.stem.removesuffix("_reg"))
+    record["status"] = fields.get("status", "active")
+    record["ignore_sections"] = fields.get("ignore_sections", ["Предисловие", "Содержание"])
+    data["documents"] = {slug: record}  # ровно одна запись на документ
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    yaml.safe_load(text)  # валидация перед атомарной записью (как раньше)
+    fs_perms.write_text_atomic(reg_path, text, 0o666)
     return slug

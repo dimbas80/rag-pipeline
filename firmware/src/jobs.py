@@ -15,6 +15,18 @@ except ImportError:  # pragma: no cover - direct `uvicorn app:app` from firmware
     from config_ui import read_env_raw
 
 
+def _child_umask_zero() -> None:
+    """В дочернем процессе: umask 0 — файлы/каталоги пайплайнов под !База_ГОСТ
+    (mkdir(0o777), файлы 0o666) не урезаются umask'ом (решение №22).
+
+    Выполняется в ребёнке между fork и exec. os.umask — тривиальный syscall-
+    враппер без Python-локов, поэтому для многопоточного FastAPI риск deadlock
+    практически нулевой (стандартная идиома; shell=False и списки argv
+    сохраняются). Родительский umask не меняется.
+    """
+    os.umask(0)
+
+
 def build_env(env_file=None) -> dict[str, str]:
     """Окружение для subprocess пайплайнов (§8.2 архитектуры).
 
@@ -83,7 +95,7 @@ class JobRunner:
                     self._emit(job, f"[phase {index}/{len(job.phases)}] started")
                     process = subprocess.Popen(argv, cwd=cwd, env=env, shell=False,
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                               text=True, bufsize=1)
+                                               text=True, bufsize=1, preexec_fn=_child_umask_zero)
                     job.pid = process.pid; job._process = process
                     for line in iter(process.stdout.readline, ""):
                         self._emit(job, line.rstrip("\n"))
@@ -102,7 +114,7 @@ class JobRunner:
         with self._slots:
             with self._lock: job.status = "running"
             try:
-                process = subprocess.Popen(job.argv, cwd=cwd, env=env, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                process = subprocess.Popen(job.argv, cwd=cwd, env=env, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=_child_umask_zero)
                 job.pid = process.pid
                 job._process = process
                 for line in iter(process.stdout.readline, ""):

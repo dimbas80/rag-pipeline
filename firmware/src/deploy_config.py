@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 import yaml
 
+try:  # supports both documented package and legacy module invocation
+    from firmware.src.config_ui import read_env_raw
+except ImportError:  # pragma: no cover - direct `uvicorn app:app` from firmware/src
+    from config_ui import read_env_raw
+
 ROOT = Path(__file__).resolve().parents[2]
 
 @dataclass(frozen=True)
@@ -17,7 +22,7 @@ class DeployConfig:
     upload_max_mb: int
     create_markdown_dir: Path
     build_search_index_dir: Path
-    qdrant_path: Path
+    qdrant_path_default: Path
     collection: str
     write_enabled: bool
     env_file: Path
@@ -25,6 +30,23 @@ class DeployConfig:
     prompts: dict[str, Any]
     model_tags: dict[str, list[str]]
     environment: str
+
+    @property
+    def qdrant_path_override(self) -> str | None:
+        """QDRANT_PATH: process-env > .env. None — override отсутствует.
+
+        Чтение .env ленивое, без кэша (файл крошечный, доступ 1–2 раза на
+        запрос); приоритет задан решением №29 (персистентная папка Qdrant).
+        """
+        override = os.environ.get("QDRANT_PATH")
+        if not override:
+            override = read_env_raw(self.env_file).get("QDRANT_PATH")
+        return override or None
+
+    @property
+    def qdrant_path(self) -> Path:
+        """Эффективный путь Qdrant: override (env/.env) или дефолт из config.yaml."""
+        return Path(self.qdrant_path_override) if self.qdrant_path_override else self.qdrant_path_default
 
     @property
     def providers_path(self) -> Path:
@@ -69,7 +91,7 @@ def load(path: str | Path | None = None) -> DeployConfig:
         upload_base_dir=Path(section["upload"]["base_dir"]), upload_max_mb=int(section["upload"]["max_mb"]),
         create_markdown_dir=Path(section["pipelines"]["create_markdown_dir"]),
         build_search_index_dir=Path(section["pipelines"]["build_search_index_dir"]),
-        qdrant_path=Path(section["qdrant"]["path"]), collection=str(section["qdrant"]["collection"]),
+        qdrant_path_default=Path(section["qdrant"]["path"]), collection=str(section["qdrant"]["collection"]),
         write_enabled=bool(section["qdrant"]["write_enabled"]), env_file=env_file,
         base_markdown=Path(section["base_markdown"]), prompts=raw.get("prompts", {}),
         model_tags=raw.get("model_tags", {}), environment=env,

@@ -6,8 +6,10 @@
 и пишет в --out.
 
 Источники (приоритет значения — первый по списку):
-  .env:   remote/interface_RAG/.env > remote/CMY/.env > remote/BSI/.env
-          > dev CMY/.env > dev BSI/.env. Ключи объединяются, не удаляются.
+  .env:   remote/config/.env (общий конфиг интерфейса на LXC, решение №29)
+          > remote/interface_RAG/.env > remote/CMY/.env > remote/BSI/.env
+          > dev config/.env (интерфейс dev) > dev CMY/.env > dev BSI/.env.
+          Ключи объединяются, не удаляются.
   providers.yaml:  эталон — «полный» вариант (с ролями build_search_index,
           remote BSI > dev BSI); доливаются отсутствующие провайдеры/модели
           из варианта Create_Markdown_YA (dev CMY).
@@ -23,6 +25,10 @@ import sys
 from pathlib import Path
 
 import yaml
+
+# Каталог интерфейса (родитель scripts/) — его config/.env читается как
+# первоочередной dev-источник .env (QDRANT_PATH и прочие UI-ключи).
+DEV_ROOT = Path(__file__).resolve().parents[1]
 
 # Канонический набор ключей (architecture.md §8.1). Реально берётся объединение
 # всех ключей из всех источников (ничего не теряем); этот список нужен для
@@ -119,15 +125,17 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copy2(dev_cmy / "firmware/src/create_markdown_config.yaml", out / "create_markdown_config.yaml")
     shutil.copy2(dev_bsi / "firmware/src/search_config.yaml", out / "search_config.yaml")
 
-    # --- .env: объединение, приоритет LXC > dev, ключи не удаляются ---
+    # --- .env: объединение, приоритет config/.env (LXC) > legacy > dev, ключи не удаляются ---
     env_sources: list[tuple[str, Path]] = []
     if remote:
         env_sources += [
+            ("remote/config/.env", remote / "config/.env"),
             ("remote/interface_RAG/.env", remote / "interface_RAG/.env"),
             ("remote/CMY/.env", remote / "CMY/.env"),
             ("remote/BSI/.env", remote / "BSI/.env"),
         ]
     env_sources += [
+        ("dev config/.env", DEV_ROOT / "config/.env"),
         ("dev CMY/.env", dev_cmy / "firmware/src/.env"),
         ("dev BSI/.env", dev_bsi / ".env"),
     ]

@@ -1,11 +1,17 @@
 from pathlib import Path
+import os
+import stat
 import yaml
 import pytest
 from firmware.src.config_ui import (
     read_yaml, read_env,
     validate_providers, validate_search_config, validate_reg_record,
-    write_env, read_env_raw, sync_role_models,
+    write_env, read_env_raw, sync_role_models, write_yaml,
 )
+
+
+def _mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 def test_read_yaml_missing_returns_empty(tmp_path):
@@ -42,3 +48,25 @@ def test_invalid_configs_rejected():
     with pytest.raises(ValueError): validate_providers({"providers": {"p": {}}})
     with pytest.raises(ValueError): validate_search_config({"nodes": {"x": {"temperature": "bad", "max_tokens": 1}}})
     with pytest.raises(ValueError): validate_reg_record({"document_id": "x"})
+
+
+# --- решение №22: конфиги интерфейса — ограничительные права 0600 ---
+
+def test_write_env_sets_0600_and_bak_0600(tmp_path):
+    path = tmp_path / ".env"
+    write_env(path, {"A": "one"})
+    assert _mode(path) == 0o600
+    write_env(path, {"A": "two"})  # вторая запись → .bak
+    bak = tmp_path / ".env.bak"
+    assert bak.exists()
+    assert _mode(bak) == 0o600
+
+
+def test_write_yaml_sets_0600_and_bak_0600(tmp_path):
+    path = tmp_path / "providers.yaml"
+    write_yaml(path, {"providers": {"p": {}}})
+    assert _mode(path) == 0o600
+    write_yaml(path, {"providers": {"p": {}}, "roles": {}})  # вторая запись → .bak
+    bak = tmp_path / "providers.yaml.bak"
+    assert bak.exists()
+    assert _mode(bak) == 0o600
