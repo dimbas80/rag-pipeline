@@ -86,7 +86,7 @@ class ChatSession:
             "type": "answer",
             "answer": answer,
             "cited_chunk_ids": cited,
-            "sources": result.get("search_results") or [],
+            "sources": _dedup_sources(result.get("search_results") or []),
             "images": images,
         }
 
@@ -102,6 +102,33 @@ class ChatSession:
 
     def list_documents(self) -> list[dict[str, Any]]:
         return self._graph.list_documents()
+
+
+def _dedup_sources(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Дедуп источников для поля `sources` (решение 31).
+
+    Один документ может дать несколько чанков — в «Источники:» он не должен
+    повторяться. Ключ дедупа: `document_id` (приоритет), fallback — `title`
+    (trim + case-insensitive). Порядок первого вхождения сохраняется. Записи
+    без обоих ключей не дедуплицируются.
+
+    Трогается ТОЛЬКО поле `sources`: `search_results`, который идёт в
+    select_images/цитаты, остаётся полным.
+    """
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in results:
+        key = str(item.get("document_id") or "").strip()
+        if not key:
+            key = str(item.get("title") or "").strip().lower()
+        if not key:
+            deduped.append(item)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
 
 
 def select_images(

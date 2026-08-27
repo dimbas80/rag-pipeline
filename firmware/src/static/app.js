@@ -149,6 +149,7 @@
       } else if (message.type === "clarification") {
         addBubble("assistant", "Уточняющий вопрос: " + (message.text || ""));
         state.chat.awaitingClarification = true;
+        setStatus("chat-status", "", "");
         $("chat-input").focus();
       } else if (message.type === "error") {
         addBubble("assistant", "Ошибка: " + (message.text || message));
@@ -166,6 +167,7 @@
     if (!text) return;
     // Один ввод: при ожидании уточняющего ответа отправляем reply, иначе query.
     var type = state.chat.awaitingClarification ? "reply" : "query";
+    setStatus("chat-status", "Думаю…", "");
     addBubble("user", text);
     input.value = "";
     if (!state.ws || state.ws.readyState === WebSocket.CLOSED) {

@@ -25,6 +25,53 @@ def test_chat_format_uses_graph_result_and_image_selection(monkeypatch, tmp_path
     assert result["images"] == [{"url": "/api/images/doc/a.png"}]
 
 
+# --- дедуп источников в _format (решение 31) ---
+
+def _format_session(tmp_path):
+    session = ChatSession.__new__(ChatSession)
+    session.cfg = type("Config", (), {"base_markdown": tmp_path})()
+    return session
+
+
+def test_format_dedups_sources_by_document_id(monkeypatch, tmp_path):
+    session = _format_session(tmp_path)
+    monkeypatch.setattr("firmware.src.chat_api.select_images", lambda *args: [])
+    result = session._format({"final_answer": "Ответ", "cited_chunk_ids": [],
+                              "search_results": [
+                                  {"chunk_id": "c1", "document_id": "doc-1", "title": "Док 1"},
+                                  {"chunk_id": "c2", "document_id": "doc-1", "title": "Док 1"},
+                                  {"chunk_id": "c3", "document_id": "doc-2", "title": "Док 2"},
+                              ]})
+    assert [s["chunk_id"] for s in result["sources"]] == ["c1", "c3"]  # порядок первого вхождения
+
+
+def test_format_dedups_sources_fallback_title_trim_case(monkeypatch, tmp_path):
+    session = _format_session(tmp_path)
+    monkeypatch.setattr("firmware.src.chat_api.select_images", lambda *args: [])
+    result = session._format({"final_answer": "Ответ", "cited_chunk_ids": [],
+                              "search_results": [
+                                  {"chunk_id": "c1", "title": "  ГОСТ Р 1.0-2019 "},
+                                  {"chunk_id": "c2", "title": "гост р 1.0-2019"},
+                              ]})
+    assert [s["chunk_id"] for s in result["sources"]] == ["c1"]
+
+
+def test_format_dedup_does_not_touch_search_results_for_images(monkeypatch, tmp_path):
+    session = _format_session(tmp_path)
+    captured = {}
+    def fake_select_images(search_results, *args, **kwargs):
+        captured["n"] = len(search_results)
+        return []
+    monkeypatch.setattr("firmware.src.chat_api.select_images", fake_select_images)
+    result = session._format({"final_answer": "Ответ", "cited_chunk_ids": [],
+                              "search_results": [
+                                  {"chunk_id": "c1", "document_id": "doc-1"},
+                                  {"chunk_id": "c2", "document_id": "doc-1"},
+                              ]})
+    assert captured["n"] == 2            # select_images видит ПОЛНЫЙ search_results
+    assert len(result["sources"]) == 1   # а sources — дедуплицированный
+
+
 # --- инъекция ключей config/.env в os.environ (решение t_a7d01588, архитектура §6.1) ---
 
 def test_inject_env_file_overrides_stale_process_env(tmp_path, monkeypatch):

@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - only for direct `uvicorn app:app`
 cfg = load()
 app = FastAPI(title="interface_RAG")
 runner = JobRunner()
+_SENTINEL = object()  # маркер «генератор исчерпан» для потоковой отдачи чата
 sessions: dict[str, dict] = {}
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -361,22 +362,75 @@ async def chat(websocket: WebSocket):
                 result = await asyncio.to_thread(session.resume, text)
                 await websocket.send_json(result)
                 continue
-            updates = await asyncio.to_thread(lambda: list(session.stream(text)))
-            state = {}
-            interrupted = False
-            for update in updates:
-                for node, values in update.items():
-                    if node == "__interrupt__":
-                        interrupts = values
-                        value = getattr(interrupts[0], "value", interrupts[0])
-                        await websocket.send_json({"type": "clarification", "text": str(value)})
-                        interrupted = True
-                        continue
-                    await websocket.send_json({"type": "node", "node": node})
-                    if isinstance(values, dict):
-                        state.update(values)
-            if not interrupted:
-                result = session._format(state)
-                await websocket.send_json(result)
+            await _stream_query(websocket, session, text)
     except Exception:
         await websocket.close()
+
+
+async def _stream_query(websocket: WebSocket, session: ChatSession, text: str) -> None:
+    """Потоковая отдача node-событий клиенту по мере выполнения графа.
+
+    session.stream(text) — ленивый sync-генератор LangGraph: каждый next()
+    выполняет ровно один узел (LLM-вызов / поиск Qdrant — блокирующий),
+    поэтому он крутится в executor-потоке. asyncio.Queue НЕ потокобезопасна,
+    значит чанки маршалируются в event-loop через
+    loop.call_soon_threadsafe(q.put_nowait, ...), а единственный потребитель —
+    await q.get() на loop-потоке (вариант A, архитектура t_b551380a §3-4).
+
+    Семантика сохранена: `__interrupt__` → clarification (финальный ответ не
+    шлётся); иначе в конце шлётся session._format(state) с накопленным state.
+    """
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue()   # трогается ТОЛЬКО loop-потоком
+    stop = threading.Event()             # «клиент ушёл» → producer прекращает тянуть
+
+    def produce() -> None:
+        gen = session.stream(text)       # ленивый sync-генератор LangGraph
+        try:
+            for update in gen:
+                if stop.is_set():
+                    break
+                loop.call_soon_threadsafe(q.put_nowait, update)
+        except Exception as exc:         # узел графа бросил → item-исключение в очередь
+            loop.call_soon_threadsafe(q.put_nowait, exc)
+        finally:
+            gen.close()                  # корректно оборвать генератор (finally-цепочку)
+            loop.call_soon_threadsafe(q.put_nowait, _SENTINEL)
+
+    producer = loop.run_in_executor(None, produce)
+
+    state: dict = {}
+    interrupted = False
+    try:
+        while True:
+            item = await q.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                # (A) ошибка графа: сообщить клиенту (снять «Думаю…»), затем пробросить
+                try:
+                    await websocket.send_json({"type": "error", "text": str(item)})
+                except Exception:
+                    pass
+                raise item
+            for node, values in item.items():
+                if node == "__interrupt__":
+                    await websocket.send_json(
+                        {"type": "clarification",
+                         "text": str(getattr(values[0], "value", values[0]))})
+                    interrupted = True
+                    continue
+                await websocket.send_json({"type": "node", "node": node})
+                if isinstance(values, dict):
+                    state.update(values)
+        if not interrupted:
+            await websocket.send_json(session._format(state))
+    except Exception:
+        # (C) send_json бросил (клиент ушёл) / проброшенная ошибка графа:
+        # оборвать поток, не ждать producer (LLM-вызов может идти долго)
+        stop.set()
+        producer.cancel()
+        raise
+    finally:
+        if not stop.is_set():
+            await producer  # нормальное завершение — джойн потока (уже вернулся)
