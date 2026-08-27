@@ -73,6 +73,26 @@ def test_vision_recognition_failure_goes_to_fallback_without_retry(content):
     sleep.assert_not_called()
 
 
+def test_vision_missing_primary_key_goes_to_fallback():
+    calls = []
+    client = _FakeClient([_FakeResponse(content="fallback")], calls)
+    config = {
+        "model": "primary",
+        "base_url": "https://primary",
+        "fallback": {
+            "model": "secondary",
+            "base_url": "https://fallback",
+            "api_key_env": "FB_KEY",
+        },
+    }
+    with patch.object(create_markdown.httpx, "Client", return_value=client), patch.object(create_markdown.time, "sleep") as sleep, patch.dict(os.environ, {"FB_KEY": "key"}):
+        result = create_markdown._call_vision_api("img", "prompt", config, "")
+
+    assert result == "fallback"
+    assert calls == ["https://fallback/chat/completions"]
+    sleep.assert_not_called()
+
+
 @pytest.mark.parametrize("status_code", [400, 401, 403])
 def test_ai_auth_and_request_errors_go_to_fallback_without_retry(status_code):
     calls = []

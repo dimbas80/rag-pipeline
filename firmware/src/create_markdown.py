@@ -2409,10 +2409,6 @@ def _call_vision_api(
     base_url = config.get("base_url", "https://api.provod.ai/v1")
     fallback = config.get("fallback", {})
 
-    if not api_key:
-        log.warning("  Vision: API-ключ не задан")
-        return None
-
     def _do_vision(mdl: str, url: str, key: str) -> str | None:
         payload = {
             "model": mdl,
@@ -2460,10 +2456,13 @@ def _call_vision_api(
         return None
 
     # Primary
-    log.info(f"  Vision: {model}")
-    result = _do_vision(model, base_url, api_key)
-    if result is not None:
-        return result
+    if api_key:
+        log.info(f"  Vision: {model}")
+        result = _do_vision(model, base_url, api_key)
+        if result is not None:
+            return result
+    else:
+        log.warning("  Vision: primary API-ключ не задан — переход к fallback")
 
     # Fallback
     if fallback:
@@ -6420,21 +6419,20 @@ def _process_json_native_pages(
         vision_api_key = os.environ.get(
             config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"), ""
         )
-        if vision_api_key:
-            table_images = []
-            for ordinal, table in enumerate(doc.tables, 1):
-                if not table.image_path:
-                    continue
-                table_images.append({
-                    "path": Path(table.image_path).name,
-                    "table_idx": ordinal,
-                    "id": f"t_p{table.page + 1}_{table.table_index}",
-                })
-            if table_images:
-                recognized = recognize_tables_vision(
-                    table_images, img_dir, config, file_tmp_dir, vision_api_key,
-                )
-                log.info("  Распознано native-таблиц: %s/%s", recognized, len(table_images))
+        table_images = []
+        for ordinal, table in enumerate(doc.tables, 1):
+            if not table.image_path:
+                continue
+            table_images.append({
+                "path": Path(table.image_path).name,
+                "table_idx": ordinal,
+                "id": f"t_p{table.page + 1}_{table.table_index}",
+            })
+        if table_images:
+            recognized = recognize_tables_vision(
+                table_images, img_dir, config, file_tmp_dir, vision_api_key,
+            )
+            log.info("  Распознано native-таблиц: %s/%s", recognized, len(table_images))
         vision_tables = load_vision_tables_from_model(doc, file_tmp_dir)
         ai_cfg = dict(config.get("ai_postprocess", config.get("postprocess", config)))
         if not ai_cfg.get("prompt"):
@@ -6676,13 +6674,10 @@ def process_file(
                     config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"),
                     "",
                 )
-                if vision_api_key:
-                    recognized = recognize_tables_vision(
-                        table_images, img_dir, config, file_tmp_dir, vision_api_key,
-                    )
-                    log.info(f"  Распознано таблиц: {recognized}/{len(table_images)}")
-                else:
-                    log.warning("  PROVOD_API_KEY не задан — vision-распознавание пропущено")
+                recognized = recognize_tables_vision(
+                    table_images, img_dir, config, file_tmp_dir, vision_api_key,
+                )
+                log.info(f"  Распознано таблиц: {recognized}/{len(table_images)}")
 
         # Этап 5: Скриптовая постобработка
         md_text = run_script_postprocess(
