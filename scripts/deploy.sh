@@ -193,15 +193,12 @@ run_remote "симлинк $CONFIG_DIR/providers.yaml → Build_Search_index/fir
 run_remote "симлинк $CONFIG_DIR/search_config.yaml → Build_Search_index/firmware/src/search_config.yaml" \
   "ln -sfn $CONFIG_DIR/search_config.yaml /root/RAG/Build_Search_index/firmware/src/search_config.yaml"
 
-cat <<REMOTE | run_remote_script "очистка dev-артефактов и старых копий конфигов (после бэкапа)"
+cat <<REMOTE | run_remote_script "очистка dev-артефактов и старых копий конфигов (после бэкапа): rm -rf tests/docs/.worktrees/.pytest_cache/workflows/.hermes/include/lib рекурсивно в interface_RAG + Create_Markdown_YA + Build_Search_index; + example/snapshots/tmp/__pycache__"
 set -e
-# interface_RAG: устаревшие копии конфигов и dev-артефакты
+# interface_RAG: устаревшие копии конфигов. Каталоги (tests/docs/.worktrees/…) удаляются единым find ниже — не дублируем.
 rm -f  /root/RAG/interface_RAG/.env
-rm -rf /root/RAG/interface_RAG/docs /root/RAG/interface_RAG/tests \
-       /root/RAG/interface_RAG/.pytest_cache /root/RAG/interface_RAG/workflows \
-       /root/RAG/interface_RAG/.hermes /root/RAG/interface_RAG/.gitignore \
+rm -rf /root/RAG/interface_RAG/.gitignore \
        /root/RAG/interface_RAG/README.md \
-       /root/RAG/interface_RAG/firmware/include /root/RAG/interface_RAG/firmware/lib \
        /root/RAG/interface_RAG/firmware/__pycache__ \
        /root/RAG/interface_RAG/firmware/src/__pycache__
 # Create_Markdown_YA: у пайплайна нет своих копий конфигов (всё через CLI-ключи)
@@ -218,10 +215,17 @@ rm -f  /root/RAG/Build_Search_index/firmware/src/.env
 rm -f  /root/RAG/Create_Markdown_YA/.env
 rm -f  /root/RAG/Build_Search_index/.env
 rm -rf /root/RAG/Build_Search_index/example /root/RAG/Build_Search_index/snapshots \
-       /root/RAG/Build_Search_index/.worktrees \
        /root/RAG/Build_Search_index/firmware/src/__pycache__ \
        /root/RAG/Build_Search_index/firmware/src/telegram_bot/__pycache__
 rm -f  /root/RAG/Build_Search_index/firmware/src/telegram_bot/bot.log*
+# Единая рекурсивная чистка не-runtime каталогов (решение 35, дополнено):
+# tests/docs/.worktrees/.pytest_cache/workflows/.hermes/include/lib — во всех трёх корнях.
+# __pycache__ сюда НЕ включаем: это runtime-артефакт, чистится отдельным find ниже.
+find /root/RAG/interface_RAG /root/RAG/Create_Markdown_YA /root/RAG/Build_Search_index \
+     -type d \
+     \( -name tests -o -name docs -o -name .worktrees -o -name .pytest_cache \
+        -o -name workflows -o -name .hermes -o -name include -o -name lib \) \
+     -prune -exec rm -rf {} + 2>/dev/null || true
 # Глубокая чистка: __pycache__ любой вложенности + README*/AGENTS.md/*.gitkeep
 find /root/RAG/interface_RAG /root/RAG/Create_Markdown_YA /root/RAG/Build_Search_index \
      -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
