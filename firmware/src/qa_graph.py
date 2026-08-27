@@ -1249,6 +1249,11 @@ FALLBACK_LLM_ERROR = (
     "Попробуйте повторить запрос позже."
 )
 
+FALLBACK_EMPTY_ANSWER = (
+    "К сожалению, не удалось сформулировать ответ по вашему запросу. "
+    "Попробуйте переформулировать вопрос или уточнить номер документа."
+)
+
 CITATION_REGEN_INSTRUCTION = (
     "В ответе ОБЯЗАТЕЛЬНО укажи источник для каждого утверждения "
     "в формате [Документ, пункт]."
@@ -1307,6 +1312,11 @@ def generate_answer(state: QAGraphState, config=None) -> dict:
             "error": f"LLM API недоступен: {last_exc}",
             "cited_chunk_ids": [],
         }
+
+    # Модель вернула пустой/пробельный ответ (решение 33): не пустой пузырь и
+    # не error — честный fallback с просьбой переформулировать запрос.
+    if not answer.strip():
+        return {"final_answer": FALLBACK_EMPTY_ANSWER, "cited_chunk_ids": []}
 
     # Матчинг цитат → конкретные чанки
     cited = _match_citations_to_chunks(answer, results)

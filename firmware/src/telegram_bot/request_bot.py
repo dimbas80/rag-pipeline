@@ -22,7 +22,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from dotenv import load_dotenv
 
 from asset_helpers import (
     extract_asset_references,
@@ -32,8 +31,9 @@ from asset_helpers import (
     strip_markdown_tables,
 )
 
-# Загружаем .env из корня проекта
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env"))
+# Ключи подаются systemd EnvironmentFile=/root/RAG/config/.env (решение 36);
+# локальный load_dotenv удалён — это был второй источник истины на удалённый
+# Build_Search_index/.env.
 
 # ─── Конфигурация ──────────────────────────────────────────────────────
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")

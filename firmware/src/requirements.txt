@@ -5,3 +5,4 @@ python-dotenv
 tqdm
 langgraph>=1.2
 pyyaml
+python-telegram-bot>=21
