@@ -2540,6 +2540,40 @@ def recognize_tables_vision(
     return success
 
 
+def _vision_table_missing(
+    table_images: list[dict], tmp_dir: str | Path
+) -> list[dict]:
+    """Вернуть таблицы без валидного table_<table_idx>.md в tmp_dir.
+
+    «Валидный» = файл существует И первая непустая строка совпадает с
+    _TABLE_ID_MARKER_RE (тот же признак, по которому AI-этап собирает
+    vision_tables). Таблицы без маркера считаются нераспознанными.
+    """
+    tmp = Path(tmp_dir)
+    missing: list[dict] = []
+    for ti in table_images:
+        # Ключ соответствия — table_idx (как создаётся table_<idx>.md в
+        # recognize_tables_vision). Запись без table_idx (legacy/битый ввод)
+        # не может иметь валидного кэша — считается недостающей.
+        table_idx = ti.get("table_idx")
+        if table_idx is None:
+            missing.append(ti)
+            continue
+        md_path = tmp / f"table_{table_idx}.md"
+        if not md_path.is_file():
+            missing.append(ti)
+            continue
+        try:
+            lines = [ln for ln in md_path.read_text(encoding="utf-8").splitlines()
+                     if ln.strip()]
+        except OSError:
+            missing.append(ti)
+            continue
+        if not lines or not _TABLE_ID_MARKER_RE.match(lines[0].strip()):
+            missing.append(ti)
+    return missing
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 5. Постобработка: LaTeX
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6443,6 +6477,30 @@ def _process_json_native_pages(
     return md_text
 
 
+def _load_cached_pages(file_tmp_dir: str | Path) -> list[dict] | None:
+    """Загрузить и провалидировать yandex_result.json из tmp/<stem>.
+
+    Возвращает список страниц, если файл есть и корректен (непустой list
+    страниц, хотя бы одна с result.textAnnotation), иначе None (→ полный OCR).
+    """
+    json_path = Path(file_tmp_dir) / "yandex_result.json"
+    if not json_path.is_file():
+        return None
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        log.warning("  Кэш yandex_result.json повреждён — выполняется OCR")
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    if not any(
+        isinstance(p, dict) and p.get("result", {}).get("textAnnotation")
+        for p in data
+    ):
+        return None
+    return data
+
+
 def process_file(
     input_path: str,
     use_ai: bool,
@@ -6565,16 +6623,34 @@ def process_file(
             return False
 
     try:
-        # Этап 2: Yandex OCR
-        pages = send_to_yandex_ocr(pdf_path, api_key, folder_id)
+        # Этап 2: Yandex OCR. При наличии валидного кэша yandex_result.json
+        # (tmp/<stem>/) пайплайн возобновляется из кэша без вызова API и без
+        # требования YANDEX_API_KEY; иначе — полный прогон OCR.
+        pages = _load_cached_pages(file_tmp_dir)
 
-        if not pages:
-            log.warning("  Yandex OCR вернул пустой результат")
-            return False
+        if pages is None:
+            # Полный прогон: кэша нет или он битый — нужен реальный OCR
+            if not api_key or not folder_id:
+                log.error(
+                    "YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env "
+                    "(кэш yandex_result.json отсутствует)"
+                )
+                return False
+            log.info(
+                "  Полный прогон: кэш yandex_result.json отсутствует — выполняется OCR"
+            )
+            pages = send_to_yandex_ocr(pdf_path, api_key, folder_id)
 
-        # Сохраняем JSON в обоих режимах: это исходный OCR-артефакт, а не raw.md.
-        json_path = file_tmp_dir / "yandex_result.json"
-        safe_write(json_path, json.dumps(pages, ensure_ascii=False, indent=2))
+            if not pages:
+                log.warning("  Yandex OCR вернул пустой результат")
+                return False
+
+            # Сохраняем JSON в обоих режимах: это исходный OCR-артефакт, а не raw.md.
+            json_path = file_tmp_dir / "yandex_result.json"
+            safe_write(json_path, json.dumps(pages, ensure_ascii=False, indent=2))
+        else:
+            # Возобновление: данные Яндекса из кэша
+            log.info("  Данные Яндекса получены из кэша (tmp/<stem>/yandex_result.json)")
 
         if use_json_native:
             md_text = _process_json_native_pages(
@@ -6668,16 +6744,32 @@ def process_file(
             except Exception as e:
                 log.warning(f"  Не удалось сохранить карту таблиц: {e}")
 
-            # Vision/AI-распознавание таблиц — только с --ai
+            # Vision/AI-распознавание таблиц — только с --ai.
+            # При возобновлении уже распознанные table_<idx>.md (валидный маркер
+            # _TABLE_ID_MARKER_RE) пропускаются; vision дозапускается только по
+            # недостающему подмножеству таблиц.
             if use_ai and table_images:
                 vision_api_key = os.environ.get(
                     config.get("table_vision", {}).get("api_key_env", "PROVOD_API_KEY"),
                     "",
                 )
-                recognized = recognize_tables_vision(
-                    table_images, img_dir, config, file_tmp_dir, vision_api_key,
-                )
-                log.info(f"  Распознано таблиц: {recognized}/{len(table_images)}")
+                missing = _vision_table_missing(table_images, file_tmp_dir)
+                if missing:
+                    log.info(
+                        f"  Распознавание таблиц: не хватает {len(missing)} из "
+                        f"{len(table_images)} — дозапуск vision"
+                    )
+                    recognized = recognize_tables_vision(
+                        missing, img_dir, config, file_tmp_dir, vision_api_key,
+                    )
+                    log.info(
+                        f"  Распознано таблиц (дозапуск): {recognized}/{len(missing)}"
+                    )
+                else:
+                    log.info(
+                        f"  Распознанные таблицы: {len(table_images)} из "
+                        f"{len(table_images)} (из кэша)"
+                    )
 
         # Этап 5: Скриптовая постобработка
         md_text = run_script_postprocess(
@@ -6897,11 +6989,9 @@ def main() -> None:
     api_key = os.environ.get("YANDEX_API_KEY", "")
     folder_id = os.environ.get("YANDEX_FOLDER_ID", "")
 
-    # Yandex API ключи нужны только для не-.md файлов
-    if input_file.suffix.lower() != ".md":
-        if not api_key or not folder_id:
-            log.error("YANDEX_API_KEY и YANDEX_FOLDER_ID должны быть заданы в .env")
-            sys.exit(1)
+    # Yandex API ключи нужны только для не-.md файлов БЕЗ валидного кэша
+    # tmp/<stem>/yandex_result.json: проверка перенесена в process_file (точка OCR),
+    # чтобы возобновление из кэша работало без YANDEX_API_KEY/YANDEX_FOLDER_ID.
 
     # Загружаем конфиг AI и разрешаем роли из отдельного реестра.
     config = {}
