@@ -19,8 +19,8 @@
 
 ## Build, test, and checks
 
-- Полный подтверждённый набор: `cd firmware && python3 -m pytest tests/ -q --ignore=tests/test_gap_filling.py`.
-- `test_gap_filling.py` — известный отдельный набор с предсуществующими падениями; его исключают из полного регрессионного прогона.
+- Полный подтверждённый набор: `cd firmware && python3 -m pytest tests/ -q`.
+- `test_ai_unified_stage.py` — тесты объединённого Этапа 6+7 (AI-коррекция таблиц + постобработка); входят в полный регрессионный прогон.
 - RAG-тесты: `cd firmware && python3 -m pytest tests/test_rag_v2.py tests/test_rag_jsonl.py -q`.
 - Синтаксическая проверка: `python3 -m py_compile firmware/src/create_markdown.py`.
 - Отдельный запуск теста: `cd firmware && python3 -m pytest tests/<test_file>.py -q`.
