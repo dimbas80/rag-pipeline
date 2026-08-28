@@ -1,8 +1,8 @@
 # interface_RAG — Архитектура веб-оркестратора
 
-> Статус: архитектура для реализации (Coder), ревизия 2026-08-27 (реворк: единый конфиг +
-> чистый прод + новый UI). Источник требований — `docs/product/requirements.md` (§5.0/5.2/5.3/§8)
-> и `docs/product/decision-log.md` (решения 10–19).
+> Статус: архитектура для реализации (Coder), ревизия 2026-08-28 (добавлена итерация 5 —
+> «Удалить результат» + реворк «Провайдеры»/«Роли» + onclose «Думаю…», §13). Источник требований —
+> `docs/product/requirements.md` (§5.0/5.2/5.3/§8) и `docs/product/decision-log.md` (решения 10–46).
 >
 > Пайплайны (`Create_Markdown_YA`, `Build_Search_index`) НЕ изменяются — только чтение их исходников
 > и запуск через `subprocess`. `interface_RAG` — тонкий оркестратор поверх их CLI и публичного
@@ -805,3 +805,132 @@ providers_path=<config_dir>/providers.yaml, search_config_path=<config_dir>/sear
 | Запись в Qdrant — только прод (§7, №3) | §4.6, §8 |
 | Стоп: SIGTERM, облачная OCR может не прерваться (§5.2, №2) | §4.5 |
 | Безопасность (argv, traversal, маски, .env) | §9 |
+| «Удалить результат» — список артефактов, судьба `.md` (№40) | §13.1 |
+| Защита удаления провайдера (№41) | §13.2 |
+| Разделение «Провайдеры»/«Роли», каскадные селекты (№42) | §13.2 |
+| Ключи провайдеров: хранение в `.env`, маска (№43) | §13.2 |
+| Имя провайдера: атомарное переименование (№44) | §13.2 |
+| «Обновить модели» per-provider (№45) | §13.2 |
+| onclose/onerror сброс «Думаю…» (№46) | §13.3 |
+
+---
+
+## 13. Итерация 5 (решения 40–46)
+
+> Источник: решения 40–46 в `docs/product/decision-log.md`. Изменения только на стороне
+> интерфейса (`firmware/src/`); пайплайны Create_Markdown_YA и Build_Search_index НЕ меняются.
+> Удаление артефактов — файловая операция интерфейса; обновление моделей — через существующий
+> `providers_api` (скан `/models`).
+
+### 13.1 Фича 1 — кнопка «Удалить результат» (решение №40)
+
+**Расположение.** Раздел «Добавить документ», область 3 (конвертация/индексация), в
+`action-row` рядом с кнопкой «Стоп» (index.html). Кнопка `#delete-result` (класс `btn danger`),
+неактивна когда нет сессии (`!state.sid`).
+
+**Семантика.** Удаляет промежуточные артефакты конвертации **текущего** документа (по `stem`
+сессии). Точный список (выверен по `create_markdown.py`, §2.1 и разметке `main()` §2.1/§5):
+
+| Удаляется | Путь | Примечание |
+|---|---|---|
+| OCR-кэш + промежуточные таблицы | `<upload_base_dir>/tmp/<stem>/` (каталог целиком) | `yandex_result.json`, `raw.md`, `table_*.md`, PDF (для DOCX), копия `table_images.json` |
+| Изображения/вырезки таблиц | `<base_markdown>/<stem>/image/` (каталог целиком) | `table_N.png` + извлечённые рисунки |
+| Карта таблиц | `<base_markdown>/<stem>/table_images.json` | копия в out_dir |
+
+**Сохраняется (НЕ удаляется):** `<stem>.md`, `<stem>_reg.yaml`, `<stem>_chunks.jsonl`,
+`<stem>_assets.json` (в `<base_markdown>/<stem>/`), исходный файл в `upload_base_dir/`, общий лог
+`tmp/Create_Markdown_VisionOCR.log`, `tmp/.ai_checkpoints/`.
+
+> `tmp/<stem>` вычисляется как `cfg.upload_base_dir / "tmp" / stem` (совпадает с `_derive_tmp_dir`
+> пайплайна: `out_dir.parents[1]/tmp/<stem>` = `base_markdown.parent/tmp/<stem>` = `upload_base_dir/tmp/<stem>`).
+
+**Контракт эндпоинта.** `POST /api/documents/{sid}/delete-result`:
+- 404 — сессия не найдена; 400 — `stem` не проходит валидацию
+  (`^[\w.а-яА-ЯёЁ -]+$`, без `..`/`/`).
+- 200 — `{"deleted": [<str, пути удалённого>], "removed": <int>, "kept": {"md": <str|None>,
+  "reg": <str|None>, "chunks": <str|None>, "assets": <str|None>}, "message": <str>}`.
+- Идемпотентно: если удалять нечего — `removed: 0`, `deleted: []`, message «нечего удалять».
+
+**Безопасность.** Перед удалением каждый целевой путь `resolve()` и проверка префикса:
+`tmp/<stem>` — внутри `(upload_base_dir/"tmp").resolve()`; `image/` и `table_images.json` — внутри
+`base_markdown.resolve()`. Удаление только через `shutil.rmtree`/`Path.unlink` по проверенным путям.
+Реализация — приватный хелпер в `app.py` (`_delete_result(cfg, stem)`) + маршрут; тестируется
+через monkeypatch `cfg` (как `test_app.py`).
+
+**Фронт (app.js).** Обработчик `#delete-result`: `confirm(...)` с перечислением что будет удалено →
+`POST /api/documents/{sid}/delete-result` → сообщение результата в `#doc-status` → `updateGates()`.
+`.md` сохраняется, поэтому `md_exists` остаётся true (вьювер остаётся доступен; картинки в нём
+будут битые — ожидаемо).
+
+### 13.2 Фича 2 — реворк настроек «Провайдеры» / «Роли» (решения 41–45)
+
+Сайдбар настроек (`settings.js`): `NAV_SECTIONS` заменяется на
+`[providers, roles, yandex, telegram, graph, qdrant]`. Секция `provider-keys` удаляется (её
+содержимое — в карточки провайдеров).
+
+**«Провайдеры» (карточка).** Для каждого провайдера из `providers.yaml` — карточка:
+- `name` — text input, редактируемо (переименование — см. №44).
+- `base_url` — text input, редактируемо.
+- `api_key` — env-row (`data-env-key="<api_key_env>"`, `data-env-value`), маска из
+  `GET /api/settings/env`, редактируется; запись — через существующий `PUT /api/settings/env`
+  (значения остаются в `.env`, №43). `api_key_env` в UI не отображается.
+- `models` — сворачиваемый список: строка = имя модели + `<select>` тега
+  (chat/vision/embedding/rerank) + «×» удалить; редактируется в `state.providers` и сохраняется
+  через `PUT /api/settings/providers/{name}`.
+- Кнопки: «Обновить модели» (`POST /api/settings/providers/{name}/refresh`) и «Удалить»
+  (`DELETE /api/settings/providers/{name}`).
+- Вверху секции — «Добавить провайдера» (перенесена из toolbar).
+
+**«Роли».** Каскадные селекты «Провайдер» → «Модель» (плюс «Fallback» чекбокс с каскадными
+селектами). Группировка — по capability, синхронно (решения 6/9):
+
+| Группа (kind) | Подроли (записываются синхронно через `sync_role_models`) | Фильтр тега моделей |
+|---|---|---|
+| chat | `create_markdown.ai_postprocess` + `build_search_index.query_processing` | нет (все модели) |
+| vision | `create_markdown.table_vision` + `create_markdown.registration_vision` | `vision` |
+| embedding | `build_search_index.embedding` | `embedding` |
+| rerank | `build_search_index.rerank` | `rerank` |
+
+Каскад: при смене «Провайдер» список «Модель» перестраивается из
+`providers.<name>.models` с фильтром по тегу; если текущая модель не в списке — добавляется
+отдельной опцией (не теряем роль, как в существующем `bindRoleControls`).
+
+**Новые эндпоинты (app.py):**
+- `PUT /api/settings/providers/{name}` — body `{"name"?: <new_name>, "base_url"?: <str>,
+  "models"?: {model: tag}}`. 404 если нет; 400 при невалидном base_url/конфликте имени/
+  `api_key_env`. Переименование — атомарно (переписывание ссылок ролей, №44). Ответ — полный
+  `providers.yaml`.
+- `DELETE /api/settings/providers/{name}` — 409 если провайдер назначен в роль (detail —
+  список ролей), 404 если нет, 200 `{"deleted": name}`.
+- `POST /api/settings/providers/{name}/refresh` — 404 если нет; 200
+  `{"ok": true, "models": {...}}` или `{"ok": false, "error": ...}` (изоляция ошибки, №45).
+
+**Новые функции `providers_api.py`:**
+- `refresh_provider(providers_path, name, env) -> dict` — скан `/models` одного провайдера, обновить
+  `models`, записать при изменении.
+- `update_provider(providers_path, name, patch) -> dict` — rename/base_url/models; rename переписывает
+  `roles.*.*.provider`/`fallback.provider`.
+- `delete_provider(providers_path, name) -> dict` — проверка ссылок ролей (`_referenced_roles`),
+  отклонение при использовании; иначе удаление + атомарная запись.
+
+**Сохранение (единая кнопка «Сохранить»).** `saveSettings()` дополняется: (1) провайдеры —
+для каждой карточки `PUT /api/settings/providers/{name}` с изменёнными name/base_url/models;
+помеченные к удалению — `DELETE ...`; (2) роли — существующий цикл `PUT
+/api/settings/providers/roles` (spec собирается из каскадных селектов); (3) ключи — существующий
+`PUT /api/settings/env` (env-row карточек подхватываются `collectEnv`); (4) graph/qdrant — как
+сейчас. Глобальная кнопка «Обновить модели» из toolbar убирается (остаются per-provider).
+
+### 13.3 Фича 3 — onclose/onerror сброс «Думаю…» (решение №46)
+
+Только фронт (`static/app.js`, `openChat()`). Добавить:
+```js
+state.ws.onclose = function () {
+  setStatus("chat-status", "", "");
+  state.chat.awaitingClarification = false;
+  setStatus("chat-status", "Соединение прервано — повторите вопрос", "warn");
+};
+state.ws.onerror = function () { setStatus("chat-status", "", ""); };
+```
+Индикатор «Думаю…» ставится в `sendChat()` и снимается в `onmessage` (answer/clarification/error);
+обработчики закрывают «дыру» жёсткого обрыва сети (known issue из `.hermes/STATE.md`). Бэкенд не
+меняется.

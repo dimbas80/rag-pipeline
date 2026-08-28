@@ -7,6 +7,115 @@
 
 ---
 
+## Итерация 5 (решения 40–46) — план для Coder
+
+> Читать вместе с `docs/architecture/architecture.md` §13 и `docs/product/decision-log.md`
+> (решения 40–46). Фазы 1–2 ниже (единый конфиг + UI-реворк) — **уже выполнены**, оставлены как
+> история. Эта итерация — поверх работающего web-ui. Пайплайны НЕ меняются; только `firmware/src/`
+> (+ `static/`) и `firmware/tests/`.
+
+### Этап 5.1 — Фича 1: кнопка «Удалить результат»
+
+**Файлы:**
+- `firmware/src/app.py` — модульный хелпер `_delete_result(cfg, stem) -> dict` + маршрут
+  `POST /api/documents/{sid}/delete-result`. Хелпер: валидация `stem`
+  (`re.fullmatch(r"[\w.а-яА-ЯёЁ -]+", stem)`, без `..`/`/`), затем удаление трёх целей с проверкой
+  префикса после `resolve()`:
+  - `cfg.upload_base_dir / "tmp" / stem` → `shutil.rmtree` (root = `(upload_base_dir/"tmp").resolve()`);
+  - `cfg.base_markdown / stem / "image"` → `shutil.rmtree` (root = `base_markdown.resolve()`);
+  - `cfg.base_markdown / stem / "table_images.json"` → `unlink(missing_ok=True)`.
+  Собирает `deleted` (только реально удалённое), `kept` (пути `.md`/`_reg.yaml`/`_chunks.jsonl`/
+  `_assets.json` — с флагами существования), `removed` (число удалённых узлов), `message`.
+- `firmware/src/static/index.html` — в `action-row` области 3 после «Стоп»:
+  `<button id="delete-result" class="btn danger" disabled>Удалить результат</button>`.
+- `firmware/src/static/app.js` — gating `delete-result.disabled = !state.sid` в `updateGates()`;
+  обработчик: `confirm(...)` → `POST /api/documents/{sid}/delete-result` → `#doc-status` message →
+  `updateGates()`.
+
+**Критерии:** удаляются ровно `tmp/<stem>/`, `image/`, `table_images.json`; сохраняются `.md`,
+`_reg.yaml`, `_chunks.jsonl`, `_assets.json`; 404 при чужой сессии; 400 при `stem` с `..`/`/`;
+повторный вызов идемпотентен (removed=0).
+
+### Этап 5.2 — Фича 2a: бэкенд провайдеров
+
+**Файлы:**
+- `firmware/src/providers_api.py`:
+  - `refresh_provider(providers_path, name, env) -> dict` — найти провайдера (KeyError если нет);
+    `scan_and_tag_models(base_url, env[api_key_env])`; обновить `models`; `write_yaml` при изменении.
+    Возврат `{"ok": True, "models": {...}}` или `{"ok": False, "error": str}` (ошибка не роняет).
+  - `update_provider(providers_path, name, patch) -> dict` — `patch = {name?, base_url?, models?}`.
+    `base_url` — валидация `^https?://`; `name` (rename) — переписать `roles.*.*.provider` и
+    `roles.*.*.fallback.provider` + перенести ключ; `models` — заменить. `write_yaml`. Возврат всего
+    реестра.
+  - `delete_provider(providers_path, name) -> dict` — `_referenced_roles(data, name)` сканирует
+    `roles.*.*.provider`/`fallback.provider`; если есть — `raise ValueError("используется в ролях: ...")`;
+    иначе удалить + `write_yaml`.
+- `firmware/src/app.py` — маршруты:
+  - `PUT /api/settings/providers/{name}` (body: `ProviderUpdate` — `name?`, `base_url?`, `models?`);
+    ValueError → 400, KeyError → 404).
+  - `DELETE /api/settings/providers/{name}` (ValueError с ролями → 409, KeyError → 404).
+  - `POST /api/settings/providers/{name}/refresh` (KeyError → 404; сканы оборачивать в try → 502 не
+    требуется — `refresh_provider` сам возвращает ok/error).
+
+**Критерии:** rename переписывает ссылки ролей; delete назначенного провайдера → 409 с перечнем
+ролей; refresh обновляет только целевого провайдера; конфликт имени/невалидный base_url → 400.
+
+### Этап 5.3 — Фича 2b: фронт «Провайдеры» / «Роли»
+
+**Файлы:** `firmware/src/static/settings.js`, `static/style.css` (минимальные стили карточек,
+можно переиспользовать `.settings-card`/`.env-row`/`.role-card`).
+
+- `NAV_SECTIONS` → `[providers, roles, yandex, telegram, graph, qdrant]`; удалить `provider-keys`.
+  Рендер: `sectionHtml("providers", renderProvidersSection())` + `sectionHtml("roles",
+  renderRolesSection())`.
+- `renderProvidersSection()`: карточки провайдеров (name input, base_url input, env-row для ключа
+  `data-env-key=api_key_env`, список моделей со `<select>` тега + «×», кнопки «Обновить модели» и
+  «Удалить»), сверху — «Добавить провайдера».
+- `renderRolesSection()`: 4 группы (chat/vision/embedding/rerank), в каждой каскадные
+  `<select data-role-provider="kind">` → `<select data-role-model="kind">` + fallback-чекбокс с
+  каскадными селектами. При смене провайдера — `repopulateModels(kind)` (модели провайдера с
+  фильтром по тегу; текущую модель сохранять отдельной опцией).
+- `collectRoleSpec(kind)`: читать provider из `data-role-provider`, model из `data-role-model`;
+  fallback аналогично. `collectProviderEdits()`: собрать по карточкам `{name, base_url, models}`
+  + список удалённых; сохранять через `PUT /api/settings/providers/{name}` / `DELETE ...`.
+- `saveSettings()`: добавить шаг провайдеров (до ролей), ключи — как сейчас (env-row карточек
+  подхватываются `collectEnv`). Глобальную кнопку «Обновить модели» из toolbar убрать
+  (остаются per-provider); `settings-refresh` handler можно удалить, endpoint
+  `POST /api/settings/providers/refresh` оставить нетронутым.
+
+**Критерии:** два раздела; карточки редактируются (имя/base_url/ключ/модели); удаление с защитой;
+per-provider «Обновить модели»; роли — каскадные селекты; единая «Сохранить» пишет всё.
+
+### Этап 5.4 — Фича 3: onclose/onerror «Думаю…»
+
+**Файл:** `firmware/src/static/app.js` — в `openChat()` добавить `state.ws.onclose`/`onerror`
+(код §13.3 архитектуры). Бэкенд не меняется.
+
+**Критерии:** при закрытии/обрыве WS индикатор `#chat-status` очищается, `awaitingClarification`
+сбрасывается, показывается подсказка о прерывании.
+
+### Тесты
+
+- `firmware/tests/test_app.py` — delete-result (создать `tmp/<stem>/`, `image/`,
+  `table_images.json`, сохраняемые файлы; assert удалено/сохранено; 404; stem-traversal 400);
+  провайдерные PUT/DELETE/refresh (через `_fake_cfg` + `TestClient`): rename переписывает роли,
+  delete назначенного → 409, refresh → обновление только цели.
+- `firmware/tests/test_providers_api.py` — `refresh_provider`/`update_provider`/`delete_provider`
+  (изоляция ошибок скана; rename ссылок; защита от удаления назначенного).
+
+### Критерии приёмки итерации 5
+
+- `python3 -m py_compile firmware/src/*.py` без ошибок.
+- `cd firmware && python3 -m pytest tests/ -q` — зелёные (включая новые).
+- Ручная проверка на dev-инстансе (порт 8099): «Удалить результат» удаляет ровно заявленное и
+  сохраняет `.md`/`_reg.yaml`/`_chunks.jsonl`/`_assets.json`; настройки — два раздела, каскадные
+  селекты ролей, per-provider «Обновить модели»/«Удалить» (назначенный удалить нельзя), ключ
+  редактируется в карточке (маска, значение в `.env`); «Думаю…» сбрасывается при обрыве WS.
+- Ключи не утекают (в ответах/логах только маски); дампов конфигов нет.
+- НЕ выполнять `git restore/checkout/stash`; не трогать пайплайны, `.hermes/`, `config/` руками.
+
+---
+
 ## Конвенции (обновлены под реворк)
 
 - Код — `firmware/src/`, тесты — `firmware/tests/`, статика — `firmware/src/static/`.
