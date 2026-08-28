@@ -429,6 +429,55 @@ main {
 .role-card .fallback-toggle { flex-direction: row; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
 .fallback-fields { border-top: 1px dashed var(--border); padding-top: 10px; }
 
+/* Карточки провайдеров (решения 41–45) */
+.provider-toolbar { margin-bottom: 12px; }
+.provider-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.provider-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  background: var(--surface-soft);
+}
+.provider-head { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 10px; }
+.provider-head label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; font-weight: 600; color: #33415a; }
+.provider-name-field { width: 160px; flex: none; }
+.provider-url-field { flex: 1; min-width: 0; }
+.provider-head input {
+  padding: 7px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit; font-size: 13.5px;
+}
+.provider-head input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.provider-card .field-help.err { color: var(--danger); font-size: 12px; margin: 4px 0 8px; }
+.models-details { border-top: 1px dashed var(--border); padding-top: 8px; margin: 8px 0; }
+.models-details summary { cursor: pointer; font-weight: 650; font-size: 13px; color: #33415a; margin-bottom: 8px; }
+.model-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+.model-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px 30px; gap: 8px; align-items: center; }
+.model-row .model-name { font-size: 12.5px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-row select { padding: 4px 6px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font: inherit; font-size: 12.5px; background: var(--surface); }
+.model-row .model-del { padding: 2px 8px; font-size: 14px; line-height: 1; }
+.model-add { display: grid; grid-template-columns: minmax(0, 1fr) 110px auto; gap: 8px; margin-top: 8px; }
+.model-add input, .model-add select {
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit; font-size: 12.5px;
+}
+.provider-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.provider-refresh-result { font-size: 12.5px; }
+.provider-refresh-result.ok { color: var(--success); }
+.provider-refresh-result.err { color: var(--danger); }
+.provider-removed-bar {
+  background: var(--danger-soft);
+  border: 1px solid #f0b4b4;
+  color: var(--danger);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
 .env-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
 .env-row { display: flex; flex-direction: column; gap: 4px; }
 .env-row label { font-size: 12.5px; font-weight: 600; color: #33415a; }
@@ -494,7 +543,7 @@ dialog h2 { margin: 0 0 14px; font-size: 17px; }
 .standalone-back { display: inline-flex; gap: 6px; align-items: center; margin: 18px 0 0; color: var(--accent); text-decoration: none; font-weight: 600; font-size: 14px; }
 
 @media (max-width: 900px) {
-  .form-grid, .role-cards, .env-grid { grid-template-columns: 1fr; }
+  .form-grid, .role-cards, .env-grid, .provider-cards { grid-template-columns: 1fr; }
   .chat-layout { grid-template-columns: 1fr; }
   .settings-layout { grid-template-columns: 1fr; }
   .settings-nav { position: static; }

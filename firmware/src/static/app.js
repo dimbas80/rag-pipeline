@@ -159,6 +159,13 @@
         setStatus("chat-status", "Обрабатывается узел: " + message.node, "");
       }
     };
+    // Решение №46: жёсткий обрыв сети не должен оставлять «Думаю…» навсегда.
+    state.ws.onclose = function () {
+      setStatus("chat-status", "", "");
+      state.chat.awaitingClarification = false;
+      setStatus("chat-status", "Соединение прервано — повторите вопрос", "warn");
+    };
+    state.ws.onerror = function () { setStatus("chat-status", "", ""); };
   }
 
   function sendChat() {
@@ -236,6 +243,7 @@
     convert.disabled = !(state.sid && state.rolesConfigured);
     index.disabled = true;
     stop.disabled = !state.currentJob;
+    $("delete-result").disabled = !state.sid; // решение №40
     areaRegister.classList.toggle("is-disabled", !state.sid);
     areaProgress.classList.toggle("is-disabled", !state.sid);
 
@@ -524,6 +532,25 @@
       logLine("[stop] статус: " + result.status, "warn");
     } catch (error) {
       setStatus("doc-status", "Ошибка остановки: " + error.message, "err");
+    }
+  });
+
+  /* ---------- «Удалить результат» (решение №40) ---------- */
+  $("delete-result").addEventListener("click", async function () {
+    if (!state.sid) return;
+    if (!confirm("Удалить промежуточные артефакты конвертации документа «" + (state.stem || "") + "»?\n\n" +
+        "Будут удалены: кэш OCR (tmp/" + (state.stem || "") + "/), каталог image/ и table_images.json.\n" +
+        "Сохранятся: .md, _reg.yaml, _chunks.jsonl, _assets.json и исходный файл.")) return;
+    var button = $("delete-result");
+    button.disabled = true;
+    try {
+      var result = await api("/api/documents/" + state.sid + "/delete-result", { method: "POST" });
+      setStatus("doc-status", result.message + " " + (result.deleted || []).join("; "), result.removed ? "ok" : "warn");
+      await updateGates();
+    } catch (error) {
+      setStatus("doc-status", "Не удалось удалить результат: " + error.message, "err");
+    } finally {
+      button.disabled = false;
     }
   });
 

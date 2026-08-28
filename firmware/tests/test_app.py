@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 from firmware.src import app
 from fastapi.testclient import TestClient
 
@@ -364,3 +366,118 @@ def test_convert_md_is_noop_instant_job(monkeypatch, tmp_path):
     assert captured["kind"] == "convert"
     assert captured["argv"][0] == sys.executable
     assert "-c" in captured["argv"]  # мгновенно-завершённая job без OCR/AI
+
+
+# --- итерация 5: «Удалить результат» (решение №40) ---
+
+def _delete_result_fixture(tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    stem = "ГОСТ 12.3.456-2020"
+    tmp_base = cfg.upload_base_dir / "tmp" / stem
+    (tmp_base / "pages").mkdir(parents=True)
+    (tmp_base / "pages" / "p1.json").write_text("{}", encoding="utf-8")
+    md_dir = cfg.base_markdown / stem
+    (md_dir / "image").mkdir(parents=True)
+    (md_dir / "image" / "p1_i1.png").write_bytes(b"png")
+    (md_dir / "table_images.json").write_text("{}", encoding="utf-8")
+    (md_dir / f"{stem}.md").write_text("# doc", encoding="utf-8")
+    (md_dir / f"{stem}_reg.yaml").write_text("{}", encoding="utf-8")
+    (md_dir / f"{stem}_chunks.jsonl").write_text("{}", encoding="utf-8")
+    (md_dir / f"{stem}_assets.json").write_text("{}", encoding="utf-8")
+    return cfg, stem
+
+
+def test_delete_result_removes_only_intermediate_artifacts(tmp_path):
+    cfg, stem = _delete_result_fixture(tmp_path)
+    result = app._delete_result(cfg, stem)
+    assert result["removed"] == 3
+    assert not (cfg.upload_base_dir / "tmp" / stem).exists()
+    md_dir = cfg.base_markdown / stem
+    assert not (md_dir / "image").exists()
+    assert not (md_dir / "table_images.json").exists()
+    # сохраняется всё ценное (требование AC: .md, регистрация, чанки, исходник)
+    assert (md_dir / f"{stem}.md").is_file()
+    assert (md_dir / f"{stem}_reg.yaml").is_file()
+    assert (md_dir / f"{stem}_chunks.jsonl").is_file()
+    assert (md_dir / f"{stem}_assets.json").is_file()
+    assert set(result["kept"]) == {"md", "reg", "chunks", "assets"}
+    assert all(v is not None for v in result["kept"].values())
+    # повторный вызов — идемпотентен, «нечего удалять»
+    again = app._delete_result(cfg, stem)
+    assert again["removed"] == 0
+
+
+def test_delete_result_rejects_unsafe_stem(tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    for bad in ("../evil", "a/b", "..", "", "x\\y", "на../з", ".hidden"):
+        try:
+            app._delete_result(cfg, bad)
+            assert False, f"ожидался ValueError для stem={bad!r}"
+        except ValueError:
+            pass
+    assert app._valid_stem("ГОСТ 12.3.456-2020") is True
+
+
+def test_delete_result_endpoint_uses_session_stem(monkeypatch, tmp_path):
+    cfg, stem = _delete_result_fixture(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    monkeypatch.setitem(app.sessions, "s-dr", {"stem": stem})
+    client = TestClient(app.app)
+    response = client.post("/api/documents/s-dr/delete-result")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["removed"] == 3
+    assert (cfg.base_markdown / stem / f"{stem}.md").is_file()
+    # чужой sid -> 404
+    assert client.post("/api/documents/nope/delete-result").status_code == 404
+
+
+# --- итерация 5: PUT/DELETE/per-provider refresh маршруты (решения 41–45) ---
+
+def _providers_route_client(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    cfg.providers_path.write_text(yaml.safe_dump({
+        "providers": {"old": {"base_url": "https://o/v1", "api_key_env": "O_KEY",
+                               "models": {"m1": "chat"}}},
+        "roles": {"create_markdown": {"ai_postprocess": {"provider": "old", "model": "m1"}}},
+    }), encoding="utf-8")
+    monkeypatch.setattr(app, "cfg", cfg)
+    return TestClient(app.app), cfg
+
+
+def test_put_provider_route_rename(tmp_path, monkeypatch):
+    client, cfg = _providers_route_client(monkeypatch, tmp_path)
+    response = client.put("/api/settings/providers/old", json={"name": "new"})
+    assert response.status_code == 200
+    written = yaml.safe_load(cfg.providers_path.read_text(encoding="utf-8"))
+    assert "new" in written["providers"]
+    assert written["roles"]["create_markdown"]["ai_postprocess"]["provider"] == "new"
+
+
+def test_delete_provider_route_409_when_referenced(tmp_path, monkeypatch):
+    client, _ = _providers_route_client(monkeypatch, tmp_path)
+    response = client.delete("/api/settings/providers/old")
+    assert response.status_code == 409
+    assert "create_markdown.ai_postprocess" in response.json()["detail"]
+    assert client.delete("/api/settings/providers/ghost").status_code == 404
+
+
+def test_put_roles_route_not_shadowed_by_name_route(tmp_path, monkeypatch):
+    # /providers/roles (PUT) зарегистрирован раньше /providers/{name} —
+    # регрессия на приоритет маршрутов FastAPI.
+    client, cfg = _providers_route_client(monkeypatch, tmp_path)
+    response = client.put("/api/settings/providers/roles",
+                          json={"kind": "chat", "spec": {"provider": "old", "model": "m1"}})
+    assert response.status_code == 200
+
+
+def test_refresh_provider_route(monkeypatch, tmp_path):
+    client, cfg = _providers_route_client(monkeypatch, tmp_path)
+    monkeypatch.setattr(app.providers_api, "scan_and_tag_models",
+                        lambda base_url, api_key, timeout=20: [{"name": "m2", "tag": "chat"}])
+    cfg.env_file.write_text("O_KEY=secret\n", encoding="utf-8")
+    response = client.post("/api/settings/providers/old/refresh")
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert response.json()["models"] == {"m2": "chat"}
+    assert client.post("/api/settings/providers/ghost/refresh").status_code == 404

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -55,6 +56,11 @@ class ProviderAdd(BaseModel):
     base_url: str
     api_key_env: str
     models: list[str] | list[ProviderModel]
+
+class ProviderUpdate(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    models: dict[str, str] | None = None
 
 class EnvUpdate(BaseModel):
     values: dict[str, str] = {}
@@ -199,6 +205,76 @@ def index_document(sid, _payload: IndexRequest | None = None):
     return first.__dict__
 
 
+_STEM_RE = re.compile(r"^[\w.а-яА-ЯёЁ -]+$")
+
+
+def _valid_stem(stem: str) -> bool:
+    """stem валиден, если проходит regex, не начинается с '.' (скрытые каталоги)
+    и не содержит хода вверх по дереву (§13.1)."""
+    return (bool(stem) and not stem.startswith(".")
+            and ".." not in stem and "/" not in stem and "\\" not in stem
+            and bool(_STEM_RE.fullmatch(stem)))
+
+
+def _delete_result(cfg, stem: str) -> dict:
+    """Удалить промежуточные артефакты конвертации текущего документа (решение №40).
+
+    Удаляются ровно: <upload_base_dir>/tmp/<stem>/, <base_markdown>/<stem>/image/,
+    <base_markdown>/<stem>/table_images.json. Сохраняются .md, _reg.yaml,
+    _chunks.jsonl, _assets.json и исходник. Каждый путь resolve()'ится и
+    проверяется на префикс разрешённого корня до удаления.
+    """
+    if not _valid_stem(stem):
+        raise ValueError("Некорректное имя документа")
+    deleted: list[str] = []
+    removed = 0
+
+    def _under(base: Path, path: Path) -> bool:
+        try:
+            path.relative_to(base)
+            return True
+        except ValueError:
+            return False
+
+    tmp_root = (Path(cfg.upload_base_dir) / "tmp").resolve()
+    md_root = Path(cfg.base_markdown).resolve()
+    targets = [
+        ("dir", Path(cfg.upload_base_dir) / "tmp" / stem, tmp_root),
+        ("dir", Path(cfg.base_markdown) / stem / "image", md_root),
+        ("file", Path(cfg.base_markdown) / stem / "table_images.json", md_root),
+    ]
+    for kind, raw, root in targets:
+        path = raw.resolve()
+        if not _under(root, path) or path == root:
+            raise ValueError(f"Путь вне разрешённого каталога: {path}")
+        if kind == "dir" and path.is_dir():
+            shutil.rmtree(path)
+            deleted.append(str(path))
+            removed += 1
+        elif kind == "file" and path.is_file():
+            path.unlink()
+            deleted.append(str(path))
+            removed += 1
+    doc_dir = Path(cfg.base_markdown) / stem
+    kept = {
+        "md": str(doc_dir / f"{stem}.md") if (doc_dir / f"{stem}.md").is_file() else None,
+        "reg": str(doc_dir / f"{stem}_reg.yaml") if (doc_dir / f"{stem}_reg.yaml").is_file() else None,
+        "chunks": str(doc_dir / f"{stem}_chunks.jsonl") if (doc_dir / f"{stem}_chunks.jsonl").is_file() else None,
+        "assets": str(doc_dir / f"{stem}_assets.json") if (doc_dir / f"{stem}_assets.json").is_file() else None,
+    }
+    message = f"Удалено объектов: {removed}" if removed else "Нечего удалять — промежуточных артефактов нет"
+    return {"deleted": deleted, "removed": removed, "kept": kept, "message": message}
+
+
+@app.post("/api/documents/{sid}/delete-result")
+def delete_result(sid):
+    s = _session(sid)
+    try:
+        return _delete_result(cfg, s["stem"])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/jobs/{job_id}")
 def job(job_id):
     try:
@@ -302,6 +378,35 @@ def refresh_providers():
         return providers_api.refresh_all_models(cfg.providers_path, build_env(cfg.env_file))
     except Exception as exc:
         raise HTTPException(502, f"Не удалось обновить модели: {exc}") from exc
+
+# --- Провайдеры: per-provider операции (итерация 5, решения 42–45). ---
+# PUT/DELETE /roles и /refresh зарегистрированы выше → приоритет над {name}.
+
+@app.put("/api/settings/providers/{name}")
+def update_provider_settings(name: str, payload: ProviderUpdate):
+    try:
+        return providers_api.update_provider(cfg.providers_path, name, payload.model_dump(exclude_unset=True))
+    except KeyError:
+        raise HTTPException(404, "Провайдер не найден")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+@app.delete("/api/settings/providers/{name}")
+def delete_provider_settings(name: str):
+    try:
+        providers_api.delete_provider(cfg.providers_path, name)
+    except KeyError:
+        raise HTTPException(404, "Провайдер не найден")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"deleted": name}
+
+@app.post("/api/settings/providers/{name}/refresh")
+def refresh_provider_settings(name: str):
+    try:
+        return providers_api.refresh_provider(cfg.providers_path, name, build_env(cfg.env_file))
+    except KeyError:
+        raise HTTPException(404, "Провайдер не найден")
 
 def _config_path(kind):
     return cfg.search_config_path if kind == "search" else cfg.create_markdown_config_path
