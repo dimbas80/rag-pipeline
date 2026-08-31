@@ -112,6 +112,12 @@
             </div>
 
             <div class="field">
+              <label for="reg-slug">Слаг (ключ в базе) <span class="req">*</span>
+                <span class="hint" title="Ключ документа в базе (doc_slug). Заполняется автоматически из обозначения, типа и тематики; можно отредактировать вручную. Разрешены латинские буквы, цифры и знак подчёркивания. При смене слага проиндексированного документа (без смены обозначения) переиндексация удалит старые фрагменты и запишет новые — дубликата не будет.">?</span></label>
+              <input id="reg-slug" name="slug" type="text" placeholder="GOST_18410_kabeli">
+            </div>
+
+            <div class="field">
               <label for="reg-document_id_alt">Старое обозначение
                 <span class="hint" title="Предыдущее обозначение при переиздании. Пример: СНиП 2.08.01-89 (после переиздания — СП 54.13330).">?</span></label>
               <input id="reg-document_id_alt" name="document_id_alt" type="text" placeholder="document_id_alt">

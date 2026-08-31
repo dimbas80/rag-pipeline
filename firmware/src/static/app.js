@@ -296,22 +296,26 @@
   /* ---------- регистрация: prefill + форма ---------- */
   async function prefillRegistration() {
     if (!state.sid) return;
+    slugDirty = false; // новый документ: автогенератив слага снова активен
     try {
       var result = await api("/api/documents/" + state.sid + "/register/prefill", { method: "POST" });
       var fields = result.fields || {};
       if (result.source === "reg_yaml") {
         // Существующий <stem>_reg.yaml: восстановить ВСЕ поля (решение №28, без OCR).
         fillAllRegistrationFields(fields);
+        slugDirty = true; // сохранённый слаг авторитетен (стабильность chunk_id) — не перегенерировать
       } else {
         // Vision-prefill: только распознанные поля.
         fillField("reg-document_id", fields.document_id);
         fillField("reg-title", fields.title);
         fillField("reg-domain", fields.domain || fields.domain_hint);
         fillInput("reg-document_type", fields.document_type);
+        fillField("reg-slug", fields.slug);
         // Автоопределение года издания из обозначения (последняя группа цифр).
         var edition = extractEdition(fields.document_id);
         if (edition) fillField("reg-edition", edition);
         if (!$("reg-document_type").value) deriveTypeFromId();
+        refreshSlugPreview();
       }
       if (result.source === "reg_yaml") {
         setStatus("reg-feedback", "Поля восстановлены из существующей регистрации (_reg.yaml) — проверьте и при необходимости отредактируйте.", "ok");
@@ -331,6 +335,7 @@
     "reg-document_id_alt": "document_id_alt",
     "reg-document_type": "document_type",
     "reg-domain": "domain",
+    "reg-slug": "slug",
     "reg-title": "title",
     "reg-edition": "edition",
     "reg-date_enacted": "date_enacted",
@@ -426,10 +431,38 @@
     if (!$("reg-document_type").value) deriveTypeFromId();
   });
 
+  /* ---------- слаг: живой автогенератив до ручной правки ---------- */
+  var SLUG_PREFIX = {"ГОСТ":"GOST", "СП":"SP", "СО":"SO", "СНиП":"SNIP", "ПУЭ":"PUE"};
+  var SLUG_TRANSLIT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"};
+  var slugDirty = false; // true — пользователь правил слаг вручную, автогенератив выключен
+
+  // Клиентская копия registration.make_slug: префикс типа + цифры обозначения + транслит тематики.
+  function buildSlug() {
+    var type = $("reg-document_type").value.trim();
+    var prefix = SLUG_PREFIX[type] || String(type || "DOC").replace(/[^\p{L}\p{N}_]+/gu, "_");
+    var num = $("reg-document_id").value.match(/\d+/);
+    var tail = $("reg-domain").value.trim().toLowerCase()
+      .replace(/[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]/g, function (ch) { return SLUG_TRANSLIT[ch]; })
+      .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    return prefix + "_" + (num ? num[0] : "DOC") + (tail ? "_" + tail : "");
+  }
+
+  function refreshSlugPreview() {
+    if (!slugDirty) $("reg-slug").value = buildSlug();
+  }
+
+  ["reg-document_id", "reg-document_type", "reg-domain"].forEach(function (id) {
+    $(id).addEventListener("input", refreshSlugPreview);
+  });
+
+  $("reg-slug").addEventListener("input", function () {
+    slugDirty = this.value !== ""; // непустой ввод — ручная правка; очистка возвращает автогенератив
+  });
+
   function collectRegistrationFields() {
     var form = $("reg-form");
     var fields = {};
-    ["document_id", "document_id_alt", "document_type", "domain", "title", "edition",
+    ["document_id", "document_id_alt", "document_type", "domain", "slug", "title", "edition",
      "date_enacted", "date_amended", "amended_by", "source_file",
      "status_reason", "replaced_by_document_id", "replaced_by_doc_key"
     ].forEach(function (name) {
@@ -447,7 +480,7 @@
   }
 
   function validateRegistration(fields) {
-    var required = ["document_id", "title", "document_type", "domain", "edition", "date_enacted"];
+    var required = ["document_id", "title", "document_type", "domain", "slug", "edition", "date_enacted"];
     var missing = required.filter(function (name) { return !fields[name]; });
     return missing;
   }
@@ -458,6 +491,10 @@
     var missing = validateRegistration(fields);
     if (missing.length) {
       setStatus("reg-feedback", "Заполните обязательные поля: " + missing.join(", ") + ".", "err");
+      return;
+    }
+    if (fields.slug && !/^[A-Za-z0-9_]+$/.test(fields.slug)) {
+      setStatus("reg-feedback", "Слаг может содержать только латинские буквы, цифры и знак подчёркивания.", "err");
       return;
     }
     $("register").disabled = true;
