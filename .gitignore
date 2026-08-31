@@ -8,3 +8,4 @@ bot.log*
 .pytest_cache/
 workflows/
 firmware/src/qdrant_data/
+.codegraph*/
