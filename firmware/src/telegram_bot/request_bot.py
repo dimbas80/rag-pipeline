@@ -390,6 +390,12 @@ def main():
             app.add_error_handler(error_handler)
             logger.info("Бот запущен, ожидаю сообщения...")
             app.run_polling(allowed_updates=Update.ALL_TYPES)
+            # Нормальный возврат из run_polling = получен stop-сигнал
+            # (SIGTERM от systemctl stop/restart). Выходим, иначе while-True
+            # сразу поднимал новый polling, сервис не мог остановиться и
+            # systemd убивал процесс SIGKILL после TimeoutStopSec.
+            logger.info("Polling остановлен (stop-сигнал) — завершаю процесс")
+            return
         except Exception as e:
             logger.error(f"Бот упал: {e}. Перезапуск через 5 сек...")
             _time.sleep(5)
