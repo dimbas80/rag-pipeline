@@ -5,3 +5,5 @@ __pycache__/
 uploads/
 config/.env
 *.bak
+.codegraph*/
+.venv/
