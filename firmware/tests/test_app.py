@@ -1,8 +1,10 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from firmware.src import app
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -481,3 +483,92 @@ def test_refresh_provider_route(monkeypatch, tmp_path):
     assert response.json()["ok"] is True
     assert response.json()["models"] == {"m2": "chat"}
     assert client.post("/api/settings/providers/ghost/refresh").status_code == 404
+
+
+def test_register_uses_explicit_slug_from_form(monkeypatch, tmp_path):
+    reg_path = tmp_path / "doc_reg.yaml"
+    monkeypatch.setattr(app, "_session", lambda sid: {"name": "doc.pdf", "source": tmp_path / "doc.pdf",
+                                                      "reg": reg_path})
+    response = app.register("x", app.Registration(fields={
+        "document_id": "ГОСТ 123", "document_type": "ГОСТ", "domain": "Кабели",
+        "slug": "GOST_123_my_custom_key",
+    }))
+    assert response == {"slug": "GOST_123_my_custom_key"}
+    data = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+    assert "GOST_123_my_custom_key" in data["documents"]
+
+
+def test_register_rejects_invalid_slug(monkeypatch, tmp_path):
+    reg_path = tmp_path / "doc_reg.yaml"
+    monkeypatch.setattr(app, "_session", lambda sid: {"name": "doc.pdf", "source": tmp_path / "doc.pdf",
+                                                      "reg": reg_path})
+    for bad_slug in ("ГОСТ 123", "my slug", "ключ/1"):
+        with pytest.raises(HTTPException) as exc:
+            app.register("x", app.Registration(fields={
+                "document_id": "ГОСТ 123", "document_type": "ГОСТ", "domain": "Кабели",
+                "slug": bad_slug,
+            }))
+        assert exc.value.status_code == 400
+    assert not reg_path.exists()
+
+
+# --- статус/перезапуск Телеграм-бота (interface-rag-bot.service, раздел «Телеграм») ---
+
+def _fake_bot_info(**overrides):
+    info = {"available": True, "unit": "interface-rag-bot.service", "active": True,
+            "sub_state": "running", "restarts": 2, "started_at": "Mon 2026-08-31 22:00:52 +07",
+            "token_configured": True, "telegram_ok": True}
+    info.update(overrides)
+    return info
+
+
+def test_telegram_bot_status_returns_service_info_without_token(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    cfg.env_file.write_text("TELEGRAM_BOT_TOKEN=secret-token-123\n", encoding="utf-8")
+    monkeypatch.setattr(app, "cfg", cfg)
+    monkeypatch.setattr(app.bot_service, "status", lambda token: _fake_bot_info(token_configured=bool(token)))
+    response = app.telegram_bot_status()
+    assert response["available"] is True
+    assert response["active"] is True
+    assert response["telegram_ok"] is True
+    # токен никогда не попадает в ответ
+    assert "secret-token-123" not in str(response)
+
+
+def test_telegram_bot_status_passes_env_token_to_service(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    cfg.env_file.write_text("TELEGRAM_BOT_TOKEN=tok-42\n", encoding="utf-8")
+    monkeypatch.setattr(app, "cfg", cfg)
+    captured = {}
+    monkeypatch.setattr(app.bot_service, "status", lambda token: captured.setdefault("token", token) or _fake_bot_info())
+    app.telegram_bot_status()
+    assert captured["token"] == "tok-42"
+
+
+def test_telegram_bot_restart_returns_fresh_status(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    monkeypatch.setattr(app.bot_service, "restart", lambda token: _fake_bot_info(restarts=3))
+    response = app.restart_telegram_bot()
+    assert response["available"] is True
+    assert response["restarts"] == 3
+
+
+def test_telegram_bot_restart_unavailable_unit_raises_503(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    monkeypatch.setattr(app.bot_service, "restart", lambda token: {"available": False, "unit": "interface-rag-bot.service"})
+    with pytest.raises(HTTPException) as exc:
+        app.restart_telegram_bot()
+    assert exc.value.status_code == 503
+
+
+def test_telegram_bot_restart_systemctl_failure_raises_502(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    def boom(token):
+        raise RuntimeError("systemctl failed")
+    monkeypatch.setattr(app.bot_service, "restart", boom)
+    with pytest.raises(HTTPException) as exc:
+        app.restart_telegram_bot()
+    assert exc.value.status_code == 502

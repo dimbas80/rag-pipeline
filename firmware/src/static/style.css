@@ -479,6 +479,14 @@ main {
 }
 
 .env-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; }
+
+/* ---------- Статус/перезапуск Телеграм-бота (раздел «Телеграм») ---------- */
+.bot-status-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 14px; }
+.bot-meta { font-size: 12.5px; color: var(--muted); }
+.bot-result { font-size: 12.5px; color: var(--muted); }
+.bot-result.ok { color: var(--success); }
+.bot-result.err { color: var(--danger); }
+
 .env-row { display: flex; flex-direction: column; gap: 4px; }
 .env-row label { font-size: 12.5px; font-weight: 600; color: #33415a; }
 .env-row .env-inputs { display: flex; gap: 8px; align-items: center; }

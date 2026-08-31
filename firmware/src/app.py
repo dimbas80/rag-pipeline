@@ -19,13 +19,13 @@ from pydantic import BaseModel
 try:  # supports both documented package and legacy module invocation
     from firmware.src.deploy_config import load
     from firmware.src.jobs import JobRunner, build_env
-    from firmware.src import config_ui, registration, providers_api, fs_perms
+    from firmware.src import config_ui, registration, providers_api, fs_perms, bot_service
     from firmware.src.chat_api import ChatSession
     from firmware.src import qdrant_api
 except ImportError:  # pragma: no cover - only for direct `uvicorn app:app`
     from deploy_config import load
     from jobs import JobRunner, build_env
-    import config_ui, registration, providers_api, fs_perms
+    import config_ui, registration, providers_api, fs_perms, bot_service
     from chat_api import ChatSession
     import qdrant_api
 
@@ -127,6 +127,9 @@ def state(sid):
 @app.post("/api/documents/{sid}/register")
 def register(sid, payload: Registration):
     s = _session(sid)
+    slug = str(payload.fields.get("slug") or "")
+    if slug and not re.fullmatch(r"[A-Za-z0-9_]+", slug):
+        raise HTTPException(400, "Слаг может содержать только латинские буквы, цифры и знак подчёркивания")
     fs_perms.ensure_dir(s["reg"].parent)  # каталог базы — 0777 (решение №22)
     slug = registration.write_reg_yaml(s["reg"], {**payload.fields, "source_file": s["name"]})
     return {"slug": slug}
@@ -472,6 +475,28 @@ def settings_status():
     roles = providers.get("roles", {})
     required = (("create_markdown", "table_vision"), ("create_markdown", "ai_postprocess"), ("create_markdown", "registration_vision"), ("build_search_index", "query_processing"), ("build_search_index", "embedding"), ("build_search_index", "rerank"))
     return {"environment": cfg.environment, "write_enabled": cfg.write_enabled, "roles": {f"{p}.{r}": bool(roles.get(p, {}).get(r)) for p, r in required}}
+
+
+def _bot_token() -> str | None:
+    return config_ui.read_env_raw(cfg.env_file).get("TELEGRAM_BOT_TOKEN") or None
+
+
+@app.get("/api/settings/telegram/bot")
+def telegram_bot_status():
+    """Статус interface-rag-bot.service + связность с Telegram API (getMe)."""
+    return bot_service.status(_bot_token())
+
+
+@app.post("/api/settings/telegram/bot/restart")
+def restart_telegram_bot():
+    """Перезапустить сервис бота; свежий статус — в ответе."""
+    try:
+        result = bot_service.restart(_bot_token())
+    except Exception as exc:
+        raise HTTPException(502, f"Не удалось перезапустить бота: {exc}") from exc
+    if not result.get("available"):
+        raise HTTPException(503, result.get("reason") or "systemd-юнит бота недоступен")
+    return result
 
 @app.websocket("/ws/chat")
 async def chat(websocket: WebSocket):

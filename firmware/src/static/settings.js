@@ -79,6 +79,9 @@
     search: { nodes: {} },
     status: {},
     qdrant: { path: "", default: "", overridden: false },
+    bot: null,        // статус interface-rag-bot.service (null = ещё не запрашивали)
+    botResult: null,  // { text, cls } — сообщение после перезапуска
+    botBusy: false,   // идёт запрос (статус/рестарт) — не перерисовывать кнопку
     activeSection: "providers",
     qdrantReset: false,
     loaded: false,
@@ -174,6 +177,7 @@
     bindGraphInputs();
     bindEnvInputs();
     bindQdrantControls();
+    bindBotControls();
     bindSettingsNav();
   }
 
@@ -193,6 +197,9 @@
     document.querySelectorAll(".settings-nav button").forEach(function (button) {
       button.classList.toggle("active", button.getAttribute("data-section") === state.activeSection);
     });
+    // Статус бота проверяем при каждом открытии раздела «Телеграм»:
+    // systemd active не гарантирует, что бот отвечает (сеть/прокси).
+    if (state.activeSection === "telegram") refreshBotStatus();
   }
 
   function optionHtml(options, selectedValue) {
@@ -364,11 +371,89 @@
       '<div class="env-grid">' + yandexRows + "</div></section>";
   }
 
+  /* ---------- секция «Телеграм»: статус/перезапуск сервиса бота ---------- */
+  function botBadgeHtml() {
+    var bot = state.bot;
+    if (!bot || bot.loading) return '<span class="badge">статус: проверяю…</span>';
+    if (!bot.available) {
+      return '<span class="badge">недоступно: ' + esc(bot.reason || "юнит не найден") + "</span>";
+    }
+    if (!bot.active) {
+      return '<span class="badge err">остановлен (' + esc(bot.sub_state || "—") + ")</span>";
+    }
+    if (bot.telegram_ok === false) {
+      return '<span class="badge warn">работает, нет связи с Telegram</span>';
+    }
+    return '<span class="badge ok">работает</span>';
+  }
+
+  function botStatusInnerHtml() {
+    var bot = state.bot;
+    var meta = "";
+    if (bot && bot.available) {
+      meta = "запущен: " + (bot.started_at || "—") +
+        ", рестартов: " + (bot.restarts != null ? bot.restarts : 0);
+      if (bot.token_configured === false) meta += ", токен не задан";
+    }
+    var result = state.botResult;
+    var resultHtml = result
+      ? '<span class="bot-result ' + esc(result.cls || "") + '">' + esc(result.text) + "</span>"
+      : '<span class="bot-result"></span>';
+    var restartDisabled = (!bot || !bot.available || state.botBusy) ? " disabled" : "";
+    return botBadgeHtml() +
+      '<span class="bot-meta">' + esc(meta) + "</span>" +
+      resultHtml +
+      '<span class="spacer" style="flex:1 1 auto"></span>' +
+      '<button type="button" id="bot-restart" class="btn"' + restartDisabled + ">Перезапустить бота</button>";
+  }
+
+  function updateBotStatusBlock() {
+    var node = $("bot-status-block");
+    if (!node) return;
+    node.innerHTML = botStatusInnerHtml();
+    bindBotControls();
+  }
+
+  async function refreshBotStatus() {
+    if (state.botBusy) return;
+    state.botBusy = true;
+    state.bot = { loading: true };
+    updateBotStatusBlock();
+    try {
+      state.bot = await api("/api/settings/telegram/bot");
+    } catch (error) {
+      state.bot = { available: false, reason: "эндпоинт недоступен (" + error.message + ")" };
+    }
+    state.botBusy = false;
+    updateBotStatusBlock();
+  }
+
+  function bindBotControls() {
+    var button = $("bot-restart");
+    if (!button || button.disabled) return;
+    button.addEventListener("click", async function () {
+      state.botBusy = true;
+      button.disabled = true;
+      button.textContent = "Перезапускаю…";
+      state.botResult = null;
+      try {
+        state.bot = await api("/api/settings/telegram/bot/restart", { method: "POST" });
+        state.botResult = { text: "Перезапущен", cls: "ok" };
+      } catch (error) {
+        state.botResult = { text: "Ошибка: " + error.message, cls: "err" };
+      }
+      state.botBusy = false;
+      updateBotStatusBlock();
+    });
+  }
+
   function renderOtherKeysCard() {
     var otherRows = KNOWN_ENV.filter(function (item) { return item.section === "telegram"; })
       .map(function (item) { return envRowHtml(item.key, item.label, state.env[item.key], false); }).join("");
     return '<section class="settings-card"><h3>Телеграм</h3>' +
-      '<p class="muted">Настройки Телеграм-бота (interface-rag-bot.service). Изменения применяются после перезапуска бота: systemctl restart interface-rag-bot.service (не hot-apply).</p>' +
+      '<p class="muted">Настройки Телеграм-бота (interface-rag-bot.service). Изменения ключей применяются не сразу: ' +
+      "сохраните, затем нажмите «Перезапустить бота».</p>" +
+      '<div class="bot-status-row" id="bot-status-block">' + botStatusInnerHtml() + "</div>" +
       '<div class="env-grid">' + (otherRows || '<div class="muted small">Телеграм-ключи не настроены.</div>') +
       "</div></section>";
   }
