@@ -1,0 +1,14 @@
+# Секреты и окружение
+.env
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Инструменты
+.codegraph*/
+.DS_Store
