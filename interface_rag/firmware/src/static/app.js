@@ -254,10 +254,11 @@
       $("md-view").hidden = !session.md_exists;
       $("md-download").hidden = !session.md_exists;
       if (session.md_exists) {
-        var href = "/api/files/markdown/" + encodeURIComponent(state.stem);
+        // ts — bust кэша браузера для ссылок «Просмотр»/«Скачать» (a href).
+        var href = mdUrl(state.stem) + "?ts=" + Date.now();
         $("md-view").href = href;
         $("md-download").href = href;
-        loadMdPreview();
+        loadMdPreview(true);
       }
     } catch (error) {
       setStatus("doc-status", "Не удалось получить состояние сессии: " + error.message, "err");
@@ -596,11 +597,16 @@
     return "/api/files/markdown/" + encodeURIComponent(stem);
   }
 
-  async function loadMdPreview() {
+  async function loadMdPreview(force) {
     var preview = $("md-preview");
-    if (!preview || !state.stem || !preview.hidden) return;
+    if (!preview || !state.stem) return;
+    // force — перечитать с диска даже если превью уже открыто
+    // (после конвертации/повторной загрузки документа).
+    if (!force && !preview.hidden) return;
     try {
-      var response = await fetch(mdUrl(state.stem));
+      // no-store: FileResponse отдаёт etag/last-modified, и браузер
+      // эвристически кэширует ответ — без этого показывается устаревший md.
+      var response = await fetch(mdUrl(state.stem), { cache: "no-store" });
       if (!response.ok) return;
       var text = await response.text();
       preview.innerHTML = renderMarkdown(text, state.stem);
@@ -708,13 +714,14 @@
 
   /* ---------- init ---------- */
   $("md-view").addEventListener("click", function (event) {
-    // «Просмотр .md» показывает/скрывает встроенный рендер; скачивание — ссылкой ниже.
+    // «Просмотр .md» — переключатель рендера; каждый показ перечитывает файл
+    // с диска (no-store в loadMdPreview), скачивание — ссылкой ниже.
     event.preventDefault();
     var preview = $("md-preview");
     if (!preview.hidden) {
       preview.hidden = true;
     } else if (state.stem) {
-      loadMdPreview();
+      loadMdPreview(true);
     }
   });
   switchTab("chat");
