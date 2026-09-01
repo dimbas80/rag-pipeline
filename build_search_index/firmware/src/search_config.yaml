@@ -1,0 +1,14 @@
+# Параметры узлов поискового графа. Провайдеры находятся в providers.yaml.
+nodes:
+  analyze_query:
+    temperature: 0.0
+    max_tokens: 256
+  reformulate_query:
+    temperature: 0.3
+    max_tokens: 256
+  ask_clarification:
+    temperature: 0.3
+    max_tokens: 512
+  generate_answer:
+    temperature: 0.0
+    max_tokens: 4096
