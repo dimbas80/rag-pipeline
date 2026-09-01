@@ -3,6 +3,9 @@
 *.env
 !*.env.example
 
+# Локальные параметры деплоя (реальный хост/доступы)
+deploy.conf
+
 # Python
 __pycache__/
 *.pyc

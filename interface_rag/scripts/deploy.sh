@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 #
-# Deploy interface_RAG на LXC 192.0.2.21 («чистый прод», решения 18–19).
+# Deploy interface_RAG на LXC-хост «чистого прода» (решения 18–19).
 #
 # По умолчанию — dry-run: печатает полный план (бэкап + консолидация +
 # rsync-манифест + симлинк + очистка + рестарт + smoke), ничего не меняет.
 # Реальный деплой:  scripts/deploy.sh --apply
 #
 # Требования на машине запуска: sshpass, rsync, python3 (с PyYAML).
-# Доступ к LXC: root/root (LAN, решение №8).
+# Параметры подключения (хост/пользователь/пароль) — scripts/deploy.conf
+# (в git не входит; шаблон: scripts/deploy.conf.example).
 #
 # Примеры:
 #   scripts/deploy.sh            # dry-run
@@ -25,15 +26,17 @@ for arg in "$@"; do
 done
 
 # --- Константы (архитектура §4.10, §8.1) ---
-LXC=192.0.2.21
-LXC_USER=root
-LXC_PASS="${LXC_PASS:-root}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DEV_ROOT="$(dirname "$SCRIPT_DIR")"
+# Локальный scripts/deploy.conf (в git не входит; шаблон: deploy.conf.example)
+# переопределяет: DEPLOY_HOST, DEPLOY_USER, DEPLOY_PASS, DEV_CMY, DEV_BSI.
+if [ -f "$SCRIPT_DIR/deploy.conf" ]; then . "$SCRIPT_DIR/deploy.conf"; fi
+LXC="${DEPLOY_HOST:-192.0.2.21}"
+LXC_USER="${DEPLOY_USER:-root}"
+LXC_PASS="${DEPLOY_PASS:-root}"
 LXC_ROOT=/root/RAG
 CONFIG_DIR=/root/RAG/config
 SERVICE=interface-rag.service
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEV_ROOT="$(dirname "$SCRIPT_DIR")"
 DEV_CMY="${DEV_CMY:-/root/projects/Create_Markdown_YA}"
 DEV_BSI="${DEV_BSI:-/root/projects/Build_Search_index}"
 

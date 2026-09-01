@@ -1,0 +1,14 @@
+# Шаблон параметров деплоя.
+# Скопировать в scripts/deploy.conf и заполнить под свою машину.
+# deploy.conf в git НЕ входит (см. .gitignore).
+#
+# DEPLOY_HOST — адрес LXC-хоста прода (в публичной истории заменён на
+# документационный IP 192.0.2.21 из RFC 5737 — используйте реальный адрес).
+# DEV_CMY / DEV_BSI — пути до соседних проектов на машине запуска
+# (в монорепо это подкаталоги create_markdown/ и build_search_index/).
+
+DEPLOY_HOST=192.0.2.21
+DEPLOY_USER=root
+DEPLOY_PASS=root
+DEV_CMY=/path/to/rag-pipeline/create_markdown
+DEV_BSI=/path/to/rag-pipeline/build_search_index
