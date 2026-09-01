@@ -221,14 +221,19 @@ def test_unified_attaches_matching_vision_table(fake_env):
 
 def test_unified_chunks_large_md_text(fake_env):
     """(г) Большой md_text чанкуется: чанк <= AI_MAX_CHARS, контекст
-    "<stem> [ч. N]", содержимое не теряется, результаты склеены."""
+    "<stem> [ч. N]", содержимое не теряется, результаты склеены.
+
+    Фейковый ответ сопоставим с чанком по длине: гард полноты
+    (_ai_result_or_original) отбраковывает усечённые ответы, поэтому
+    «короткая заглушка» в итог не попадает.
+    """
     big_md = _big_md_text()
     calls = []
 
     def fake_ai(text, cfg, context=""):
         n = len(calls)
         calls.append((text, context))
-        return f"AI_RESULT_{n}"
+        return text + f" [AI_RESULT_{n}]"
 
     ok, mock_call = _run_process_file(
         fake_env, {"ai_postprocess": {"prompt": "p"}},
@@ -236,7 +241,7 @@ def test_unified_chunks_large_md_text(fake_env):
     )
     assert ok is True
     assert mock_call.call_count > 1
-    # Контекст каждого чанка — "<stem> [ч. N]", ни один чанк не превышает лимит
+    # Контекст каждого чанка — "<stem> [ч.{i + 1}]", ни один чанк не превышает лимит
     all_input = ""
     for i, (text, context) in enumerate(calls):
         assert context == f"input [ч.{i + 1}]"
@@ -269,7 +274,9 @@ def test_unified_partial_results_keep_chunk(fake_env):
     def fake_ai(text, cfg, context=""):
         n = counter[0]
         counter[0] += 1
-        return f"AI_OK_{n}" if n % 2 == 0 else None
+        # Успешный ответ сопоставим с чанком по длине (гард полноты отбраковывает
+        # усечённые ответы), неуспешный — None (исходный чанк сохраняется).
+        return text + f" [AI_OK_{n}]" if n % 2 == 0 else None
 
     ok, mock_call = _run_process_file(
         fake_env, {"ai_postprocess": {"prompt": "p"}},

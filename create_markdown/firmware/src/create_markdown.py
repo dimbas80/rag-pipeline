@@ -224,7 +224,7 @@ def parse_yandex_json_to_model(pages: list[dict] | None) -> Document:
             if any(bbox.y0 >= tb.y0 and bbox.y1 <= tb.y1 and bbox.y1 > bbox.y0 for tb in table_boxes):
                 continue
             layout = str(raw_block.get("layoutType", ""))
-            caption_flag = bool(_TABLE_WORD_RE.search(_normalize_spaced_text(text))) or layout.endswith("CAPTION")
+            caption_flag = _looks_like_table_caption(text) or layout.endswith("CAPTION")
             continuation_flag = _is_continuation_caption(text)
             heading_parts = _model_heading_parts(text) if layout.endswith("SECTION_HEADER") else None
             level = number = title = None
@@ -449,6 +449,10 @@ PROVOD_BASE_URL = "https://api.provod.ai/v1"
 
 # Лимиты
 AI_MAX_CHARS = 80000
+# Доля длины AI-ответа относительно исходного чанка, ниже которой ответ
+# считается неполным (LLM молча пропустила фрагмент): чанк идёт в итог
+# без изменений — потеря текста недопустима.
+AI_MIN_OUTPUT_RATIO = 0.85
 YANDEX_MAX_PAGES = 200
 YANDEX_MAX_SIZE_MB = 10
 YANDEX_POLL_TIMEOUT = 600  # 10 минут
@@ -1063,6 +1067,15 @@ def parse_yandex_json_to_md(
         # 3. Рендерим страницу в порядке Y
         page_lines: list[str] = []
 
+        def _next_rendered(index: int) -> tuple[str, dict] | None:
+            """Следующий элемент после index, который не является блоком-ячейкой таблицы."""
+            for j in range(index + 1, len(elements)):
+                jtype, jdata = elements[j][1], elements[j][2]
+                if jtype == "block" and _block_in_table(jdata):
+                    continue
+                return (jtype, jdata)
+            return None
+
         # Индекс таблицы в массиве ta["tables"] — единственный источник id.
         # Тот же список итерирует extract_table_images() через enumerate(ta["tables"]),
         # поэтому ti здесь == ti в вырезке (тождество id, контракт table-id-marker §4).
@@ -1071,10 +1084,22 @@ def parse_yandex_json_to_md(
             id(t): i for i, t in enumerate(raw_tables)
         }
 
-        for y, etype, data in elements:
+        for idx, (y, etype, data) in enumerate(elements):
             if etype == "block":
                 # Пропускаем блоки, которые являются частью таблицы
                 if _block_in_table(data):
+                    continue
+                block_text = _block_text(data)
+                nxt = _next_rendered(idx)
+                # «Окончание/Продолжение …» — служебный маркер ТОЛЬКО если сразу
+                # за ним идёт таблица; иначе это обычный текст (дефект: проза
+                # со словом «окончание» ошибочно принималась за маркер).
+                if _CONTINUATION_MARKER_RE.match(block_text) and nxt and nxt[0] == "table":
+                    continue
+                # Одинокая «Т» — оторванная первая буква подписи «Т а б л и ц а …»
+                # (OCR делит подпись на два блока); подавляем только перед подписью.
+                if (block_text == "Т" and nxt and nxt[0] == "block"
+                        and _CAPTION_START_RE.match(_block_text(nxt[1]))):
                     continue
                 text = _block_to_md(data)
                 if text:
@@ -1158,12 +1183,19 @@ def _block_to_md(block: dict) -> str:
     # Нормализуем для проверки содержания
     normalized = _normalize_spaced_text(text)
 
-    # Блоки с "Т а б л и ц а" — это подпись, будет вставлена с таблицей
-    if re.search(r"Таблиц[аы]", normalized, re.IGNORECASE):
+    # Подпись «Т а б л и ц а …» — только если слово стоит в НАЧАЛЕ блока:
+    # абзац с упоминанием «(таблица Б.1)» в середине — это текст, не подпись.
+    if _CAPTION_START_RE.match(text):
         return ""
 
-    # Блоки с "П р и м е ч а н и е" — это примечание, будет в > blockquote у таблицы
-    if re.search(r"Примечани[ея]", normalized, re.IGNORECASE):
+    # «Окончание/Продолжение таблицы N» — служебная подпись-продолжение.
+    # Блок-маркер БЕЗ слова «таблица», за которым не идёт таблица, отсекается
+    # контекстно в parse_yandex_json_to_md и сюда не доходит.
+    if _CONTINUATION_CAPTION_RE.search(normalized):
+        return ""
+
+    # «П р и м е ч а н и е» — только в начале блока (аналогично подписи).
+    if _PRIM_NOTE_START_RE.match(text):
         return ""
 
     layout_type = block.get("layoutType", "")
@@ -1195,6 +1227,39 @@ def _block_to_md(block: dict) -> str:
 
 
 _TABLE_WORD_RE = re.compile(r"Т\s*а\s*б\s*л\s*и\s*ц\s*а", re.IGNORECASE)
+
+# Якорные проверки: слово стоит в НАЧАЛЕ блока. Слово «таблица»/«примечание»
+# в середине обычного абзаца (например, «…(таблица Б.1)…») не делает блок
+# подписью/примечанием — такие блоки выводятся как текст (иначе теряется текст).
+# _CAPTION_START_RE учитывает OCR-разбиение подписи: «Т а б л и ц а …» и
+# оторванную первую букву («Т» отдельным блоком + «а б л и ц а …»).
+_CAPTION_START_RE = re.compile(r"^\s*Т?\s*а\s*б\s*л\s*и\s*ц\s*а\b", re.IGNORECASE)
+_PRIM_NOTE_START_RE = re.compile(
+    r"^\s*П\s*р\s*и\s*м\s*е\s*ч\s*а\s*н\s*и\s*[ея]\b", re.IGNORECASE
+)
+# Маркер продолжения таблицы: «Окончание/Продолжение …» в начале строки.
+# Слово «таблица» может отсутствовать (OCR); валидность маркера определяется
+# контекстом (за ним должна идти таблица), а не наличием слова. \b отсекает
+# словоформы («окончанием короткого замыкания») — не маркеры.
+_CONTINUATION_MARKER_RE = re.compile(
+    r"^\s*\*{0,2}\s*(?:Окончани[ея]|Продолжени[ея]|Продолж\.?)\b", re.IGNORECASE
+)
+# Шум полосы страницы между таблицами: колонтитул «ГОСТ …», номер страницы.
+_PAGE_NOISE_RE = re.compile(
+    r"^(?:ГОСТ\s+\d+[—\-–\s]*\d*|\d{1,4}|—\s*\d{1,4}\s*—)\s*$", re.IGNORECASE
+)
+
+
+def _looks_like_table_caption(text: str) -> bool:
+    """Якорная проверка: блок является подписью таблицы.
+
+    «Таблица…» в начале блока (включая OCR-варианты «Т а б л и ц а» и
+    «а б л и ц а …» без первой буквы) либо явное «Окончание/Продолжение
+    таблицы N». Слово «таблица» в середине обычного абзаца подписью
+    не является.
+    """
+    t = text.strip()
+    return bool(_CAPTION_START_RE.match(t) or _CONTINUATION_CAPTION_RE.search(t))
 
 
 def _block_text(block: dict) -> str:
@@ -2891,10 +2956,25 @@ def _table_header(table_lines: list[str]) -> str:
     return table_lines[0].strip() if table_lines else ""
 
 
-def _is_continuation(text: str) -> bool:
-    """Проверить 'Продолжение...' или 'Окончание...'."""
-    text = text.strip().lower()
-    return any(kw in text for kw in ["продолжение", "окончание", "продолж.", "оконч."])
+def _between_is_service_only(between_lines: list[str]) -> bool:
+    """Между таблицами нет содержательного текста?
+
+    Допустимое «служебное» содержимое: ID-маркеры таблиц, подписи
+    («Таблица N — …», «Окончание/Продолжение таблицы N», слово «таблица»
+    может отсутствовать из-за OCR) и шум полосы страницы (колонтитул,
+    номер страницы). Любая содержательная строка — это текст, и слияние
+    таблиц с его удалением запрещено.
+    """
+    for raw_line in between_lines:
+        line = raw_line.strip()
+        if not line or _TABLE_ID_MARKER_RE.match(line) or _PAGE_NOISE_RE.match(line):
+            continue
+        bare = line.strip("*").strip()
+        if (_CONTINUATION_MARKER_RE.match(bare)
+                or _CAPTION_START_RE.match(_normalize_spaced_text(bare))):
+            continue
+        return False
+    return True
 
 
 def _extract_table_number(text: str) -> str | None:
@@ -2985,7 +3065,15 @@ def merge_tables(md_text: str) -> str:
             n_start, n_end = tables[j]
             between = "\n".join(lines[t_end:n_start]).strip()
             between_lines = [l for l in between.split("\n") if l.strip()]
-            has_continuation = any(_is_continuation(bl) for bl in between_lines)
+            # Слияние допустимо только когда между таблицами нет содержательного
+            # текста (дефект: подстроки «окончание/продолжение» в обычной прозе
+            # между таблицами считались маркером продолжения, и текст между
+            # таблицами молча удалялся).
+            service_only = _between_is_service_only(between_lines)
+            has_continuation = service_only and any(
+                _CONTINUATION_MARKER_RE.match(bl.strip().strip("*").strip())
+                for bl in between_lines
+            )
 
             next_lines = lines[n_start:n_end]
             next_header = _table_header(next_lines)
@@ -2998,8 +3086,8 @@ def merge_tables(md_text: str) -> str:
 
             same_caption = _same_table_caption(lines, t_start, n_start)
 
-            can_merge = has_continuation or (
-                header and header == next_header and same_caption
+            can_merge = service_only and (
+                has_continuation or (header and header == next_header and same_caption)
             )
 
             if not can_merge:
@@ -3741,6 +3829,35 @@ def _chunk_text(text: str, max_chars: int = AI_MAX_CHARS) -> list[str]:
     return [c for c in chunks if c]
 
 
+def _ai_result_or_original(result: str | None, chunk: str, context: str) -> str:
+    """Гард полноты AI-ответа: при частичной потере вернуть исходный чанк.
+
+    LLM на длинном входе может молча пропустить фрагмент текста. Пустой
+    ответ уже обработан вызывающим кодом; здесь ловим ЧАСТИЧНУЮ потерю:
+      - ответ заметно короче входного чанка (< AI_MIN_OUTPUT_RATIO);
+      - из ответа исчезли ID-маркеры таблиц, присутствовавшие в чанке.
+    В обоих случаях в итоговый Markdown уходит исходный чанк.
+    """
+    if not result:
+        return chunk
+    if len(result) < AI_MIN_OUTPUT_RATIO * len(chunk):
+        log.error(
+            "  ⚠ %s: AI-ответ короче входа (%d из %d символов) — оставляю исходный чанк",
+            context, len(result), len(chunk),
+        )
+        return chunk
+    chunk_ids = set(re.findall(r"<!--\s*(t_p\d+_\d+)\s*-->", chunk))
+    result_ids = set(re.findall(r"<!--\s*(t_p\d+_\d+)\s*-->", result))
+    lost = chunk_ids - result_ids
+    if lost:
+        log.error(
+            "  ⚠ %s: AI-ответ потерял ID-маркеры таблиц (%s) — оставляю исходный чанк",
+            context, ", ".join(sorted(lost, key=_table_id_sort_key)),
+        )
+        return chunk
+    return result
+
+
 def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
     """AI-постобработка через config-указанный провайдер.
 
@@ -3807,7 +3924,16 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
                     continue
                 resp.raise_for_status()
                 data = resp.json()
-                content = data["choices"][0]["message"].get("content") or ""
+                choice = data["choices"][0]
+                finish_reason = choice.get("finish_reason")
+                if finish_reason == "length":
+                    log.warning(
+                        f"  {prv}/{mdl}: ответ усечён (finish_reason=length) — "
+                        f"считаю неудачей, попытка {attempt + 1}/3"
+                    )
+                    time.sleep(5)
+                    continue
+                content = choice["message"].get("content") or ""
                 content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
                 content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
                 if _is_recognition_failure(content):
@@ -6870,7 +6996,7 @@ def process_file(
 
                 log.info(f"  Часть {i + 1}/{len(md_chunks)} ({len(chunk_input)} символов)")
                 result = _call_ai_api(chunk_input, ai_cfg, f"{file_stem} [ч.{i + 1}]")
-                candidate = result if result else chunk
+                candidate = _ai_result_or_original(result, chunk, f"{file_stem} [ч.{i + 1}]")
                 results[i] = _normalize_inline_latex_delimiters(candidate)
                 try:
                     ckpt_path.write_text(
