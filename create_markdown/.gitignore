@@ -1,0 +1,7 @@
+.worktrees/
+__pycache__/
+.env
+.pytest_cache/
+tmp/
+workflows/
+.codegraph*/
