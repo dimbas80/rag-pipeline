@@ -1,0 +1,9 @@
+.worktrees/
+__pycache__/
+*.pyc
+.env
+uploads/
+config/.env
+*.bak
+.codegraph*/
+.venv/

@@ -1,0 +1,18 @@
+[Unit]
+Description=interface_RAG Telegram QA bot
+After=network-online.target interface-rag.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/RAG/Build_Search_index/firmware/src/telegram_bot
+EnvironmentFile=/root/RAG/config/.env
+ExecStart=/root/RAG/venv/bin/python request_bot.py
+Restart=always
+RestartSec=5
+# Бот stateless: если грациозная остановка зависла — SIGKILL через 15с,
+# иначе каждый restart/stop висел 90с (дефолт TimeoutStopUSec).
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
