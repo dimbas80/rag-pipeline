@@ -16,6 +16,8 @@ import logging.handlers
 import os
 import re
 import sys
+import threading
+import time
 
 # Добавляем родительскую директорию для импорта qa_graph
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -62,6 +64,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("telegram_bot")
 
+# httpx (транспорт python-telegram-bot) пишет INFO на каждый long-poll
+# getUpdates — ~5 строк/мин заглушают полезные записи в journald и файле.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 if not TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN не задан в .env!")
     sys.exit(1)
@@ -103,9 +109,13 @@ def _is_authorized(update: Update) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приветствие при /start."""
+    """Приветствие при /start. Заодно сбрасывает историю диалога чата:
+    /start = начало нового разговора без контекста прошлых вопросов."""
     if not _is_authorized(update):
         return
+    chat_id = update.effective_chat.id
+    if _history.pop(chat_id, None) is not None:
+        logger.info("История диалога очищена по /start [chat=%s]", chat_id)
     await update.message.reply_text(
         "🔍 *QA-бот нормативных документов*\n\n"
         "Я отвечаю на вопросы по ГОСТ, СП, СНиП, СанПиН, ПУЭ, ПТЭ "
@@ -115,6 +125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• «Как организовать электроснабжение котельной»\n"
         "• «Можно ли использовать крышу как молниеприемник»\n\n"        
         "Команды:\n"
+        "/start — начать новый диалог (сбрасывает контекст прошлых вопросов)\n"
         "/list — перечень документов в базе",
         parse_mode="Markdown",
     )
@@ -187,7 +198,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         qa = get_qa()
-        result = await asyncio.to_thread(qa.run, full_query)
+        run_started = time.monotonic()
+        # user_query — чистый новый вопрос: целенаправленный поиск «Таблица N»
+        # не должен видеть «табл. N» из цитат в контексте истории (full_query).
+        result = await asyncio.to_thread(qa.run, full_query, query)
+        logger.info("[timing] qa.run total: %.1fs", time.monotonic() - run_started)
 
         # Граф может остановиться на уточняющем вопросе (ask_clarification):
         # в результате есть ключ __interrupt__ и нет final_answer. Отвечаем
@@ -388,6 +403,12 @@ def main():
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             app.add_error_handler(error_handler)
             logger.info("Бот запущен, ожидаю сообщения...")
+            # Прогрев QA-графа в фоне: импорт qa_graph + загрузка fastembed
+            # bm25 занимают 15–16 с (замер 2026-09-03) — иначе это платит
+            # первый вопрос после старта процесса. Демон-поток не мешает
+            # остановке; повторный get_qa() из handle_message безопасен
+            # (проверка _qa is None, повторная инициализация безвредна).
+            threading.Thread(target=get_qa, name="qa-warmup", daemon=True).start()
             app.run_polling(allowed_updates=Update.ALL_TYPES)
             # Нормальный возврат из run_polling = получен stop-сигнал
             # (SIGTERM от systemctl stop/restart). Выходим, иначе while-True

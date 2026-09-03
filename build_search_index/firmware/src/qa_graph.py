@@ -95,7 +95,7 @@ API_RETRY_BACKOFF = 2.0
 # ─── Пост-валидация цитат (раздел 5.6 архитектуры) ────────────────────
 
 CITATION_PATTERN = re.compile(
-    r"\[([А-ЯЁа-яёA-Za-z0-9\s.,/\-]+?)\s*[,;]\s*(?:п\.|пп\.|табл\.|таблица|ст\.|разд\.|прил\.)\s*[\d.]+\]"
+    r"\[([А-ЯЁа-яёA-Za-z0-9\s.,/\-—–]+?)\s*[,;]\s*(?:п\.|пп\.|табл\.|таблица|ст\.|разд\.|прил\.)\s*[\d.]+\]"
 )
 
 # Гибкий вариант для матчинга цитат в _match_citations_to_chunks
@@ -103,10 +103,19 @@ CITATION_PATTERN = re.compile(
 # Группа 1: document_id, группа 2: тип (п./табл./ст.), группа 3: номер
 # Номер: цифры + опционально кириллическая буква приложения (А-Я) + .цифры
 CITATION_MATCH_PATTERN = re.compile(
-    r"\[?([А-ЯЁа-яёA-Za-z0-9\s.,/\-]{3,}?)\s*[,;]\s*"
+    r"\[?([А-ЯЁа-яёA-Za-z0-9\s.,/\-—–]{3,}?)\s*[,;]\s*"
     r"(п\.|пп\.|табл\.|таблица|таблицей|ст\.|разд\.|прил\.)\s*"
     r"([А-ЯA-Z]?\.?\d+(?:\.\d+)*)\]?"
 )
+
+
+def _norm_dashes(s: str) -> str:
+    """«—»/«–» → «-»: LLM ставит длинное тире в номерах документов
+    («ГОСТ 31996—2012»), тогда как document_id в базе содержит дефис.
+    Без нормализации has_citations не видит цитату (лишняя регенерация
+    ответа) и _match_citations_to_chunks не находит chunk_id (пустой
+    cited_chunk_ids → бот не отправляет картинки по цитатам)."""
+    return (s or "").replace("—", "-").replace("–", "-")
 
 
 # ─── Состояние графа (раздел 3 архитектуры) ───────────────────────────
@@ -117,6 +126,12 @@ class QAGraphState(TypedDict):
     # ── Входные данные ──
     query: str
     """Исходный запрос пользователя (неизменен на протяжении всего графа)."""
+
+    user_query: str
+    """Новый вопрос пользователя БЕЗ контекста истории (None → равен query).
+    Нужен целенаправленному поиску: ссылки «Таблица N»/«Рисунок N» извлекаются
+    только из нового вопроса, чтобы «табл. 19» в цитатах прошлых ответов
+    (переданных в query для LLM-контекста) не уводила поиск к чужому чанку."""
 
     # ── Диалог ──
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -271,7 +286,11 @@ def llm_chat(messages: list[dict], config: QAGraphConfig | None = None,
             raise
         except (requests.RequestException, KeyError, IndexError, TypeError, ValueError) as exc:
             raise ProviderUnavailableError(str(exc)) from exc
-    return run_with_fallback(spec, attempt, "chat")
+    started = time.monotonic()
+    result = run_with_fallback(spec, attempt, "chat")
+    logger.info("[timing] llm_chat %s: %.1fs (provider=%s model=%s)",
+                node_name, time.monotonic() - started, spec["provider"], spec["model"])
+    return result
 
 
 # ─── Форматирование результатов поиска (раздел 5.6) ───────────────────
@@ -384,7 +403,7 @@ def _match_citations_to_chunks(answer: str, search_results: list[dict]) -> list[
     cited: set[str] = set()
 
     for m in CITATION_MATCH_PATTERN.finditer(answer):
-        doc_ref = m.group(1).strip()   # "СО 153-34.21.122-2003"
+        doc_ref = _norm_dashes(m.group(1).strip())  # "СО 153-34.21.122-2003"
         ref_type = m.group(2)          # "п." или "табл." или "ст."
         ref_num = m.group(3)           # "3.3.2.2" или "3.1"
 
@@ -627,6 +646,34 @@ def _get_sparse_model() -> SparseTextEmbedding:
 
 # ─── Узел 1: analyze_query (раздел 5.1) ───────────────────────────────
 
+# Rule-based предфильтр конкретности (оптимизация 2026-09-03: узел стоит
+# 5–17 с на каждый вопрос, а его вердикт влияет только на выбор маршрута
+# search/ask_clarification — см. _route_after_analyze).
+_DOC_HINT_RE = re.compile(r"\b(?:ГОСТ|СП|СНиП|СанПиН|ПУЭ|ПТЭ|РД|ВСН|СН)\b", re.I)
+_DIGIT_RE = re.compile(r"\d")
+_SIGNIFICANT_WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]{4,}")
+
+
+def _looks_concrete(query: str) -> bool | None:
+    """Локальная оценка «конкретности» запроса без LLM.
+
+    True  — запрос явно конкретен (номер документа, любая цифра или
+            ≥3 значимых слова): analyze_query можно пропустить, маршрут
+            и так будет search;
+    None  — уверенности нет, решает LLM как раньше (короткие запросы,
+            продолжения диалога «а в воздухе?»).
+
+    False никогда не возвращается: локально нельзя надёжно распознать
+    абстрактный запрос, ложное уточнение хуже лишнего поиска.
+    """
+    q = query or ""
+    if _DOC_HINT_RE.search(q) or _DIGIT_RE.search(q):
+        return True
+    if len(_SIGNIFICANT_WORD_RE.findall(q)) >= 3:
+        return True
+    return None
+
+
 ANALYZE_QUERY_PROMPT = """Ты — анализатор поисковых запросов к базе нормативных документов
 (ГОСТ, СП, СНиП, СанПиН).
 
@@ -662,6 +709,19 @@ def analyze_query(state: QAGraphState, config=None) -> dict:
     cfg = _get_qa_config(config)
     query = state.get("query", "")
     history = state.get("messages") or []
+
+    # Rule-based пропуск LLM-классификации (оптимизация скорости):
+    # явно конкретный запрос → маршрут search без вызова LLM.
+    if _looks_concrete(query) is True:
+        logger.info("[timing] analyze_query: 0.0s (rule-based, LLM пропущен)")
+        return {
+            "query_analysis": {
+                "is_concrete": True,
+                "key_terms": [],
+                "suggested_clarification": None,
+            },
+            "active_query": query,
+        }
 
     messages = _build_llm_messages(ANALYZE_QUERY_PROMPT, query, history)
     try:
@@ -816,7 +876,7 @@ def _scroll_chunks_by_ids(client, collection: str, chunk_ids: list[str]) -> list
 
 
 def _targeted_search_results(
-    query: str, client, cfg: QAGraphConfig
+    query: str, client, cfg: QAGraphConfig, ref_query: str | None = None
 ) -> list[dict] | None:
     """Целенаправленный поиск чанка с явно запрошенной таблицей/рисунком.
 
@@ -827,9 +887,15 @@ def _targeted_search_results(
     generate_answer), либо None, если явной ссылки нет, чанк не найден,
     документ неоднозначен или возникла ошибка (вызывающий продолжает
     обычный семантический поиск).
+
+    ref_query — текст для извлечения ссылок (по умолчанию query). Вызывающий
+    передаёт user_query (новый вопрос без истории): «табл. N» в цитатах
+    прошлых ответов не должна включать целенаправленный поиск. Сужение по
+    документу ниже использует полный query — документ может быть назван
+    в контексте диалога.
     """
     try:
-        refs = extract_asset_references(query)
+        refs = extract_asset_references(ref_query or query)
         if not refs:
             return None
         asset_type, ref_num = refs[0]
@@ -906,7 +972,12 @@ def search_node(state: QAGraphState, config=None) -> dict:
 
     # Целенаправленный поиск для явных запросов «покажи таблицу/рисунок N»
     # (фикс 3.3): ищем чанк по caption, не полагаясь на семантический топ.
-    targeted = _targeted_search_results(query, client, cfg)
+    # Ссылки извлекаем ТОЛЬКО из нового вопроса (user_query) — «табл. N»
+    # в истории диалога (цитаты прошлых ответов) не должна уводить поиск
+    # к чужому документу (инцидент СП 52.13330, 2026-09-03).
+    targeted = _targeted_search_results(
+        query, client, cfg, ref_query=state.get("user_query") or query
+    )
     if targeted is not None:
         _close_qdrant_client(cfg.qdrant_path, client)
         return {"search_results": targeted}
@@ -1455,10 +1526,15 @@ class QAGraph:
         # thread_id текущего прогона — для resume() после interrupt()
         self._thread_id: str | None = None
 
-    def _initial_state(self, query: str) -> dict:
-        """Начальное состояние графа (раздел 3): query + пустые поля."""
+    def _initial_state(self, query: str, user_query: str | None = None) -> dict:
+        """Начальное состояние графа (раздел 3): query + пустые поля.
+
+        user_query — новый вопрос пользователя без контекста истории
+        (None → равен query); используется целенаправленным поиском.
+        """
         return {
             "query": query,
+            "user_query": user_query or query,
             "messages": [],
             "search_results": [],
             "reformulate_count": 0,
@@ -1518,8 +1594,11 @@ class QAGraph:
             }
         }
 
-    def run(self, query: str) -> dict:
+    def run(self, query: str, user_query: str | None = None) -> dict:
         """graph.invoke() с начальным состоянием.
+
+        user_query — новый вопрос пользователя без контекста истории
+        (None → равен query); см. QAGraphState.user_query.
 
         Возвращает финальное состояние графа. Если граф остановился на
         interrupt() (запрошено уточнение), в результате присутствует ключ
@@ -1528,24 +1607,25 @@ class QAGraph:
         """
         self._thread_id = uuid.uuid4().hex
         return self.graph.invoke(
-            self._initial_state(query),
+            self._initial_state(query, user_query),
             config=self._thread_config(),
         )
 
-    def stream(self, query: str):
+    def stream(self, query: str, user_query: str | None = None):
         """Streaming-режим для отслеживания прогресса.
 
         stream_mode="updates": каждый чанк — словарь {имя_узла: обновление}.
         На interrupt() чанк будет {"__interrupt__": (Interrupt, ...)}.
         Возвращает генератор; thread_id фиксируется сразу (до итерации),
         чтобы resume() можно было вызвать и после частичного чтения.
+        user_query — новый вопрос без контекста истории (см. run()).
         """
         self._thread_id = uuid.uuid4().hex
-        return self._stream_impl(query)
+        return self._stream_impl(query, user_query)
 
-    def _stream_impl(self, query: str):
+    def _stream_impl(self, query: str, user_query: str | None = None):
         yield from self.graph.stream(
-            self._initial_state(query),
+            self._initial_state(query, user_query),
             config=self._thread_config(),
             stream_mode="updates",
         )

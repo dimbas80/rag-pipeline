@@ -20,6 +20,7 @@ sparse — локальный fastembed (Qdrant/bm25),
 """
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -34,6 +35,7 @@ from fastembed import SparseTextEmbedding
 from qdrant_client import QdrantClient, models
 
 SPARSE_MODEL = "Qdrant/bm25"
+logger = logging.getLogger("search")
 DEFAULT_COLLECTION = "technical_standard"
 _DEFAULT_PROVIDER_CFG = _get_providers()
 EMBED_MODEL = resolve_subrole(_DEFAULT_PROVIDER_CFG, "build_search_index", "embedding")["model"]
@@ -75,7 +77,11 @@ def embed_query_siliconflow(query: str, api_key: str | None = None, model: str |
         try:
             key=get_api_key(cfg,target["provider"],api_key); r=requests.post(get_endpoint(cfg,target["provider"],"embedding"),json={"model":target["model"],"input":[QUERY_INSTRUCTION.format(query=query)],"encoding_format":"float"},headers={"Authorization":f"Bearer {key}"},timeout=API_TIMEOUT); r.raise_for_status(); return r.json()["data"][0]["embedding"]
         except (requests.RequestException,KeyError,IndexError,TypeError,ValueError) as exc: raise ProviderUnavailableError(str(exc)) from exc
-    return run_with_fallback(spec,attempt,"embedding")
+    started = time.monotonic()
+    result = run_with_fallback(spec, attempt, "embedding")
+    logger.info("[timing] embed_query: %.1fs (provider=%s model=%s)",
+                time.monotonic() - started, spec["provider"], spec["model"])
+    return result
 
 def rerank_siliconflow(query: str, documents: list[str], api_key: str | None, top_n: int, model: str | None = None) -> list[float]:
     cfg=_get_providers(); spec=resolve_subrole(cfg,"build_search_index","rerank")
@@ -84,7 +90,11 @@ def rerank_siliconflow(query: str, documents: list[str], api_key: str | None, to
         try:
             key=get_api_key(cfg,target["provider"],api_key); r=requests.post(get_endpoint(cfg,target["provider"],"rerank"),json={"model":target["model"],"query":query,"documents":documents,"top_n":top_n},headers={"Authorization":f"Bearer {key}"},timeout=API_TIMEOUT); r.raise_for_status(); d=r.json(); m={x["index"]:x["relevance_score"] for x in d["results"]}; return [m.get(i,0.0) for i in range(len(documents))]
         except (requests.RequestException,KeyError,IndexError,TypeError,ValueError) as exc: raise ProviderUnavailableError(str(exc)) from exc
-    return run_with_fallback(spec,attempt,"rerank")
+    started = time.monotonic()
+    result = run_with_fallback(spec, attempt, "rerank")
+    logger.info("[timing] rerank %d docs: %.1fs (provider=%s model=%s)",
+                len(documents), time.monotonic() - started, spec["provider"], spec["model"])
+    return result
 
 def build_payload_filter(domain: str | None, document_type: str | None, document_id: str | None) -> models.Filter | None:
     """Фильтр по payload-полям Qdrant; None = без фильтра."""

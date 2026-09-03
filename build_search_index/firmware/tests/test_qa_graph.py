@@ -124,7 +124,7 @@ def test_qa_graph_state_schema():
     """Все поля из раздела 3 архитектуры присутствуют."""
     hints = typing.get_type_hints(qa_graph.QAGraphState, include_extras=True)
     expected = {
-        "query", "messages", "search_results", "reformulate_count",
+        "query", "user_query", "messages", "search_results", "reformulate_count",
         "query_analysis", "active_query", "final_answer",
         "needs_clarification", "error", "cited_chunk_ids",
     }
@@ -427,6 +427,13 @@ def test_has_citations_table():
     assert qa_graph.has_citations("по [ГОСТ 31996-2012, табл. 19]")
 
 
+def test_has_citations_em_dash():
+    """LLM любит длинное тире в номерах — цитата должна признаваться
+    (иначе лишняя регенерация ответа)."""
+    assert qa_graph.has_citations("нагрузка 187 А [ГОСТ 31996—2012, табл. 19].")
+    assert qa_graph.has_citations("см. [ГОСТ 31996–2012, п. 10.1]")
+
+
 def test_has_citations_table_word():
     assert qa_graph.has_citations("по [ГОСТ 31996-2012, таблица 19]")
 
@@ -447,6 +454,14 @@ def test_has_citations_wrong_format():
 
 def test_has_citations_empty():
     assert not qa_graph.has_citations("")
+
+
+def test_match_citations_em_dash_matches_hyphen_doc_id():
+    """«ГОСТ 31996—2012» в ответе LLM матчится с «ГОСТ 31996-2012» в базе
+    (нормализация тире), иначе cited_chunk_ids пуст и картинки не уходят."""
+    answer = "Нагрузка 187 А [ГОСТ 31996—2012, п. 10.1]."
+    results = [{"document_id": "ГОСТ 31996-2012", "clause": "10.1", "chunk_id": "c1"}]
+    assert qa_graph._match_citations_to_chunks(answer, results) == ["c1"]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -542,14 +557,26 @@ def test_analyze_query_concrete(monkeypatch):
     monkeypatch.setattr(
         qa_graph, "llm_chat",
         lambda messages, config, node_name, **kw: (
-            '{"is_concrete": true, "key_terms": ["гост"], "suggested_clarification": null}'
+            '{"is_concrete": true, "key_terms": ["молниеотвод"], "suggested_clarification": null}'
         ),
     )
-    out = qa_graph.analyze_query(_state(query="высота молниеотвода по ГОСТ 31996"), _cfg())
+    # Запрос без цифр и номеров документов (2 значимых слова) — уходит в LLM.
+    out = qa_graph.analyze_query(_state(query="высота молниеотвода"), _cfg())
     assert out["query_analysis"]["is_concrete"] is True
-    assert out["query_analysis"]["key_terms"] == ["гост"]
+    assert out["query_analysis"]["key_terms"] == ["молниеотвод"]
     assert out["query_analysis"]["suggested_clarification"] is None
-    assert out["active_query"] == "высота молниеотвода по ГОСТ 31996"
+    assert out["active_query"] == "высота молниеотвода"
+
+
+def test_analyze_query_rule_based_skips_llm(monkeypatch):
+    """Явно конкретный запрос (номер документа/цифры) — LLM не вызывается."""
+    def fail(*a, **kw):
+        raise AssertionError("llm_chat не должен вызываться для конкретного запроса")
+    monkeypatch.setattr(qa_graph, "llm_chat", fail)
+    out = qa_graph.analyze_query(
+        _state(query="Допустимый ток кабеля ВВГ 4х50 в земле"), _cfg())
+    assert out["query_analysis"]["is_concrete"] is True
+    assert out["active_query"] == "Допустимый ток кабеля ВВГ 4х50 в земле"
 
 
 def test_analyze_query_abstract_does_not_set_needs_clarification(monkeypatch):
@@ -758,6 +785,50 @@ def test_search_node_uses_query_when_active_missing(monkeypatch):
     assert captured["query"] == "вопрос"
 
 
+# ─── user_query: изоляция целенаправленного поиска от истории ──────────
+
+def test_search_node_targeted_refs_from_user_query_not_history(monkeypatch):
+    """«табл. 19» в контексте истории (query) не включает targeted-поиск,
+    если нового вопроса (user_query) она не касается (инцидент СП 52.13330)."""
+    _patch_search_deps(monkeypatch)
+    monkeypatch.setattr(qa_graph, "hybrid_search", lambda *a, **k: [])
+
+    blob = ("Предыдущий вопрос: ...\nПредыдущий ответ: ... [ГОСТ 31996-2012, табл. 19]\n\n"
+            "Новый вопрос: По СП 52.13330 какая норма освещенности в детском саду")
+    out = qa_graph.search_node(
+        _state(query=blob, active_query=blob,
+               user_query="По СП 52.13330 какая норма освещенности в детском саду"),
+        _cfg(),
+    )
+    assert out["search_results"] == []  # ушёл в hybrid, а не в targeted
+
+
+def test_search_node_targeted_ref_query_passed(monkeypatch):
+    """search_node передаёт user_query в _targeted_search_results как ref_query,
+    сужение по документу продолжит видеть полный query."""
+    _patch_search_deps(monkeypatch)
+    captured = {}
+
+    def fake_targeted(query, client, cfg, ref_query=None):
+        captured["query"] = query
+        captured["ref_query"] = ref_query
+        return None
+
+    monkeypatch.setattr(qa_graph, "_targeted_search_results", fake_targeted)
+    monkeypatch.setattr(qa_graph, "hybrid_search", lambda *a, **k: [])
+    qa_graph.search_node(
+        _state(query="блоб с историей", active_query="блоб с историей",
+               user_query="покажи таблицу 19"), _cfg())
+    assert captured["ref_query"] == "покажи таблицу 19"
+    assert captured["query"] == "блоб с историей"
+
+
+def test_initial_state_user_query_defaults_to_query():
+    g = object.__new__(qa_graph.QAGraph)
+    assert g._initial_state("вопрос")["user_query"] == "вопрос"
+    assert g._initial_state("блоб", "чистый вопрос")["user_query"] == "чистый вопрос"
+
+
 # ─── Фикс 3.1: жизненный цикл QdrantClient в search_node ──────────────
 
 class _FakeQdrantClient:
@@ -807,7 +878,7 @@ def test_search_node_closes_client_on_targeted_path(monkeypatch):
     monkeypatch.setattr(qa_graph, "_get_sparse_model", lambda: object())
     monkeypatch.setattr(
         qa_graph, "_targeted_search_results",
-        lambda query, client, cfg: [{"chunk_id": "c1", "score": 1.0}],
+        lambda query, client, cfg, ref_query=None: [{"chunk_id": "c1", "score": 1.0}],
     )
     monkeypatch.setattr(qa_graph, "hybrid_search", lambda *a, **k: (_ for _ in ()).throw(AssertionError("not called")))
 
