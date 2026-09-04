@@ -136,7 +136,7 @@ prod = {
         "create_markdown_dir": f"{install}/Create_Markdown_YA/firmware/src",
         "build_search_index_dir": f"{install}/Build_Search_index/firmware/src",
     },
-    "qdrant": {"path": f"{base}/Markdown/qdrant_data",
+    "qdrant": {"path": f"{install}/qdrant",
                "collection": "technical_standard", "write_enabled": True},
     "base_markdown": f"{base}/Markdown",
 }
