@@ -1,0 +1,18 @@
+[Unit]
+Description=interface_RAG web interface (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/RAG/interface_RAG/firmware/src
+EnvironmentFile=/root/RAG/config/.env
+ExecStart=/root/RAG/venv/bin/uvicorn app:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=5
+# uvicorn зависает при остановке так же, как бот: SIGKILL через 15с
+# вместо дефолтных 90с (см. interface-rag-bot.service).
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
