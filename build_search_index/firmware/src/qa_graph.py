@@ -349,7 +349,8 @@ def _format_search_results(results: list[dict]) -> str:
 _assets_cache: dict[str, dict] = {}
 _doc_dirs: dict[str, str] = {}
 
-BASE_MARKDOWN = "/mnt/sdb/!База_ГОСТ/Markdown"
+# Корень документов: BASE_DIR из общего .env (systemd EnvironmentFile); дефолт — прод.
+BASE_MARKDOWN = os.path.join(os.environ.get("BASE_DIR", "/mnt/sdb/!База_ГОСТ"), "Markdown")
 
 
 def _load_assets(doc_id: str) -> dict | None:

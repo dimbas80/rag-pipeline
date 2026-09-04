@@ -6,6 +6,7 @@
      «Обновить модели», «Удалить» с проверкой использования на сервере);
    - Роли: каскадный выбор Провайдер → Модель + Fallback;
    - Yandex OCR / Телеграм (ключи .env, маскированы);
+   - Папки: корень документов (BASE_DIR) и база Qdrant (QDRANT_PATH) в .env;
    - параметры узлов графа (search_config.yaml) с комментариями;
    - единая кнопка «Сохранить» (все секции одним действием).
    Без сырых дампов providers.yaml/.env.
@@ -70,7 +71,7 @@
     { id: "yandex", label: "Yandex OCR" },
     { id: "telegram", label: "Телеграм" },
     { id: "graph", label: "Параметры графа" },
-    { id: "qdrant", label: "Папка Qdrant" }
+    { id: "paths", label: "Папки" }
   ];
 
   var state = {
@@ -78,11 +79,13 @@
     env: {},
     search: { nodes: {} },
     status: {},
+    baseDir: { path: "", default: "", overridden: false },
     qdrant: { path: "", default: "", overridden: false },
     bot: null,        // статус interface-rag-bot.service (null = ещё не запрашивали)
     botResult: null,  // { text, cls } — сообщение после перезапуска
     botBusy: false,   // идёт запрос (статус/рестарт) — не перерисовывать кнопку
     activeSection: "providers",
+    baseDirReset: false,
     qdrantReset: false,
     loaded: false,
     busy: false,
@@ -114,14 +117,17 @@
         api("/api/settings/env"),
         api("/api/settings/search-config"),
         api("/api/settings/status"),
-        api("/api/settings/qdrant")
+        api("/api/settings/qdrant"),
+        api("/api/settings/base-dir")
       ]);
       state.providers = results[0] || { providers: {}, roles: {} };
       state.env = results[1] || {};
       state.search = results[2] || { nodes: {} };
       state.status = results[3] || {};
       state.qdrant = results[4] || { path: "", default: "", overridden: false };
+      state.baseDir = results[5] || { path: "", default: "", overridden: false };
       state.qdrantReset = false;
+      state.baseDirReset = false;
       state.loaded = true;
       render();
     } catch (error) {
@@ -166,7 +172,7 @@
           sectionHtml("yandex", renderYandexCard()) +
           sectionHtml("telegram", renderOtherKeysCard()) +
           sectionHtml("graph", renderGraphCard()) +
-          sectionHtml("qdrant", renderQdrantCard()) +
+          sectionHtml("paths", renderPathsCard()) +
         "</div>" +
       "</div>";
 
@@ -176,7 +182,7 @@
     bindRoleControls();
     bindGraphInputs();
     bindEnvInputs();
-    bindQdrantControls();
+    bindPathsControls();
     bindBotControls();
     bindSettingsNav();
   }
@@ -473,20 +479,35 @@
       "</div></section>";
   }
 
-  function renderQdrantCard() {
+  function renderPathsCard() {
+    var b = state.baseDir || { path: "", default: "", overridden: false };
     var q = state.qdrant || { path: "", default: "", overridden: false };
-    var hint = q.overridden
+    var baseHint = b.overridden
+      ? "Указан override (BASE_DIR в .env); дефолт из config.yaml: " + esc(b.default)
+      : "Используется дефолт из config.yaml: " + esc(b.default);
+    var qdrantHint = q.overridden
       ? "Указан override (QDRANT_PATH в .env); дефолт из config.yaml: " + esc(q.default)
       : "Используется дефолт из config.yaml: " + esc(q.default);
-    return '<section class="settings-card"><h3>Папка Qdrant</h3>' +
-      '<p class="muted">База семантического поиска. Путь сохраняется в .env (QDRANT_PATH) и передаётся пайплайну через --qdrant-path. Пустая строка = вернуться к дефолту.</p>' +
+    return '<section class="settings-card"><h3>Папки</h3>' +
+      '<p class="muted">Пути сохраняются в .env и передаются всем компонентам: пайплайну конвертации ' +
+      "(итог в &lt;корень&gt;/Markdown/&lt;документ&gt;/, временные данные в &lt;корень&gt;/tmp/), " +
+      "поисковому индексу и боту. Пустая строка = вернуться к дефолту. После смены корня перезапустите бота " +
+      "в разделе «Телеграм».</p>" +
+      '<div class="env-row" data-basedir-row>' +
+        '<label>Корневая папка документов <code>BASE_DIR</code></label>' +
+        '<div class="env-inputs">' +
+          '<input type="text" id="base-dir-input" value="' + esc(b.path) + '" placeholder="' + esc(b.default) + '">' +
+          '<button type="button" id="base-dir-reset" class="btn ghost">Сбросить к дефолту</button>' +
+        "</div>" +
+        '<div class="field-help">' + baseHint + "</div>" +
+      "</div>" +
       '<div class="env-row" data-qdrant-row>' +
         '<label>Путь к базе Qdrant <code>QDRANT_PATH</code></label>' +
         '<div class="env-inputs">' +
           '<input type="text" id="qdrant-path-input" value="' + esc(q.path) + '" placeholder="' + esc(q.default) + '">' +
           '<button type="button" id="qdrant-reset" class="btn ghost">Сбросить к дефолту</button>' +
         "</div>" +
-        '<div class="field-help">' + hint + "</div>" +
+        '<div class="field-help">' + qdrantHint + "</div>" +
       "</div></section>";
   }
 
@@ -663,7 +684,18 @@
     });
   }
 
-  function bindQdrantControls() {
+  function bindPathsControls() {
+    var baseReset = $("base-dir-reset");
+    if (baseReset) baseReset.addEventListener("click", function () {
+      var input = $("base-dir-input");
+      if (input && state.baseDir) input.value = state.baseDir.default || "";
+      state.baseDirReset = true;
+      setStatus("Сброс к дефолту — нажмите «Сохранить», чтобы применить.", "warn");
+    });
+    var baseInput = $("base-dir-input");
+    if (baseInput) baseInput.addEventListener("input", function () {
+      state.baseDirReset = false;
+    });
     var reset = $("qdrant-reset");
     if (reset) reset.addEventListener("click", function () {
       var input = $("qdrant-path-input");
@@ -817,7 +849,22 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(env)
       });
-      // 5. Папка Qdrant (решение №29) — только если изменилась или запрошен сброс.
+      // 5. Папки — корень документов (BASE_DIR), затем Qdrant (решение №29);
+      //    сохраняем только если изменились или запрошен сброс.
+      var baseInput = $("base-dir-input");
+      if (baseInput) {
+        var baseWantReset = state.baseDirReset;
+        state.baseDirReset = false;
+        var currentBase = state.baseDir ? state.baseDir.path : "";
+        var inputBase = baseInput.value.trim();
+        if (baseWantReset || inputBase !== currentBase) {
+          await api("/api/settings/base-dir", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ path: baseWantReset ? "" : inputBase })
+          });
+        }
+      }
       var qdrantInput = $("qdrant-path-input");
       if (qdrantInput) {
         var wantReset = state.qdrantReset;

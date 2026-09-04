@@ -6552,6 +6552,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="После прогона интерактивно зарегистрировать документ "
         "в per-document <stem>_reg.yaml (требует TTY)",
     )
+    parser.add_argument(
+        "--base-dir",
+        default="",
+        help="Корневая папка документов: итог в <base-dir>/Markdown/<stem>/, "
+        "временные данные в <base-dir>/tmp/<stem>/. По умолчанию — переменная "
+        "окружения BASE_DIR; без неё папки определяются от входного файла",
+    )
 
     return parser.parse_args(argv)
 
@@ -7076,15 +7083,20 @@ def main() -> None:
     """Точка входа. Парсинг аргументов, обработка одного файла."""
     args = parse_args()
 
-    # Выходные папки относительно входного файла
+    # Корень документов: --base-dir → BASE_DIR из окружения → папка входного файла.
+    # При явном корне итог всегда в <base_dir>/Markdown/<stem>/, временные данные
+    # в <base_dir>/tmp/<stem>/ (интерфейс и бот передают корень через общий .env).
     input_path = Path(args.input).resolve()
-    base_dir = input_path.parent
+    base_dir = Path(args.base_dir) if args.base_dir else Path(
+        os.environ.get("BASE_DIR") or input_path.parent
+    )
     output_base = str(base_dir / "Markdown")
     tmp_base = str(base_dir / "tmp")
 
-    # Если входной .md лежит внутри Markdown/ → лог пишем в tmp/ рядом с Markdown/,
-    # а не внутри Markdown/<file>/tmp/. Это тот же tmp/, куда пишется лог пайплайна.
-    if "Markdown" in input_path.parts:
+    # Без явного корня: если входной .md лежит внутри Markdown/ → лог пишем в tmp/
+    # рядом с Markdown/, а не внутри Markdown/<file>/tmp/. Это тот же tmp/, куда
+    # пишется лог пайплайна.
+    if not args.base_dir and "Markdown" in input_path.parts:
         # Найти сегмент Markdown/ в пути и взять его родителя
         mdx = list(input_path.parts).index("Markdown")
         source_dir = Path(*input_path.parts[:mdx])

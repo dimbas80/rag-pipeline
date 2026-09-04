@@ -76,6 +76,19 @@ def _fake_cfg(tmp_path):
         @property
         def qdrant_path(self):
             return Path(self.qdrant_path_override) if self.qdrant_path_override else self.qdrant_path_default
+
+        # BASE_DIR: та же схема — override из .env, иначе upload_base_dir.
+        @property
+        def base_dir_override(self):
+            return app.config_ui.read_env_raw(self.env_file).get("BASE_DIR") or None
+
+        @property
+        def base_dir(self):
+            return Path(self.base_dir_override) if self.base_dir_override else self.upload_base_dir
+
+        @property
+        def base_markdown(self):
+            return self.base_dir / "Markdown" if self.base_dir_override else tmp_path / "Markdown"
     return Cfg()
 
 
@@ -300,6 +313,55 @@ def test_put_qdrant_settings_normalizes_dotdot_path(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert app.config_ui.read_env_raw(tmp_path / ".env")["QDRANT_PATH"] == str(Path("/etc"))
     assert response.json()["path"] == str(Path("/etc"))
+
+
+# --- корневая папка документов через /api/settings/base-dir ---
+
+def test_get_base_dir_settings_reports_path_default_and_override(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    response = app.settings_base_dir()
+    assert response["path"] == str(tmp_path / "upload")
+    assert response["default"] == str(tmp_path / "upload")
+    assert response["overridden"] is False
+
+
+def test_put_base_dir_settings_writes_env(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.put("/api/settings/base-dir", json={"path": "/mnt/sdb/!База_ГОСТ"})
+    assert response.status_code == 200
+    assert app.config_ui.read_env_raw(tmp_path / ".env")["BASE_DIR"] == "/mnt/sdb/!База_ГОСТ"
+    assert response.json()["overridden"] is True
+    assert response.json()["path"] == "/mnt/sdb/!База_ГОСТ"
+
+
+def test_put_base_dir_settings_empty_resets_override(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    (tmp_path / ".env").write_text("BASE_DIR=/old/base\n", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.put("/api/settings/base-dir", json={"path": ""})
+    assert response.status_code == 200
+    assert "BASE_DIR" not in app.config_ui.read_env_raw(tmp_path / ".env")
+
+
+def test_put_base_dir_settings_rejects_relative_path(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    assert client.put("/api/settings/base-dir", json={"path": "relative/path"}).status_code == 400
+
+
+def test_put_base_dir_settings_normalizes_dotdot_path(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.put("/api/settings/base-dir", json={"path": "/tmp/../base"})
+    assert response.status_code == 200
+    assert app.config_ui.read_env_raw(tmp_path / ".env")["BASE_DIR"] == str(Path("/base"))
+    assert response.json()["path"] == str(Path("/base"))
 
 
 # --- решение 39: .md → канонический Markdown/<stem>/<stem>.md при upload ---

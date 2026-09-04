@@ -26,10 +26,32 @@ class DeployConfig:
     collection: str
     write_enabled: bool
     env_file: Path
-    base_markdown: Path
+    base_markdown_default: Path
     prompts: dict[str, Any]
     model_tags: dict[str, list[str]]
     environment: str
+
+    @property
+    def base_dir_override(self) -> str | None:
+        """BASE_DIR — корневая папка документов: только из .env интерфейса
+        (<config_dir>/.env, пишет UI через config_ui.write_env). process-env НЕ
+        читается — тот же аргумент, что у qdrant_path_override. None — override
+        отсутствует. Чтение ленивое, без кэша."""
+        return read_env_raw(self.env_file).get("BASE_DIR") or None
+
+    @property
+    def base_dir(self) -> Path:
+        """Эффективный корень документов: BASE_DIR из .env или upload.base_dir
+        из config.yaml (в проде это уже корневая папка с документами)."""
+        return Path(self.base_dir_override) if self.base_dir_override else self.upload_base_dir
+
+    @property
+    def base_markdown(self) -> Path:
+        """Папка итоговых markdown: <base_dir>/Markdown при override,
+        иначе дефолт из config.yaml."""
+        if self.base_dir_override:
+            return self.base_dir / "Markdown"
+        return self.base_markdown_default
 
     @property
     def qdrant_path_override(self) -> str | None:
@@ -97,6 +119,6 @@ def load(path: str | Path | None = None) -> DeployConfig:
         build_search_index_dir=Path(section["pipelines"]["build_search_index_dir"]),
         qdrant_path_default=Path(section["qdrant"]["path"]), collection=str(section["qdrant"]["collection"]),
         write_enabled=bool(section["qdrant"]["write_enabled"]), env_file=env_file,
-        base_markdown=Path(section["base_markdown"]), prompts=raw.get("prompts", {}),
+        base_markdown_default=Path(section["base_markdown"]), prompts=raw.get("prompts", {}),
         model_tags=raw.get("model_tags", {}), environment=env,
     )

@@ -184,3 +184,41 @@ def test_env_injection_does_not_change_qdrant_path(tmp_path, monkeypatch):
     assert loaded.qdrant_path_override == "/interface/qdrant"
     assert loaded.qdrant_path == Path("/interface/qdrant")
     monkeypatch.delenv("QDRANT_PATH", raising=False)   # не оставлять загрязнение
+
+
+# --- BASE_DIR: корневая папка документов (env > .env > config.yaml) ---
+
+def test_base_dir_defaults_to_upload_dir(tmp_path, monkeypatch):
+    # Без BASE_DIR в .env корень = upload.base_dir из config.yaml; base_markdown —
+    # значение из config.yaml (не переопределяется).
+    monkeypatch.delenv("BASE_DIR", raising=False)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_config(), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.base_dir_override is None
+    assert loaded.base_dir == Path("/u")
+    assert loaded.base_markdown == Path("/m")
+
+
+def test_base_dir_override_from_env_file(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("BASE_DIR=/mnt/sdb/!База_ГОСТ\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.base_dir_override == "/mnt/sdb/!База_ГОСТ"
+    assert loaded.base_dir == Path("/mnt/sdb/!База_ГОСТ")
+    # при override итоговые markdown живут в <base_dir>/Markdown
+    assert loaded.base_markdown == Path("/mnt/sdb/!База_ГОСТ/Markdown")
+
+
+def test_base_dir_empty_env_file_value_falls_back(tmp_path, monkeypatch):
+    monkeypatch.setenv("BASE_DIR", "/proc/base")  # process-env НЕ источник истины
+    cfg = tmp_path / "config.yaml"
+    env_file = tmp_path / ".env"
+    env_file.write_text("BASE_DIR=\n", encoding="utf-8")
+    cfg.write_text(_config(dev_env_file=str(env_file)), encoding="utf-8")
+    loaded = load(cfg)
+    assert loaded.base_dir_override is None
+    assert loaded.base_dir == Path("/u")
+    assert loaded.base_markdown == Path("/m")

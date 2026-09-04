@@ -76,6 +76,9 @@ class MarkdownUpdate(BaseModel):
 class QdrantPathUpdate(BaseModel):
     path: str = ""
 
+class BaseDirUpdate(BaseModel):
+    path: str = ""
+
 
 def _session(sid: str) -> dict:
     value = sessions.get(sid)
@@ -229,7 +232,7 @@ def _valid_stem(stem: str) -> bool:
 def _delete_result(cfg, stem: str) -> dict:
     """Удалить промежуточные артефакты конвертации текущего документа (решение №40).
 
-    Удаляются ровно: <upload_base_dir>/tmp/<stem>/, <base_markdown>/<stem>/image/,
+    Удаляются ровно: <base_dir>/tmp/<stem>/, <base_markdown>/<stem>/image/,
     <base_markdown>/<stem>/table_images.json. Сохраняются .md, _reg.yaml,
     _chunks.jsonl, _assets.json и исходник. Каждый путь resolve()'ится и
     проверяется на префикс разрешённого корня до удаления.
@@ -246,10 +249,10 @@ def _delete_result(cfg, stem: str) -> dict:
         except ValueError:
             return False
 
-    tmp_root = (Path(cfg.upload_base_dir) / "tmp").resolve()
+    tmp_root = (cfg.base_dir / "tmp").resolve()
     md_root = Path(cfg.base_markdown).resolve()
     targets = [
-        ("dir", Path(cfg.upload_base_dir) / "tmp" / stem, tmp_root),
+        ("dir", cfg.base_dir / "tmp" / stem, tmp_root),
         ("dir", Path(cfg.base_markdown) / stem / "image", md_root),
         ("file", Path(cfg.base_markdown) / stem / "table_images.json", md_root),
     ]
@@ -492,6 +495,30 @@ def update_qdrant(payload: QdrantPathUpdate):
         path = str(Path(path).resolve())
     config_ui.write_env(cfg.env_file, {"QDRANT_PATH": path})
     return settings_qdrant()
+
+@app.get("/api/settings/base-dir")
+def settings_base_dir():
+    """Корневая папка документов (BASE_DIR): эффективный путь, дефолт, override."""
+    return {
+        "path": str(cfg.base_dir),
+        "default": str(cfg.upload_base_dir),
+        "overridden": cfg.base_dir_override is not None,
+    }
+
+@app.put("/api/settings/base-dir")
+def update_base_dir(payload: BaseDirUpdate):
+    """Задать корневую папку документов персистентно (BASE_DIR в .env).
+
+    Пустая строка = сбросить override (вернуться к дефолту из config.yaml).
+    Запись идёт через config_ui.write_env → .env остаётся 0600.
+    """
+    path = (payload.path or "").strip()
+    if path and not Path(path).is_absolute():
+        raise HTTPException(400, "Путь должен быть абсолютным")
+    if path:
+        path = str(Path(path).resolve())
+    config_ui.write_env(cfg.env_file, {"BASE_DIR": path})
+    return settings_base_dir()
 
 # --- Типы документов (решение №50): datalist регистрации, пользовательские дополнения. ---
 
