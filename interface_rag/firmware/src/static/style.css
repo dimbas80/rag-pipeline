@@ -258,6 +258,26 @@ main {
 .log .log-ok    { color: #4ade80; }
 .log .log-info  { color: #93c5fd; }
 
+/* ---------- MD-редактор (решение №51) ---------- */
+.md-editor { margin-top: 14px; }
+.md-editor textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 420px;
+  resize: vertical;
+  background: #0e1a2b;
+  color: #cfe0f2;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.md-editor .action-row { margin: 10px 0 0; }
+
 /* ---------- MD-вьювер ---------- */
 .md-preview {
   margin-top: 14px;
@@ -431,7 +451,7 @@ main {
 
 /* Карточки провайдеров (решения 41–45) */
 .provider-toolbar { margin-bottom: 12px; }
-.provider-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.provider-cards { display: grid; grid-template-columns: 1fr; gap: 14px; } /* одна колонка на всю ширину: с чипами тегов в двух колонках тесно */
 .provider-card {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -453,12 +473,28 @@ main {
 .models-details { border-top: 1px dashed var(--border); padding-top: 8px; margin: 8px 0; }
 .models-details summary { cursor: pointer; font-weight: 650; font-size: 13px; color: #33415a; margin-bottom: 8px; }
 .model-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
-.model-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px 30px; gap: 8px; align-items: center; }
+.model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 30px; gap: 8px; align-items: center; }
 .model-row .model-name { font-size: 12.5px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-row select { padding: 4px 6px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); font: inherit; font-size: 12.5px; background: var(--surface); }
 .model-row .model-del { padding: 2px 8px; font-size: 14px; line-height: 1; }
-.model-add { display: grid; grid-template-columns: minmax(0, 1fr) 110px auto; gap: 8px; margin-top: 8px; }
-.model-add input, .model-add select {
+/* Метки-чипы ролей модели вместо выпадающего списка (решение №52). */
+.model-tags { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.tag-chip {
+  padding: 2px 8px;
+  font: inherit; font-size: 11.5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  line-height: 1.4;
+}
+.tag-chip.on {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: #fff;
+}
+.model-add { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; margin-top: 8px; align-items: center; }
+.model-add input {
   padding: 6px 8px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
@@ -551,7 +587,7 @@ dialog h2 { margin: 0 0 14px; font-size: 17px; }
 .standalone-back { display: inline-flex; gap: 6px; align-items: center; margin: 18px 0 0; color: var(--accent); text-decoration: none; font-weight: 600; font-size: 14px; }
 
 @media (max-width: 900px) {
-  .form-grid, .role-cards, .env-grid, .provider-cards { grid-template-columns: 1fr; }
+  .form-grid, .role-cards, .env-grid { grid-template-columns: 1fr; }
   .chat-layout { grid-template-columns: 1fr; }
   .settings-layout { grid-template-columns: 1fr; }
   .settings-nav { position: static; }

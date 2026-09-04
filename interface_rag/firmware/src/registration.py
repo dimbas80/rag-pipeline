@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json, os, re, subprocess, tempfile
+from datetime import date
 from pathlib import Path
 import yaml
 
@@ -9,16 +10,19 @@ except ImportError:  # pragma: no cover - direct module usage from firmware/src
     import fs_perms
 
 FIELDS = ["document_id", "document_id_alt", "document_type", "domain", "title", "edition", "date_enacted", "date_amended", "amended_by", "source_file", "status", "status_reason", "replaced_by_document_id", "replaced_by_doc_key", "ignore_sections"]
-PREFIX = {"ГОСТ":"GOST", "СП":"SP", "СО":"SO", "СНиП":"SNIP", "ПУЭ":"PUE"}
 _TRANSLIT = str.maketrans({
-    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"
+    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+    "А":"A","Б":"B","В":"V","Г":"G","Д":"D","Е":"E","Ё":"E","Ж":"Zh","З":"Z","И":"I","Й":"Y","К":"K","Л":"L","М":"M","Н":"N","О":"O","П":"P","Р":"R","С":"S","Т":"T","У":"U","Ф":"F","Х":"H","Ц":"C","Ч":"Ch","Ш":"Sh","Щ":"Sch","Ъ":"","Ы":"Y","Ь":"","Э":"E","Ю":"Yu","Я":"Ya"
 })
-def make_slug(document_id, document_type, domain, existing=()):
-    prefix = PREFIX.get(document_type or "", re.sub(r"\W+", "_", document_type or "DOC"))
-    num = re.search(r"\d+", document_id or "")
-    tail = re.sub(r"[^a-z0-9]+", "_", (domain or "").lower().translate(_TRANSLIT)).strip("_")
-    base = f"{prefix}_{num.group(0) if num else 'DOC'}" + (f"_{tail}" if tail else "")
-    slug = base; i = 2
+def make_slug(document_id, existing=()):
+    """Слаг-ключ из обозначения документа (решение №47): транслитерация
+    обозначения целиком. Пример: «ГОСТ 18410—73» → `GOST_18410_73`;
+    «СП 297.1325800.2017» → `SP_297_1325800_2017`."""
+    text = (document_id or "").translate(_TRANSLIT)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+    if not slug:
+        slug = "DOC"
+    base = slug; i = 2
     while slug in existing: slug = f"{base}_{i}"; i += 1
     return slug
 
@@ -39,6 +43,36 @@ def extract_first_page(source_file):
             return doc[0].get_pixmap(matrix=fitz.Matrix(1.5, 1.5)).tobytes("png")
     except Exception: return None
 
+_DATE_RE = re.compile(
+    r"(?P<y>\d{4})-(?P<mo>\d{1,2})-(?P<d>\d{1,2})"
+    r"|(?P<d2>\d{1,2})\.(?P<mo2>\d{1,2})\.(?P<y2>\d{4})"
+    r"|(?P<d3>\d{1,2})\.(?P<mo3>\d{1,2})\.(?P<yy>\d{2})")
+
+def normalize_date(value):
+    """Распознанную дату → строка `ГГГГ-ММ-ДД` (для input[type=date]) или None.
+
+    Понимает `ГГГГ-ММ-ДД`, `ДД.ММ.ГГГГ` и `ДД.ММ.ГГ` (ГГ<50 → 20xx, иначе 19xx);
+    дату ищет внутри произвольного текста (титул редко даёт чистый формат).
+    Некорректная дата (например 32.13.2020) → None (решение №48).
+    """
+    if not value:
+        return None
+    m = _DATE_RE.search(str(value))
+    if not m:
+        return None
+    try:
+        if m.group("y"):
+            y, mo, d = int(m.group("y")), int(m.group("mo")), int(m.group("d"))
+        elif m.group("y2"):
+            d, mo, y = int(m.group("d2")), int(m.group("mo2")), int(m.group("y2"))
+        else:
+            d, mo, yy = int(m.group("d3")), int(m.group("mo3")), int(m.group("yy"))
+            y = 2000 + yy if yy < 50 else 1900 + yy
+        date(y, mo, d)  # валидация календарной даты
+    except ValueError:
+        return None
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
 def vision_prefill(image_bytes, *, config=None, providers_path=None, env=None):
     """Extract registration fields through the configured registration vision role."""
     try:
@@ -49,11 +83,13 @@ def vision_prefill(image_bytes, *, config=None, providers_path=None, env=None):
         providers = config_ui.read_yaml(providers_path)
         spec = llm_client.resolve_role(providers, "create_markdown", "registration_vision")
         key = (env or os.environ).get(spec.get("api_key_env", ""), "")
-        prompt = (config or {}).get("registration_vision", "Извлеки JSON: document_id, title, domain_hint, document_type. Если неизвестно — null.")
+        prompt = (config or {}).get("registration_vision", "Извлеки JSON: document_id, title, domain_hint, document_type, date_enacted (дата введения в действие). Если неизвестно — null.")
         raw = llm_client.vision_completion(spec, image_bytes, prompt, key)
         match = re.search(r"\{.*\}", raw, re.S)
         result = json.loads(match.group(0) if match else raw)
-        return {key: result.get(key) for key in ("document_id", "title", "document_type", "domain_hint")}
+        fields = {key: result.get(key) for key in ("document_id", "title", "document_type", "domain_hint", "date_enacted")}
+        fields["date_enacted"] = normalize_date(fields.get("date_enacted"))
+        return fields
     except Exception:
         return {}
 
@@ -118,7 +154,7 @@ def write_reg_yaml(reg_path, fields):
     elif docs:
         slug = next(iter(docs))
     else:
-        slug = make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), docs)
+        slug = make_slug(fields.get("document_id"), docs)
     record = {key: fields.get(key) for key in FIELDS}
     record["source_file"] = fields.get("source_file", reg_path.stem.removesuffix("_reg"))
     record["status"] = fields.get("status", "active")

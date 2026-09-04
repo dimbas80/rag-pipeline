@@ -5,6 +5,7 @@ import yaml
 
 from firmware.src.registration import (
     make_slug,
+    normalize_date,
     write_reg_yaml,
     read_reg_record,
     read_reg_slug,
@@ -29,8 +30,24 @@ def _fields(**overrides):
     return base
 
 
-def test_registration_slug_transliterates():
-    assert make_slug('ГОСТ 123', 'ГОСТ', 'Электрика').startswith('GOST_123_')
+def test_registration_slug_transliterates_full_document_id():
+    # Решение №47: слаг — транслитерация обозначения целиком.
+    assert make_slug('ГОСТ 123-45') == 'GOST_123_45'
+    assert make_slug('СП 297.1325800.2017') == 'SP_297_1325800_2017'
+    assert make_slug('') == 'DOC'
+    assert make_slug('ГОСТ 839—80', ('GOST_839_80',)) == 'GOST_839_80_2'
+
+
+def test_normalize_date_formats():
+    # Решение №48: распознанная дата → ГГГГ-ММ-ДД для input[type=date].
+    assert normalize_date('1973-01-01') == '1973-01-01'
+    assert normalize_date('01.07.1980') == '1980-07-01'
+    assert normalize_date('Введён в действие 01.07.80') == '1980-07-01'  # ГГ>=50 → 19xx
+    assert normalize_date('01.03.25') == '2025-03-01'
+    assert normalize_date('32.13.2020') is None  # некалендарная дата
+    assert normalize_date('не дата') is None
+    assert normalize_date(None) is None
+    assert normalize_date('') is None
 
 
 def test_write_reg_yaml_upsert_keeps_slug_and_single_record(tmp_path):

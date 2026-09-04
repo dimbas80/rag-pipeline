@@ -60,11 +60,18 @@ class ProviderAdd(BaseModel):
 class ProviderUpdate(BaseModel):
     name: str | None = None
     base_url: str | None = None
-    models: dict[str, str] | None = None
+    # Решение №52: теги модели — «chat», «chat+vision» или список тегов.
+    models: dict[str, list[str] | str] | None = None
 
 class EnvUpdate(BaseModel):
     values: dict[str, str] = {}
     delete: list[str] = []
+
+class DocumentTypeAdd(BaseModel):
+    type: str
+
+class MarkdownUpdate(BaseModel):
+    content: str
 
 class QdrantPathUpdate(BaseModel):
     path: str = ""
@@ -158,7 +165,7 @@ def registration_prefill(sid):
     image_bytes = registration.extract_first_page(s["source"])
     fields = registration.vision_prefill(image_bytes, config=cfg.prompts, providers_path=cfg.providers_path, env=build_env(cfg.env_file)) if image_bytes else {}
     fields.setdefault("domain", fields.get("domain_hint"))
-    fields["slug"] = registration.make_slug(fields.get("document_id"), fields.get("document_type"), fields.get("domain"), ()) if fields.get("document_id") else None
+    fields["slug"] = registration.make_slug(fields.get("document_id")) if fields.get("document_id") else None
     return {"fields": fields, "source": "vision", "exists": False, "image_available": bool(image_bytes)}
 
 
@@ -308,14 +315,31 @@ def events(job_id):
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-@app.get("/api/files/markdown/{stem}")
-def markdown(stem):
+def _markdown_path(stem: str) -> Path:
+    """Валидированный путь `<base_markdown>/<stem>/<stem>.md` (GET и PUT, §13.1)."""
     if ".." in stem or "/" in stem or not re.fullmatch(r"[\w.а-яА-ЯёЁ -]+", stem):
         raise HTTPException(404)
     path = (cfg.base_markdown / stem / f"{stem}.md").resolve()
     if cfg.base_markdown.resolve() not in path.parents or not path.is_file():
         raise HTTPException(404)
-    return FileResponse(path)
+    return path
+
+
+@app.get("/api/files/markdown/{stem}")
+def markdown(stem):
+    return FileResponse(_markdown_path(stem))
+
+
+@app.put("/api/files/markdown/{stem}")
+def update_markdown(stem, payload: MarkdownUpdate):
+    """Сохранить отредактированный .md из текстового редактора UI (решение №51).
+
+    Права 0666 — как у файлов базы; после правки требуется переиндексация
+    (клиент показывает напоминание).
+    """
+    path = _markdown_path(stem)
+    fs_perms.write_text_atomic(path, payload.content, 0o666)
+    return {"ok": True, "bytes": len(payload.content.encode("utf-8"))}
 
 
 @app.get("/api/documents-in-base")
@@ -468,6 +492,31 @@ def update_qdrant(payload: QdrantPathUpdate):
         path = str(Path(path).resolve())
     config_ui.write_env(cfg.env_file, {"QDRANT_PATH": path})
     return settings_qdrant()
+
+# --- Типы документов (решение №50): datalist регистрации, пользовательские дополнения. ---
+
+def _read_document_types() -> list[str]:
+    data = config_ui.read_yaml(cfg.document_types_path)
+    types = data.get("types") if isinstance(data, dict) else None
+    return [str(t) for t in types] if isinstance(types, list) else []
+
+
+@app.get("/api/settings/document-types")
+def get_document_types():
+    return {"types": _read_document_types()}
+
+
+@app.post("/api/settings/document-types")
+def add_document_type(payload: DocumentTypeAdd):
+    value = (payload.type or "").strip()
+    if not value or len(value) > 40:
+        raise HTTPException(400, "Некорректный тип документа")
+    types = _read_document_types()
+    if value not in types:
+        types.append(value)
+        config_ui.write_yaml(cfg.document_types_path, {"types": types})
+    return {"types": types}
+
 
 @app.get("/api/settings/status")
 def settings_status():

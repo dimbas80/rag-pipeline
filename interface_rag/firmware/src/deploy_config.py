@@ -53,6 +53,11 @@ class DeployConfig:
         return self.config_dir / "providers.yaml"
 
     @property
+    def document_types_path(self) -> Path:
+        """Пользовательские типы документов для datalist регистрации (решение №50)."""
+        return self.config_dir / "document_types.yaml"
+
+    @property
     def create_markdown_config_path(self) -> Path:
         """Единый конфиг Create_Markdown_YA (промпты + RAG-секции)."""
         return self.config_dir / "create_markdown_config.yaml"

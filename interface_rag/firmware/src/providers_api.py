@@ -6,11 +6,50 @@ try:
 except ImportError:
     from config_ui import read_yaml, write_yaml
 
-def tag_model(name, rules=None):
+ALLOWED_TAGS = ["chat", "vision", "embedding", "rerank"]
+
+def model_tags(name, rules=None):
+    """Теги модели по имени — СПИСОК (решение №52): модель может совмещать роли.
+    VL/vision-модели умеют и чат → [chat, vision] (gpt-4o, qwen*-vl, llava, …);
+    embedding/rerank — специализированные; остальное — [chat]."""
     n = name.lower(); rules = rules or {"embedding": ["embedding", "embed"], "rerank": ["rerank", "reranker"], "vision": ["vision", "-vl", "vl-", "4.5v", "4.6v", "4v", "-v-flash", "llava", "gpt-4o"]}
+    tags = []
     for tag, patterns in rules.items():
-        if any(p in n for p in patterns) or (tag == "vision" and (re.search(r"qwen.*-vl|gemini.*vision|claude.*vision", n))): return tag
-    return "chat"
+        if any(p in n for p in patterns) or (tag == "vision" and (re.search(r"qwen.*-vl|gemini.*vision|claude.*vision", n))):
+            tags.append(tag)
+    if "embedding" in tags or "rerank" in tags:
+        return [t for t in ALLOWED_TAGS if t in tags]
+    if "vision" in tags:
+        return ["chat", "vision"]
+    return ["chat"]
+
+def _as_tag_list(value):
+    """Значение тега из YAML/запроса («chat», «chat+vision», список) → список
+    известных тегов в каноническом порядке; неизвестные отбрасываются."""
+    parts = value.split("+") if isinstance(value, str) else (value if isinstance(value, list) else [])
+    tags = [str(p).strip().lower() for p in parts]
+    return [t for t in ALLOWED_TAGS if t in tags]
+
+def _normalize_models(models):
+    """{имя: тег|список} → {имя: [теги]} (решение №52). Пустой/неизвестный
+    набор тегов → автоопределение по имени."""
+    normalized = {}
+    for model_name, value in (models or {}).items():
+        model_name = str(model_name).strip()
+        if not model_name:
+            continue
+        normalized[model_name] = _as_tag_list(value) or model_tags(model_name)
+    return normalized
+
+def _merge_models(existing, scanned):
+    """Merge для «Обновить модели» (решение №53): скан добавляет только НОВЫЕ
+    модели; теги уже существующих (в т.ч. вручную поправленные) не меняются."""
+    merged = _normalize_models(existing)
+    for item in scanned:
+        name = str(item.get("name") or "").strip()
+        if name and name not in merged:
+            merged[name] = item.get("tags") or model_tags(name)
+    return merged
 
 def scan_models(base_url, api_key, timeout=20):
     url = base_url.rstrip("/") + "/models"
@@ -20,14 +59,14 @@ def scan_models(base_url, api_key, timeout=20):
 
 
 def scan_and_tag_models(base_url, api_key, timeout=20):
-    return [{"name": name, "tag": tag_model(name)} for name in scan_models(base_url, api_key, timeout)]
+    return [{"name": name, "tags": model_tags(name)} for name in scan_models(base_url, api_key, timeout)]
 
 def add_provider(providers_path, name, base_url, api_key_env, models):
     if not re.match(r"^https?://[^\s]+$", base_url): raise ValueError("Некорректный base_url")
     data = read_yaml(providers_path); providers = data.setdefault("providers", {})
     if name in providers: raise ValueError("Провайдер уже существует")
     if any(item.get("api_key_env") == api_key_env for item in providers.values()): raise ValueError("api_key_env уже используется")
-    providers[name] = {"base_url": base_url.rstrip("/"), "api_key_env": api_key_env, "models": {m: tag_model(m) for m in models}}
+    providers[name] = {"base_url": base_url.rstrip("/"), "api_key_env": api_key_env, "models": {m: model_tags(m) for m in models}}
     write_yaml(providers_path, data); return providers[name]
 
 
@@ -69,7 +108,8 @@ def refresh_provider(providers_path, name, env=None):
         models = scan_and_tag_models(provider["base_url"], api_key)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
-    new_models = {item["name"]: item["tag"] for item in models}
+    # Решение №53: merge — ручные модели и правки тегов переживают «Обновить модели».
+    new_models = _merge_models(provider.get("models"), models)
     if new_models != (provider.get("models") or {}):
         provider["models"] = new_models
         write_yaml(providers_path, data)
@@ -100,18 +140,8 @@ def update_provider(providers_path, name, patch):
             raise ValueError("Некорректный base_url")
         provider["base_url"] = base_url.rstrip("/")
     if patch.get("models") is not None:
-        models = patch["models"]
-        if not isinstance(models, dict):
-            raise ValueError("models должен быть объектом {имя: тег}")
-        allowed = {"chat", "vision", "embedding", "rerank"}
-        normalized = {}
-        for model_name, tag in models.items():
-            model_name = str(model_name).strip()
-            if not model_name:
-                continue
-            tag = tag if tag in allowed else tag_model(model_name)
-            normalized[model_name] = tag
-        provider["models"] = normalized
+        # Решение №52: значения — «chat», «chat+vision» или список; канонический порядок.
+        provider["models"] = _normalize_models(patch["models"])
     if new_name != name:
         # атомарный перенос ключа + переписывание ссылок ролей (№44)
         providers[new_name] = provider
@@ -168,9 +198,11 @@ def refresh_all_models(providers_path, env=None):
             continue
         try:
             models = scan_and_tag_models(provider["base_url"], api_key)
-            provider["models"] = {item["name"]: item["tag"] for item in models}
-            changed = True
-            result[name] = {"ok": True, "models": provider["models"]}
+            merged = _merge_models(provider.get("models"), models)  # решение №53
+            if merged != (provider.get("models") or {}):
+                provider["models"] = merged
+                changed = True
+            result[name] = {"ok": True, "models": merged}
         except Exception as exc:
             result[name] = {"ok": False, "error": str(exc)}
     if changed:

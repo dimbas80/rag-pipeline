@@ -215,11 +215,20 @@
     return Object.keys(state.providers.providers || {});
   }
 
+  var ALL_TAGS = ["chat", "vision", "embedding", "rerank"];
+
+  // Значение тега из providers.yaml: строка («chat»), «chat+vision» или список.
+  function modelTagList(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === "string") return value.split("+").map(function (s) { return s.trim(); }).filter(Boolean);
+    return [];
+  }
+
   function providerModels(name, tag) {
     var provider = (state.providers.providers || {})[name];
     var models = (provider && provider.models) || {};
     return Object.keys(models).filter(function (m) {
-      return !tag || models[m] === tag;
+      return !tag || modelTagList(models[m]).indexOf(tag) !== -1;
     });
   }
 
@@ -229,7 +238,7 @@
     return roles[def.role[1]] || {};
   }
 
-  /* ---------- секция «Провайдеры» (решения 41–45) ---------- */
+  /* ---------- секция «Провайдеры» (решения 41–45, 52) ---------- */
   function providerCardHtml(name, provider) {
     var models = provider.models || {};
     var modelRows = Object.keys(models).map(function (modelName) {
@@ -246,7 +255,7 @@
         '<div class="model-list" data-model-list>' + modelRows + "</div>" +
         '<div class="model-add">' +
           '<input type="text" data-new-model-name placeholder="имя модели">' +
-          '<select data-new-model-tag>' + tagOptionsHtml("chat") + "</select>" +
+          '<span class="model-tags">' + tagChipsHtml(["chat"]) + "</span>" +
           '<button type="button" class="btn ghost" data-model-add>+ модель</button>' +
         "</div>" +
       "</details>" +
@@ -258,16 +267,20 @@
     "</div>";
   }
 
-  function tagOptionsHtml(selected) {
-    return ["chat", "vision", "embedding", "rerank"].map(function (tag) {
-      return '<option value="' + tag + '"' + (tag === selected ? " selected" : "") + ">" + tag + "</option>";
+  /* Метки-чипы вместо выпадающего списка (решение №52): автодетект по имени —
+     дефолт, клик по метке включает/выключает роль (модель может совмещать,
+     например chat+vision — тогда она доступна в обеих ролях). */
+  function tagChipsHtml(activeTags) {
+    return ALL_TAGS.map(function (tag) {
+      var on = (activeTags || []).indexOf(tag) !== -1;
+      return '<button type="button" class="tag-chip' + (on ? " on" : "") + '" data-model-tag="' + tag + '" title="Роль модели: ' + tag + '">' + tag + "</button>";
     }).join("");
   }
 
-  function modelRowHtml(modelName, tag) {
+  function modelRowHtml(modelName, tags) {
     return '<div class="model-row" data-model="' + esc(modelName) + '">' +
       '<span class="model-name" title="' + esc(modelName) + '">' + esc(modelName) + "</span>" +
-      '<select data-model-tag>' + tagOptionsHtml(tag) + "</select>" +
+      '<span class="model-tags">' + tagChipsHtml(modelTagList(tags)) + "</span>" +
       '<button type="button" class="btn ghost model-del" data-model-del title="Удалить модель из списка">×</button>' +
     "</div>";
   }
@@ -284,8 +297,10 @@
       : "";
     return '<section class="settings-card"><h3>Провайдеры</h3>' +
       '<p class="muted">Каждая карточка — провайдер из providers.yaml: имя (переименование обновит ссылки в ролях), ' +
-      'base_url, API-ключ (хранится в .env, показан маской) и список моделей с тегами. ' +
-      '«Обновить модели» запрашивает /models только у этого провайдера.</p>' +
+      'base_url, API-ключ (хранится в .env, показан маской) и список моделей с метками ролей ' +
+      '(chat / vision / embedding / rerank — определяются по имени; клик по метке включает или выключает роль, ' +
+      'модель может совмещать несколько, например chat+vision — тогда доступна в обеих ролях). ' +
+      '«Обновить модели» добавляет новые модели провайдера, не трогая существующие строки и их метки.</p>' +
       '<div class="provider-toolbar"><button id="add-provider" class="btn">Добавить провайдера</button></div>' +
       removedBar +
       '<div class="provider-cards">' + (cards || '<div class="muted small">Провайдеры не настроены — добавьте кнопкой выше.</div>') +
@@ -501,7 +516,21 @@
     if (save) save.addEventListener("click", saveSettings);
   }
 
-  /* Карточки провайдеров: rename-url, модели, refresh, delete (решения 41–45). */
+  /* Клик по метке-чипу: включить/выключить роль модели (решение №52). */
+  function bindTagChips(root) {
+    root.querySelectorAll(".tag-chip").forEach(function (chip) {
+      chip.addEventListener("click", function () { chip.classList.toggle("on"); });
+    });
+  }
+
+  /* Активные теги строки модели / блока «+ модель». */
+  function rowTags(root) {
+    return Array.prototype.map.call(root.querySelectorAll(".tag-chip.on"), function (chip) {
+      return chip.getAttribute("data-model-tag");
+    });
+  }
+
+  /* Карточки провайдеров: rename-url, модели, refresh, delete (решения 41–45, 52). */
   function bindProviderControls() {
     var add = $("add-provider");
     if (add) add.addEventListener("click", openProviderDialog);
@@ -517,18 +546,19 @@
       var updateCount = function () {
         if (countEl) countEl.textContent = "Модели (" + list.querySelectorAll(".model-row").length + ")";
       };
-      // «+ модель» — добавить строку в список (без тега имени: вложенность не ломается)
+      // «+ модель» — добавить строку в список (теги — активные чипы, можно несколько)
       var addBtn = card.querySelector("[data-model-add]");
       var nameInput = card.querySelector("[data-new-model-name]");
-      if (addBtn && list && nameInput) {
+      var addRow = card.querySelector(".model-add");
+      if (addBtn && list && nameInput && addRow) {
+        bindTagChips(addRow);
         addBtn.addEventListener("click", function () {
           var modelName = nameInput.value.trim();
           if (!modelName) return;
           var existing = list.querySelector('[data-model="' + CSS.escape(modelName) + '"]');
           if (existing) { nameInput.value = ""; return; }
-          var tag = card.querySelector("[data-new-model-tag]").value;
           var wrap = document.createElement("div");
-          wrap.innerHTML = modelRowHtml(modelName, tag);
+          wrap.innerHTML = modelRowHtml(modelName, rowTags(addRow));
           var row = wrap.firstChild;
           list.appendChild(row);
           bindModelRow(row, updateCount);
@@ -538,7 +568,10 @@
       }
       // существующие строки моделей
       if (list) {
-        list.querySelectorAll(".model-row").forEach(function (row) { bindModelRow(row, updateCount); });
+        list.querySelectorAll(".model-row").forEach(function (row) {
+          bindModelRow(row, updateCount);
+          bindTagChips(row);
+        });
       }
       // «Обновить модели» per-provider (№45) — сразу на сервер, изоляция ошибки
       var refreshBtn = card.querySelector("[data-provider-refresh]");
@@ -677,7 +710,7 @@
       var models = {};
       card.querySelectorAll("[data-model-list] .model-row").forEach(function (row) {
         var modelName = row.getAttribute("data-model");
-        models[modelName] = row.querySelector("[data-model-tag]").value;
+        models[modelName] = rowTags(row); // список тегов (решение №52)
       });
       var original = (state.providers.providers || {})[origName] || {};
       var changed = name !== origName || baseUrl !== (original.base_url || "") ||
@@ -853,7 +886,7 @@
         });
         var byTag = {};
         (scan.models || []).forEach(function (item) {
-          byTag[item.tag] = (byTag[item.tag] || 0) + 1;
+          (item.tags || []).forEach(function (t) { byTag[t] = (byTag[t] || 0) + 1; });
         });
         resultBox.innerHTML = "Моделей найдено: " + (scan.models || []).length +
           (Object.keys(byTag).length

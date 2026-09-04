@@ -33,7 +33,7 @@
     <div class="chat-layout">
       <div class="chat-main">
         <div class="page-head">
-          <h2>Чат по базе ГОСТ</h2>
+          <h2>Чат по базе</h2>
           <p class="muted">Вопрос на естественном языке — ответ с цитатами и иллюстрациями из документов.</p>
         </div>
         <div id="chat-messages" class="chat-messages"></div>
@@ -113,8 +113,8 @@
 
             <div class="field">
               <label for="reg-slug">Слаг (ключ в базе) <span class="req">*</span>
-                <span class="hint" title="Ключ документа в базе (doc_slug). Заполняется автоматически из обозначения, типа и тематики; можно отредактировать вручную. Разрешены латинские буквы, цифры и знак подчёркивания. При смене слага проиндексированного документа (без смены обозначения) переиндексация удалит старые фрагменты и запишет новые — дубликата не будет.">?</span></label>
-              <input id="reg-slug" name="slug" type="text" placeholder="GOST_18410_kabeli">
+                <span class="hint" title="Ключ документа в базе (doc_slug). Заполняется автоматически транслитерацией обозначения (пример: ГОСТ 18410—73 → GOST_18410_73); можно отредактировать вручную. Разрешены латинские буквы, цифры и знак подчёркивания. При смене слага проиндексированного документа (без смены обозначения) переиндексация удалит старые фрагменты и запишет новые — дубликата не будет.">?</span></label>
+              <input id="reg-slug" name="slug" type="text" placeholder="GOST_18410_73">
             </div>
 
             <div class="field">
@@ -206,9 +206,18 @@
           <button id="delete-result" class="btn danger" disabled title="Удалить промежуточные артефакты конвертации (OCR-кэш, image/, table_images.json). .md, регистрация и чанки сохраняются.">Удалить результат</button>
           <span class="spacer"></span>
           <a id="md-view" class="btn link" hidden target="_blank" rel="noopener">Просмотр .md</a>
+          <a id="md-edit" class="btn link" hidden>Редактировать .md</a>
           <a id="md-download" class="btn link" hidden download>Скачать .md</a>
         </div>
         <pre id="job-log" class="log"></pre>
+        <div id="md-editor" class="md-editor" hidden>
+          <textarea id="md-editor-text" spellcheck="false"></textarea>
+          <div class="action-row">
+            <button id="md-editor-save" class="btn primary">Сохранить</button>
+            <button id="md-editor-cancel" class="btn">Отмена</button>
+            <span id="md-editor-status" class="status-line"></span>
+          </div>
+        </div>
         <div id="md-preview" class="md-preview" hidden></div>
       </div>
     </div>

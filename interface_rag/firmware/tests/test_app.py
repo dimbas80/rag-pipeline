@@ -53,6 +53,7 @@ def _fake_cfg(tmp_path):
     class Cfg:
         config_dir = tmp_path
         providers_path = tmp_path / "providers.yaml"
+        document_types_path = tmp_path / "document_types.yaml"
         create_markdown_config_path = tmp_path / "create_markdown_config.yaml"
         search_config_path = tmp_path / "search_config.yaml"
         create_markdown_dir = tmp_path / "cm"
@@ -476,12 +477,13 @@ def test_put_roles_route_not_shadowed_by_name_route(tmp_path, monkeypatch):
 def test_refresh_provider_route(monkeypatch, tmp_path):
     client, cfg = _providers_route_client(monkeypatch, tmp_path)
     monkeypatch.setattr(app.providers_api, "scan_and_tag_models",
-                        lambda base_url, api_key, timeout=20: [{"name": "m2", "tag": "chat"}])
+                        lambda base_url, api_key, timeout=20: [{"name": "m2", "tags": ["chat", "vision"]}])
     cfg.env_file.write_text("O_KEY=secret\n", encoding="utf-8")
     response = client.post("/api/settings/providers/old/refresh")
     assert response.status_code == 200
     assert response.json()["ok"] is True
-    assert response.json()["models"] == {"m2": "chat"}
+    # решение №53: merge — существующая m1 сохраняется, m2 добавляется
+    assert response.json()["models"] == {"m1": ["chat"], "m2": ["chat", "vision"]}
     assert client.post("/api/settings/providers/ghost/refresh").status_code == 404
 
 
@@ -572,3 +574,40 @@ def test_telegram_bot_restart_systemctl_failure_raises_502(monkeypatch, tmp_path
     with pytest.raises(HTTPException) as exc:
         app.restart_telegram_bot()
     assert exc.value.status_code == 502
+
+
+# --- решение №50: пользовательские типы документов ---
+
+def test_document_types_roundtrip(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    assert app.get_document_types() == {"types": []}
+    result = app.add_document_type(app.DocumentTypeAdd(type="  ГОСТ Р  "))
+    assert result["types"] == ["ГОСТ Р"]
+    # идемпотентность + второй тип
+    app.add_document_type(app.DocumentTypeAdd(type="ГОСТ Р"))
+    result = app.add_document_type(app.DocumentTypeAdd(type="СТО"))
+    assert result["types"] == ["ГОСТ Р", "СТО"]
+    with pytest.raises(HTTPException) as exc:
+        app.add_document_type(app.DocumentTypeAdd(type="   "))
+    assert exc.value.status_code == 400
+    assert app.get_document_types() == {"types": ["ГОСТ Р", "СТО"]}
+
+
+# --- решение №51: текстовый редактор итогового md ---
+
+def test_markdown_put_updates_file(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    doc_dir = tmp_path / "Markdown" / "doc"
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "doc.md").write_text("старый текст", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.put("/api/files/markdown/doc", json={"content": "# Новый текст\n"})
+    assert response.status_code == 200
+    assert (doc_dir / "doc.md").read_text(encoding="utf-8") == "# Новый текст\n"
+    # GET отдаёт обновлённый файл
+    assert "Новый текст" in client.get("/api/files/markdown/doc").text
+    # неизвестный stem → 404, traversal не проходит
+    assert client.put("/api/files/markdown/nope", json={"content": "x"}).status_code == 404
+    assert client.put("/api/files/markdown/../etc", json={"content": "x"}).status_code in (404, 307)

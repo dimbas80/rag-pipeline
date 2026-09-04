@@ -22,7 +22,7 @@ prod:
   env_file: /root/RAG/config/.env
   base_markdown: /mnt/sdb/!База_ГОСТ/Markdown
 prompts:
-  registration_vision: 'Извлеки JSON: document_id, title, domain_hint, document_type. Если неизвестно — null.'
+  registration_vision: 'Извлеки JSON: document_id, title, domain_hint, document_type, date_enacted (дата введения в действие, ГГГГ-ММ-ДД или как написана на титуле). Если неизвестно — null.'
 model_tags:
   embedding: [embedding, embed]
   rerank: [rerank, reranker]

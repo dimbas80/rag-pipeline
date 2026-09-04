@@ -252,6 +252,7 @@
       var session = await api("/api/documents/" + state.sid);
       index.disabled = !session.can_index;
       $("md-view").hidden = !session.md_exists;
+      $("md-edit").hidden = !session.md_exists;
       $("md-download").hidden = !session.md_exists;
       if (session.md_exists) {
         // ts — bust кэша браузера для ссылок «Просмотр»/«Скачать» (a href).
@@ -281,9 +282,9 @@
       var result = await api("/api/documents", { method: "POST", body: form });
       state.sid = result.session_id;
       state.stem = result.stem;
-      fillField("reg-source_file", file.name);
       setStatus("doc-status", "Файл загружен. Заполняю форму регистрации…");
-      await prefillRegistration();
+      await prefillRegistration(); // сначала очистка+распознавание…
+      fillField("reg-source_file", file.name); // …затем имя файла (очистка его стирает)
       state.rolesConfigured = await rolesReady();
       await updateGates();
       setStatus("doc-status", "Файл загружен: " + file.name + ". Проверьте поля регистрации (распознанные — заполнены) и нажмите «Зарегистрировать документ».", "ok");
@@ -295,8 +296,25 @@
   });
 
   /* ---------- регистрация: prefill + форма ---------- */
+  var IGNORE_SECTIONS_DEFAULT = "Предисловие, Содержание";
+
+  // Сброс ВСЕХ полей формы регистрации (решение №49): без этого на следующем
+  // документе остаются значения предыдущего (распознанные поля перезаписываются
+  // только если модель их вернула).
+  function resetRegistrationForm() {
+    Object.keys(REG_FIELD_MAP).forEach(function (id) {
+      var input = $(id);
+      if (!input) return;
+      if (id === "reg-status") { input.value = "active"; return; }
+      if (id === "reg-ignore_sections") { input.value = IGNORE_SECTIONS_DEFAULT; return; }
+      input.value = "";
+    });
+    setStatus("reg-feedback", "", "");
+  }
+
   async function prefillRegistration() {
     if (!state.sid) return;
+    resetRegistrationForm();
     slugDirty = false; // новый документ: автогенератив слага снова активен
     try {
       var result = await api("/api/documents/" + state.sid + "/register/prefill", { method: "POST" });
@@ -311,7 +329,7 @@
         fillField("reg-title", fields.title);
         fillField("reg-domain", fields.domain || fields.domain_hint);
         fillInput("reg-document_type", fields.document_type);
-        fillField("reg-slug", fields.slug);
+        fillField("reg-date_enacted", fields.date_enacted); // ГГГГ-ММ-ДД (нормализует бэкенд, решение №48)
         // Автоопределение года издания из обозначения (последняя группа цифр).
         var edition = extractEdition(fields.document_id);
         if (edition) fillField("reg-edition", edition);
@@ -432,29 +450,64 @@
     if (!$("reg-document_type").value) deriveTypeFromId();
   });
 
+  /* ---------- типы документов: datalist + пользовательские (решение №50) ---------- */
+  // Дефолты зашиты в <datalist> index.html; добавленные вручную типы хранятся
+  // на бэкенде (document_types.yaml) и подмешиваются при загрузке страницы —
+  // поэтому доступны и для следующего документа, и в другом браузере.
+  var docTypes = []; // всё, что сейчас в datalist (дефолты + пользовательские)
+
+  function datalistHas(value) {
+    var lower = String(value).trim().toLowerCase();
+    return docTypes.some(function (t) { return t.toLowerCase() === lower; });
+  }
+
+  function addTypeOption(value) {
+    docTypes.push(value);
+    var option = document.createElement("option");
+    option.value = value;
+    $("document-type-list").appendChild(option);
+  }
+
+  async function loadDocumentTypes() {
+    try {
+      var result = await api("/api/settings/document-types");
+      ((result && result.types) || []).forEach(function (t) {
+        if (!datalistHas(t)) addTypeOption(t);
+      });
+    } catch (_) { /* сервер недоступен — остаются дефолты из HTML */ }
+  }
+
+  // Новый тип, введённый вручную, сохраняется сразу (change = фиксация значения).
+  $("reg-document_type").addEventListener("change", async function () {
+    var value = this.value.trim();
+    if (!value || datalistHas(value)) return;
+    addTypeOption(value);
+    try {
+      await api("/api/settings/document-types", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: value })
+      });
+    } catch (_) { /* тип останется только в текущей сессии */ }
+  });
+
   /* ---------- слаг: живой автогенератив до ручной правки ---------- */
-  var SLUG_PREFIX = {"ГОСТ":"GOST", "СП":"SP", "СО":"SO", "СНиП":"SNIP", "ПУЭ":"PUE"};
-  var SLUG_TRANSLIT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya"};
+  // Клиентская копия registration.make_slug (решение №47): слаг — транслитерация
+  // обозначения целиком. Пример: «ГОСТ 18410—73» → GOST_18410_73.
+  var SLUG_TRANSLIT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","ч":"ch","ш":"sh","щ":"sch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya","А":"A","Б":"B","В":"V","Г":"G","Д":"D","Е":"E","Ё":"E","Ж":"Zh","З":"Z","И":"I","Й":"Y","К":"K","Л":"L","М":"M","Н":"N","О":"O","П":"P","Р":"R","С":"S","Т":"T","У":"U","Ф":"F","Х":"H","Ц":"C","Ч":"Ch","Ш":"Sh","Щ":"Sch","Ъ":"","Ы":"Y","Ь":"","Э":"E","Ю":"Yu","Я":"Ya"};
   var slugDirty = false; // true — пользователь правил слаг вручную, автогенератив выключен
 
-  // Клиентская копия registration.make_slug: префикс типа + цифры обозначения + транслит тематики.
   function buildSlug() {
-    var type = $("reg-document_type").value.trim();
-    var prefix = SLUG_PREFIX[type] || String(type || "DOC").replace(/[^\p{L}\p{N}_]+/gu, "_");
-    var num = $("reg-document_id").value.match(/\d+/);
-    var tail = $("reg-domain").value.trim().toLowerCase()
-      .replace(/[абвгдеёжзийклмнопрстуфхцчшщъыьэюя]/g, function (ch) { return SLUG_TRANSLIT[ch]; })
-      .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-    return prefix + "_" + (num ? num[0] : "DOC") + (tail ? "_" + tail : "");
+    var text = $("reg-document_id").value.replace(/[абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ]/g, function (ch) { return SLUG_TRANSLIT[ch]; });
+    var slug = text.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+    return slug || "";
   }
 
   function refreshSlugPreview() {
     if (!slugDirty) $("reg-slug").value = buildSlug();
   }
 
-  ["reg-document_id", "reg-document_type", "reg-domain"].forEach(function (id) {
-    $(id).addEventListener("input", refreshSlugPreview);
-  });
+  $("reg-document_id").addEventListener("input", refreshSlugPreview);
 
   $("reg-slug").addEventListener("input", function () {
     slugDirty = this.value !== ""; // непустой ввод — ручная правка; очистка возвращает автогенератив
@@ -712,6 +765,62 @@
     return "/api/images/" + encodeURIComponent(state.stem) + "/" + relativePath.replace(/^\.?\//, "");
   }
 
+  /* ---------- MD-редактор (решение №51): простой текстовый редактор итогового md ---------- */
+  function setEditorStatus(message, cls) {
+    var el = $("md-editor-status");
+    if (!el) return;
+    el.textContent = message || "";
+    el.className = "status-line" + (cls ? " " + cls : "");
+  }
+
+  async function openMdEditor() {
+    if (!state.stem) return;
+    setEditorStatus("");
+    try {
+      var response = await fetch(mdUrl(state.stem), { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      $("md-editor-text").value = await response.text();
+      $("md-editor").hidden = false;
+      $("md-preview").hidden = true; // редактор вместо рендера
+      $("md-editor-text").focus();
+    } catch (error) {
+      setStatus("doc-status", "Не удалось открыть .md: " + error.message, "err");
+    }
+  }
+
+  function closeMdEditor() {
+    var editor = $("md-editor");
+    if (editor) editor.hidden = true;
+  }
+
+  $("md-edit").addEventListener("click", function (event) {
+    event.preventDefault();
+    if ($("md-editor").hidden) openMdEditor();
+    else closeMdEditor();
+  });
+
+  $("md-editor-cancel").addEventListener("click", closeMdEditor);
+
+  $("md-editor-save").addEventListener("click", async function () {
+    var save = $("md-editor-save");
+    save.disabled = true;
+    setEditorStatus("Сохраняю…");
+    try {
+      await api("/api/files/markdown/" + encodeURIComponent(state.stem), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: $("md-editor-text").value })
+      });
+      closeMdEditor();
+      loadMdPreview(true); // перерисовать превью из сохранённого файла
+      setStatus("doc-status", ".md сохранён. Переиндексируйте документ («Добавить документ в базу»), чтобы изменения попали в базу.", "warn");
+    } catch (error) {
+      setEditorStatus("Ошибка сохранения: " + error.message, "err");
+    } finally {
+      save.disabled = false;
+    }
+  });
+
   /* ---------- init ---------- */
   $("md-view").addEventListener("click", function (event) {
     // «Просмотр .md» — переключатель рендера; каждый показ перечитывает файл
@@ -724,5 +833,6 @@
       loadMdPreview(true);
     }
   });
+  loadDocumentTypes(); // пользовательские типы документов в datalist (решение №50)
   switchTab("chat");
 })();

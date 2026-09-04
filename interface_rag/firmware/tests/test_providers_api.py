@@ -2,9 +2,21 @@ import pytest
 import yaml
 from firmware.src import providers_api
 
-def test_tag_model():
-    assert providers_api.tag_model('text-embedding-3-small')=='embedding'
-    assert providers_api.tag_model('qwen-vl')=='vision'
+def test_model_tags_multi():
+    assert providers_api.model_tags('text-embedding-3-small') == ['embedding']
+    assert providers_api.model_tags('qwen3-reranker') == ['rerank']
+    # Решение №52: VL/vision-модели умеют и чат → [chat, vision]
+    assert providers_api.model_tags('qwen-vl') == ['chat', 'vision']
+    assert providers_api.model_tags('gpt-4o') == ['chat', 'vision']
+    assert providers_api.model_tags('llama3-8b-instruct') == ['chat']
+
+def test_as_tag_list_and_normalize():
+    assert providers_api._as_tag_list('chat') == ['chat']
+    assert providers_api._as_tag_list('chat+vision') == ['chat', 'vision']
+    assert providers_api._as_tag_list(['vision', 'chat']) == ['chat', 'vision']  # канонический порядок
+    assert providers_api._as_tag_list('weird') == []
+    assert providers_api._normalize_models({'m': 'chat+vision', 'x': '', '': 'chat'}) == {
+        'm': ['chat', 'vision'], 'x': ['chat']}
 
 def test_scan_models(monkeypatch):
     class R:
@@ -29,7 +41,7 @@ def test_refresh_all_models_updates_and_isolates_errors(monkeypatch, tmp_path):
     def fake_scan(base_url, api_key, timeout=20):
         if base_url == "https://b/v1":
             raise RuntimeError("boom")
-        return [{"name": "x-model", "tag": "chat"}]
+        return [{"name": "x-model", "tags": ["chat"]}]
     monkeypatch.setattr(providers_api, "scan_and_tag_models", fake_scan)
 
     result = providers_api.refresh_all_models(path, {"A_KEY": "a", "B_KEY": "b", "C_KEY": "c"})
@@ -38,9 +50,34 @@ def test_refresh_all_models_updates_and_isolates_errors(monkeypatch, tmp_path):
     assert "boom" in result["b"]["error"]
     assert result["c"]["ok"] is True
     written = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert written["providers"]["a"]["models"] == {"x-model": "chat"}
+    assert written["providers"]["a"]["models"] == {"x-model": ["chat"]}
     assert written["providers"]["b"]["models"] == {}
-    assert written["providers"]["c"]["models"] == {"x-model": "chat"}
+    assert written["providers"]["c"]["models"] == {"x-model": ["chat"]}
+
+
+def test_refresh_keeps_manual_models_and_tags(monkeypatch, tmp_path):
+    # Решение №53: «Обновить модели» добавляет только новые модели; теги
+    # существующих (в т.ч. вручную исправленные) не перезаписываются.
+    path = tmp_path / "providers.yaml"
+    path.write_text(yaml.safe_dump({"providers": {
+        "a": {"base_url": "https://a/v1", "api_key_env": "A_KEY",
+              "models": {"manual-model": ["chat", "vision"], "known": ["embedding"]}},
+    }}), encoding="utf-8")
+
+    def fake_scan(base_url, api_key, timeout=20):
+        return [{"name": "fresh", "tags": ["chat"]},
+                {"name": "known", "tags": ["chat"]}]  # тег из скана НЕ применяется
+    monkeypatch.setattr(providers_api, "scan_and_tag_models", fake_scan)
+
+    result = providers_api.refresh_provider(path, "a", {"A_KEY": "k"})
+    assert result["ok"] is True
+    assert result["models"] == {
+        "manual-model": ["chat", "vision"],  # ручная модель сохранена
+        "known": ["embedding"],              # её теги не перезаписаны
+        "fresh": ["chat"],                   # новая модель добавлена
+    }
+    written = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert written["providers"]["a"]["models"] == result["models"]
 
 
 def test_refresh_skips_provider_without_key(monkeypatch, tmp_path):
@@ -101,13 +138,15 @@ def test_update_provider_models_and_base_url(tmp_path):
     _providers_with_roles(path)
     data = providers_api.update_provider(path, "free", {
         "base_url": "https://f2/v1/",
-        "models": {"emb-1": "embedding", "bad-tag-model": "weird"},
+        "models": {"emb-1": "embedding", "multi": "chat+vision", "bad-tag-model": "weird"},
     })
     provider = data["providers"]["free"]
     assert provider["base_url"] == "https://f2/v1"
-    assert provider["models"]["emb-1"] == "embedding"
+    assert provider["models"]["emb-1"] == ["embedding"]
+    # решение №52: несколько ролей у одной модели
+    assert provider["models"]["multi"] == ["chat", "vision"]
     # неизвестный тег -> авто-тегирование по имени
-    assert provider["models"]["bad-tag-model"] == "chat"
+    assert provider["models"]["bad-tag-model"] == ["chat"]
 
 
 def test_delete_provider_guarded_by_roles(tmp_path):
@@ -139,9 +178,9 @@ def test_refresh_provider_single_isolates_error(monkeypatch, tmp_path):
         providers_api.refresh_provider(path, "missing", {})
 
     monkeypatch.setattr(providers_api, "scan_and_tag_models",
-                        lambda base_url, api_key, timeout=20: [{"name": "m2", "tag": "vision"}])
+                        lambda base_url, api_key, timeout=20: [{"name": "m2", "tags": ["chat", "vision"]}])
     result = providers_api.refresh_provider(path, "old", {"O_KEY": "k"})
     assert result["ok"] is True
-    assert result["models"] == {"m2": "vision"}
+    assert result["models"] == {"m1": ["chat"], "m2": ["chat", "vision"]}  # m1 сохранён (№53)
     written = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert written["providers"]["old"]["models"] == {"m2": "vision"}
+    assert written["providers"]["old"]["models"] == {"m1": ["chat"], "m2": ["chat", "vision"]}
