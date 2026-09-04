@@ -520,6 +520,58 @@ def update_base_dir(payload: BaseDirUpdate):
     config_ui.write_env(cfg.env_file, {"BASE_DIR": path})
     return settings_base_dir()
 
+@app.get("/api/fs/dirs")
+def fs_dirs(path: str = "/"):
+    """Список подкаталогов сервера для выбора папок в UI (машина интерфейса,
+    не машина браузера). Отдаются только имена каталогов, скрытые (с точкой)
+    не показываются; содержимое файлов не читается."""
+    target = (path or "/").strip() or "/"
+    if not Path(target).is_absolute():
+        raise HTTPException(400, "Путь должен быть абсолютным")
+    resolved = Path(target).resolve()
+    if not resolved.exists():
+        raise HTTPException(404, "Каталог не существует")
+    if not resolved.is_dir():
+        raise HTTPException(400, "Это не каталог")
+    entries = [
+        {"name": child.name, "path": str(child)}
+        for child in sorted(resolved.iterdir(), key=lambda p: p.name)
+        if child.is_dir() and not child.name.startswith(".")
+    ]
+    parent = str(resolved.parent) if resolved.parent != resolved else None
+    return {"path": str(resolved), "parent": parent, "entries": entries}
+
+def _tmp_root() -> Path:
+    return (cfg.base_dir / "tmp").resolve()
+
+def _dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+@app.get("/api/settings/tmp")
+def tmp_settings():
+    """Текущий размер папки временных файлов <BASE_DIR>/tmp (для раздела «Папки»)."""
+    root = _tmp_root()
+    return {"path": str(root), "size_bytes": _dir_size_bytes(root)}
+
+@app.post("/api/settings/tmp/clear")
+def tmp_clear():
+    """Удалить всё содержимое <BASE_DIR>/tmp (сама папка остаётся).
+
+    Удаляются только дети tmp-каталога — соседние файлы и сам корень не трогаются.
+    """
+    root = _tmp_root()
+    freed = _dir_size_bytes(root)
+    if root.exists():
+        for child in root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    return {"path": str(root), "freed_bytes": freed, "size_bytes": 0}
+
 # --- Типы документов (решение №50): datalist регистрации, пользовательские дополнения. ---
 
 def _read_document_types() -> list[str]:

@@ -673,3 +673,81 @@ def test_markdown_put_updates_file(monkeypatch, tmp_path):
     # неизвестный stem → 404, traversal не проходит
     assert client.put("/api/files/markdown/nope", json={"content": "x"}).status_code == 404
     assert client.put("/api/files/markdown/../etc", json={"content": "x"}).status_code in (404, 307)
+
+
+# --- обзор каталогов сервера для выбора папок в UI ---
+
+def test_fs_dirs_lists_only_visible_directories(monkeypatch, tmp_path):
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "beta").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.get("/api/fs/dirs", params={"path": str(tmp_path)})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == str(tmp_path)
+    assert body["parent"] == str(tmp_path.parent)
+    names = [e["name"] for e in body["entries"]]
+    assert names == sorted(["alpha", "beta"])
+    assert all(e["path"] == str(tmp_path / n) for n, e in
+               zip(names, body["entries"]))
+
+
+def test_fs_dirs_root_has_no_parent(monkeypatch):
+    client = TestClient(app.app)
+    response = client.get("/api/fs/dirs")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["path"] == "/"
+    assert body["parent"] is None
+
+
+def test_fs_dirs_unknown_path_404(monkeypatch):
+    client = TestClient(app.app)
+    response = client.get("/api/fs/dirs", params={"path": "/nonexistent-xyz-123"})
+    assert response.status_code == 404
+
+
+def test_fs_dirs_rejects_relative_path(monkeypatch):
+    client = TestClient(app.app)
+    assert client.get("/api/fs/dirs", params={"path": "relative/path"}).status_code == 400
+
+
+# --- очистка временных файлов tmp/ (раздел «Папки») ---
+
+def test_get_tmp_size_reports_path_and_bytes(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    tmp_dir = cfg.base_dir / "tmp"
+    (tmp_dir / "sub").mkdir(parents=True)
+    (tmp_dir / "sub" / "f.bin").write_bytes(b"x" * 100)
+    (tmp_dir / "g.bin").write_bytes(b"y" * 30)
+    response = app.tmp_settings()
+    assert response["path"] == str(tmp_dir)
+    assert response["size_bytes"] == 130
+
+
+def test_get_tmp_size_missing_dir_is_zero(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    response = app.tmp_settings()
+    assert response["size_bytes"] == 0
+
+
+def test_post_tmp_clear_removes_contents_keeps_dir(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    tmp_dir = cfg.base_dir / "tmp"
+    (tmp_dir / "sub").mkdir(parents=True)
+    (tmp_dir / "sub" / "f.bin").write_bytes(b"x" * 100)
+    (cfg.base_dir / "keep.txt").write_text("важный файл вне tmp", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.post("/api/settings/tmp/clear")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["size_bytes"] == 0
+    assert body["freed_bytes"] == 100
+    assert tmp_dir.is_dir()
+    assert list(tmp_dir.iterdir()) == []
+    assert (tmp_dir.parent / "keep.txt").read_text(encoding="utf-8") == "важный файл вне tmp"

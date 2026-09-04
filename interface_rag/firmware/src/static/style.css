@@ -583,6 +583,26 @@ dialog h2 { margin: 0 0 14px; font-size: 17px; }
 .dialog-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
 .scan-result { margin-top: 8px; font-size: 12.5px; max-height: 180px; overflow: auto; }
 
+/* выбор папки на сервере */
+.folder-crumbs { display: flex; flex-wrap: wrap; gap: 2px; align-items: center; font-size: 13px; }
+.folder-crumb {
+  border: 0; background: transparent; padding: 2px 4px; cursor: pointer;
+  font: inherit; font-size: 13px; color: var(--accent); border-radius: var(--radius-sm);
+}
+.folder-crumb:hover { text-decoration: underline; }
+.folder-sep { color: var(--muted); }
+.folder-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 320px; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px;
+}
+.folder-item {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  border: 0; background: transparent; padding: 7px 9px;
+  font: inherit; font-size: 14px; border-radius: var(--radius-sm);
+}
+.folder-item:hover { background: var(--accent-soft); }
+
 /* ---------- Standalone settings page ---------- */
 .standalone-back { display: inline-flex; gap: 6px; align-items: center; margin: 18px 0 0; color: var(--accent); text-decoration: none; font-weight: 600; font-size: 14px; }
 

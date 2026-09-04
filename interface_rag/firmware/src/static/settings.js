@@ -81,18 +81,25 @@
     status: {},
     baseDir: { path: "", default: "", overridden: false },
     qdrant: { path: "", default: "", overridden: false },
+    tmp: { path: "", size_bytes: 0, freed_bytes: 0 },
     bot: null,        // статус interface-rag-bot.service (null = ещё не запрашивали)
     botResult: null,  // { text, cls } — сообщение после перезапуска
     botBusy: false,   // идёт запрос (статус/рестарт) — не перерисовывать кнопку
     activeSection: "providers",
-    baseDirReset: false,
-    qdrantReset: false,
     loaded: false,
     busy: false,
     removedProviders: {} // имя провайдера -> true: помечен к удалению до «Сохранить» (№41)
   };
 
   function $(id) { return document.getElementById(id); }
+  function fmtBytes(n) {
+    var v = Number(n) || 0;
+    if (v <= 0) return "0 Б";
+    var units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    var i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i ? Math.round(v * 10) / 10 : v) + " " + units[i];
+  }
   function esc(value) {
     return String(value == null ? "" : value)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -118,7 +125,8 @@
         api("/api/settings/search-config"),
         api("/api/settings/status"),
         api("/api/settings/qdrant"),
-        api("/api/settings/base-dir")
+        api("/api/settings/base-dir"),
+        api("/api/settings/tmp")
       ]);
       state.providers = results[0] || { providers: {}, roles: {} };
       state.env = results[1] || {};
@@ -126,8 +134,7 @@
       state.status = results[3] || {};
       state.qdrant = results[4] || { path: "", default: "", overridden: false };
       state.baseDir = results[5] || { path: "", default: "", overridden: false };
-      state.qdrantReset = false;
-      state.baseDirReset = false;
+      state.tmp = results[6] || { path: "", size_bytes: 0, freed_bytes: 0 };
       state.loaded = true;
       render();
     } catch (error) {
@@ -482,6 +489,7 @@
   function renderPathsCard() {
     var b = state.baseDir || { path: "", default: "", overridden: false };
     var q = state.qdrant || { path: "", default: "", overridden: false };
+    var t = state.tmp || { path: "", size_bytes: 0, freed_bytes: 0 };
     var baseHint = b.overridden
       ? "Указан override (BASE_DIR в .env); дефолт из config.yaml: " + esc(b.default)
       : "Используется дефолт из config.yaml: " + esc(b.default);
@@ -497,7 +505,7 @@
         '<label>Корневая папка документов <code>BASE_DIR</code></label>' +
         '<div class="env-inputs">' +
           '<input type="text" id="base-dir-input" value="' + esc(b.path) + '" placeholder="' + esc(b.default) + '">' +
-          '<button type="button" id="base-dir-reset" class="btn ghost">Сбросить к дефолту</button>' +
+          '<button type="button" id="base-dir-pick" class="btn primary">Добавить</button>' +
         "</div>" +
         '<div class="field-help">' + baseHint + "</div>" +
       "</div>" +
@@ -505,9 +513,16 @@
         '<label>Путь к базе Qdrant <code>QDRANT_PATH</code></label>' +
         '<div class="env-inputs">' +
           '<input type="text" id="qdrant-path-input" value="' + esc(q.path) + '" placeholder="' + esc(q.default) + '">' +
-          '<button type="button" id="qdrant-reset" class="btn ghost">Сбросить к дефолту</button>' +
+          '<button type="button" id="qdrant-pick" class="btn primary">Добавить</button>' +
         "</div>" +
         '<div class="field-help">' + qdrantHint + "</div>" +
+      "</div>" +
+      '<div class="env-row" data-tmp-row>' +
+        '<label>Временные файлы конвертации <code>tmp/</code> — ' + esc(fmtBytes(t.size_bytes)) + "</label>" +
+        '<div class="env-inputs">' +
+          '<button type="button" id="tmp-clear" class="btn primary"' + (t.size_bytes ? "" : " disabled") + ">Очистить tmp</button>" +
+        "</div>" +
+        '<div class="field-help">Путь: ' + esc(t.path) + ". Кнопка удаляет всё содержимое tmp/ (промежуточные данные конвертации).</div>" +
       "</div></section>";
   }
 
@@ -685,27 +700,27 @@
   }
 
   function bindPathsControls() {
-    var baseReset = $("base-dir-reset");
-    if (baseReset) baseReset.addEventListener("click", function () {
-      var input = $("base-dir-input");
-      if (input && state.baseDir) input.value = state.baseDir.default || "";
-      state.baseDirReset = true;
-      setStatus("Сброс к дефолту — нажмите «Сохранить», чтобы применить.", "warn");
+    var basePick = $("base-dir-pick");
+    if (basePick) basePick.addEventListener("click", function () {
+      openFolderPicker("base-dir-input", "Корневая папка документов");
     });
-    var baseInput = $("base-dir-input");
-    if (baseInput) baseInput.addEventListener("input", function () {
-      state.baseDirReset = false;
+    var qdrantPick = $("qdrant-pick");
+    if (qdrantPick) qdrantPick.addEventListener("click", function () {
+      openFolderPicker("qdrant-path-input", "Путь к базе Qdrant");
     });
-    var reset = $("qdrant-reset");
-    if (reset) reset.addEventListener("click", function () {
-      var input = $("qdrant-path-input");
-      if (input && state.qdrant) input.value = state.qdrant.default || "";
-      state.qdrantReset = true;
-      setStatus("Сброс к дефолту — нажмите «Сохранить», чтобы применить.", "warn");
-    });
-    var input = $("qdrant-path-input");
-    if (input) input.addEventListener("input", function () {
-      state.qdrantReset = false;
+    var tmpClear = $("tmp-clear");
+    if (tmpClear) tmpClear.addEventListener("click", async function () {
+      tmpClear.disabled = true;
+      setStatus("Очищаю tmp/…", "warn");
+      try {
+        var res = await api("/api/settings/tmp/clear", { method: "POST" });
+        state.tmp = res;
+        setStatus("tmp/ очищена, освобождено " + fmtBytes(res.freed_bytes) + ".", "ok");
+        render();
+      } catch (error) {
+        tmpClear.disabled = false;
+        setStatus("Ошибка очистки tmp: " + error.message, "err");
+      }
     });
   }
 
@@ -850,32 +865,28 @@
         body: JSON.stringify(env)
       });
       // 5. Папки — корень документов (BASE_DIR), затем Qdrant (решение №29);
-      //    сохраняем только если изменились или запрошен сброс.
+      //    сохраняем только если изменились (пустая строка = сброс к дефолту).
       var baseInput = $("base-dir-input");
       if (baseInput) {
-        var baseWantReset = state.baseDirReset;
-        state.baseDirReset = false;
         var currentBase = state.baseDir ? state.baseDir.path : "";
         var inputBase = baseInput.value.trim();
-        if (baseWantReset || inputBase !== currentBase) {
+        if (inputBase !== currentBase) {
           await api("/api/settings/base-dir", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path: baseWantReset ? "" : inputBase })
+            body: JSON.stringify({ path: inputBase })
           });
         }
       }
       var qdrantInput = $("qdrant-path-input");
       if (qdrantInput) {
-        var wantReset = state.qdrantReset;
-        state.qdrantReset = false;
         var currentPath = state.qdrant ? state.qdrant.path : "";
         var inputPath = qdrantInput.value.trim();
-        if (wantReset || inputPath !== currentPath) {
+        if (inputPath !== currentPath) {
           await api("/api/settings/qdrant", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ path: wantReset ? "" : inputPath })
+            body: JSON.stringify({ path: inputPath })
           });
         }
       }
@@ -891,6 +902,82 @@
     } finally {
       state.busy = false;
     }
+  }
+
+  /* ---------- выбор папки на сервере (машина интерфейса, не браузера) ---------- */
+  function openFolderPicker(inputId, title) {
+    var existing = $("folder-dialog");
+    if (existing) existing.remove();
+
+    var input = $(inputId);
+    var start = (input && input.value.trim()) || "/";
+    if (!start.startsWith("/")) start = "/";
+
+    var dialog = document.createElement("dialog");
+    dialog.id = "folder-dialog";
+    dialog.innerHTML =
+      "<h2>" + esc(title) + "</h2>" +
+      '<div class="dialog-field"><div id="folder-crumbs" class="folder-crumbs"></div></div>' +
+      '<div class="dialog-field"><div id="folder-list" class="folder-list"></div></div>' +
+      '<div class="dialog-actions">' +
+        '<button id="folder-cancel" class="btn ghost">Отмена</button>' +
+        '<button id="folder-up" class="btn">Вверх</button>' +
+        '<button id="folder-choose" class="btn primary">Выбрать эту папку</button>' +
+      "</div>";
+    document.body.appendChild(dialog);
+    dialog.showModal();
+
+    var current = null;
+
+    $("folder-cancel").addEventListener("click", function () { dialog.close(); });
+    $("folder-up").addEventListener("click", function () {
+      if (current && current.parent) load(current.parent);
+    });
+    $("folder-choose").addEventListener("click", function () {
+      if (current) input.value = current.path;
+      dialog.close();
+    });
+
+    async function load(path) {
+      var list = $("folder-list");
+      list.innerHTML = '<div class="muted">Загрузка…</div>';
+      try {
+        current = await api("/api/fs/dirs?path=" + encodeURIComponent(path));
+      } catch (error) {
+        list.innerHTML = '<div class="muted">Ошибка: ' + esc(error.message) + "</div>";
+        return;
+      }
+      renderCrumbs();
+      if (!current.entries.length) {
+        list.innerHTML = '<div class="muted">Подкаталогов нет</div>';
+        return;
+      }
+      list.innerHTML = current.entries.map(function (entry) {
+        return '<button type="button" class="folder-item" data-path="' + esc(entry.path) + '">' +
+          "&#128193; " + esc(entry.name) + "</button>";
+      }).join("");
+      Array.prototype.forEach.call(list.querySelectorAll(".folder-item"), function (btn) {
+        btn.addEventListener("click", function () { load(btn.getAttribute("data-path")); });
+      });
+    }
+
+    function renderCrumbs() {
+      var parts = current.path.split("/").filter(Boolean);
+      var crumbs = ['<button type="button" class="folder-crumb" data-path="/">/</button>'];
+      var acc = "";
+      parts.forEach(function (part) {
+        acc += "/" + part;
+        crumbs.push('<button type="button" class="folder-crumb" data-path="' + esc(acc) + '">' + esc(part) + "</button>");
+      });
+      var bar = $("folder-crumbs");
+      bar.innerHTML = crumbs.join('<span class="folder-sep">/</span>');
+      $("folder-up").disabled = !current.parent;
+      Array.prototype.forEach.call(bar.querySelectorAll(".folder-crumb"), function (btn) {
+        btn.addEventListener("click", function () { load(btn.getAttribute("data-path")); });
+      });
+    }
+
+    load(start);
   }
 
   /* ---------- «Добавить провайдера» ---------- */
