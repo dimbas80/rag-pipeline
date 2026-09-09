@@ -14,13 +14,14 @@
       <img class="brand-icon" src="/static/favicon.svg" alt="">
       <div>
         <h1>База данных нормативно-технических документов</h1>
-        <p class="subtitle">Загрузка нормативных документов (ГОСТ / СП / СО / СНиП / ПУЭ) с распознаванием
+        <p class="subtitle">Загрузка нормативных документов с распознаванием
         OCR→Markdown и семантическим поиском по базе.</p>
       </div>
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="chat">Чат</button>
       <button class="tab" data-tab="documents">Добавить документ</button>
+      <button class="tab" data-tab="base">Документы в базе</button>
       <button class="tab" data-tab="settings">Настройки</button>
     </nav>
   </div>
@@ -88,14 +89,9 @@
 
             <div class="field">
               <label for="reg-document_type">Тип документа <span class="req">*</span>
-                <span class="hint" title="ГОСТ / СП / СО / СНиП / ПУЭ. Определяется по обозначению; можно выбрать вручную.">?</span></label>
-              <input id="reg-document_type" name="document_type" type="text" list="document-type-list" placeholder="ГОСТ / СП / СО / СНиП / ПУЭ">
-              <datalist id="document-type-list">
-                <option value="ГОСТ">
-                <option value="СП">
-                <option value="СО">
-                <option value="СНиП">
-                <option value="ПУЭ">
+                <span class="hint" title="Список типов — из конфига document_types.yaml. Определяется по обозначению; можно выбрать вручную или ввести свой (новый тип сохранится в конфиг).">?</span></label>
+              <input id="reg-document_type" name="document_type" type="text" list="document-type-list" placeholder="Нажмите для выбора из списка">
+              <datalist id="document-type-list"><!-- заполняется из GET /api/settings/document-types -->
               </datalist>
             </div>
 
@@ -220,6 +216,33 @@
         </div>
         <div id="md-preview" class="md-preview" hidden></div>
       </div>
+    </div>
+  </section>
+
+  <!-- ================= ДОКУМЕНТЫ В БАЗЕ ================= -->
+  <section id="base" class="tab-panel" hidden>
+    <div class="page-head">
+      <h2>Документы в базе</h2>
+      <p class="muted">Документы, проиндексированные в Qdrant. «Удалить» убирает чанки документа из базы;
+      .md и регистрация остаются — документ можно переиндексировать на вкладке «Добавить документ».</p>
+    </div>
+    <div class="action-row">
+      <button id="base-refresh" class="btn">Обновить</button>
+      <label for="base-type-filter" class="base-filter">Тип документа:
+        <select id="base-type-filter"><option value="">все</option></select>
+      </label>
+      <span id="base-status" class="status-line"></span>
+    </div>
+    <div id="base-table-wrap">
+      <table id="base-table" class="base-table" hidden>
+        <colgroup>
+          <col class="c-doc"><col class="c-title"><col class="c-domain"><col class="c-type">
+          <col class="c-status"><col class="c-count"><col class="c-action">
+        </colgroup>
+        <thead><tr id="base-table-head"><!-- колонки строит app.js (BASE_COLUMNS) --></tr></thead>
+        <tbody id="base-table-body"></tbody>
+      </table>
+      <div id="base-empty" class="muted small">Нажмите «Обновить».</div>
     </div>
   </section>
 

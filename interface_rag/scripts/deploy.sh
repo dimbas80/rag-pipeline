@@ -155,6 +155,14 @@ else
   plan "push staging → $CONFIG_DIR (providers.yaml, create_markdown_config.yaml, search_config.yaml, .env)"
 fi
 
+# document_types.yaml НЕ входит в консолидацию: на проде его наполняет UI
+# (POST /api/settings/document-types, решение №54). Существующий файл не
+# перезаписывается: rsync --ignore-existing кладёт сид только при отсутствии.
+run_local "seed document_types.yaml → $CONFIG_DIR (только если отсутствует; не перезаписывать)" \
+  rsync -az --ignore-existing -e "$RSYNC_E" "$DEV_ROOT/config/document_types.yaml" "root@$LXC:$CONFIG_DIR/"
+run_remote "chmod 600 document_types.yaml (конфиги owner-only, решение №22)" \
+  "chmod 600 $CONFIG_DIR/document_types.yaml"
+
 # --- 3. rsync-манифест «чистого» прода (архитектура §8.3) ---
 say "3. rsync-манифест (только нужные файлы)"
 EXCLUDES=(

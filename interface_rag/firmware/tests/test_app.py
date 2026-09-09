@@ -14,6 +14,54 @@ def test_app_routes_include_security_endpoints():
     assert '/api/images/{doc_dir}/{rel_path:path}' in paths
     assert '/api/settings/providers/roles' in paths
     assert '/api/settings/providers/refresh' in paths
+    assert '/api/documents-in-base/{document_id}' in paths
+
+
+def test_delete_document_from_base_requires_write_permission(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    cfg.write_enabled = False
+    monkeypatch.setattr(app, "cfg", cfg)
+    client = TestClient(app.app)
+    response = client.delete("/api/documents-in-base/gost_r_51889_2011")
+    assert response.status_code == 409
+
+
+def test_delete_document_from_base_calls_qdrant_and_reports_count(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "cfg", _fake_cfg(tmp_path))
+    captured = {}
+
+    def fake_delete(path, collection, document_id):
+        captured.update(path=path, collection=collection, document_id=document_id)
+        return 17
+
+    monkeypatch.setattr(app.qdrant_api, "delete_document", fake_delete)
+    client = TestClient(app.app)
+    response = client.delete("/api/documents-in-base/sp_118_13")
+    assert response.status_code == 200
+    assert response.json() == {"document_id": "sp_118_13", "deleted": 17}
+    assert captured["document_id"] == "sp_118_13"
+    assert captured["collection"] == "technical_standard"
+
+
+def test_delete_document_from_base_qdrant_failure_maps_to_503(monkeypatch, tmp_path):
+    monkeypatch.setattr(app, "cfg", _fake_cfg(tmp_path))
+
+    def boom(path, collection, document_id):
+        raise RuntimeError("файл заблокирован")
+
+    monkeypatch.setattr(app.qdrant_api, "delete_document", boom)
+    client = TestClient(app.app)
+    response = client.delete("/api/documents-in-base/doc_x")
+    assert response.status_code == 503
+    assert "файл заблокирован" in response.json()["detail"]
+
+
+def test_document_types_seed_config_present():
+    # Типы берутся только из конфига (решение №54): сид репозитория обязан
+    # существовать и быть непустым — иначе datalist пуст на чистой установке.
+    path = Path(__file__).resolve().parents[2] / "config" / "document_types.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(data.get("types"), list) and data["types"]
 
 
 def test_traversal_routes_reject_unsafe_paths():

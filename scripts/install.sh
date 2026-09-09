@@ -115,6 +115,13 @@ step "providers.yaml, create_markdown_config.yaml, search_config.yaml из ре�
 install -m 600 "$REPO_ROOT/create_markdown/firmware/src/providers.yaml" "$INSTALL_DIR/config/providers.yaml"
 install -m 600 "$REPO_ROOT/create_markdown/firmware/src/create_markdown_config.yaml" "$INSTALL_DIR/config/create_markdown_config.yaml"
 install -m 600 "$REPO_ROOT/build_search_index/firmware/src/search_config.yaml" "$INSTALL_DIR/config/search_config.yaml"
+# document_types.yaml — только сид при отсутствии: наполненный через UI файл
+# (решение №54) повторная установка не перезаписывает.
+if [ -f "$INSTALL_DIR/config/document_types.yaml" ]; then
+  step "document_types.yaml уже есть — не перезаписываем"
+else
+  install -m 600 "$REPO_ROOT/interface_rag/config/document_types.yaml" "$INSTALL_DIR/config/document_types.yaml"
+fi
 # Импорт-тайм Build_Search_index читает search_config.yaml/providers.yaml рядом с кодом
 # → симлинки на общий конфиг (как в deploy.sh).
 ln -sfn "$INSTALL_DIR/config/search_config.yaml" "$INSTALL_DIR/Build_Search_index/firmware/src/search_config.yaml"

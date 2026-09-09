@@ -380,6 +380,47 @@ main {
 #base-docs .doc-id { font-weight: 650; }
 #base-docs .doc-meta { color: var(--muted); font-size: 12.5px; }
 
+/* ---------- Документы в базе (вкладка) ---------- */
+#base-table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+  overflow-x: auto;
+}
+.base-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 13.5px; }
+.base-table col.c-doc { width: 17%; }
+.base-table col.c-title { width: 30%; }
+.base-table col.c-domain { width: 15%; }
+.base-table col.c-type { width: 9%; }
+.base-table col.c-status { width: 10%; }
+.base-table col.c-count { width: 7%; }
+.base-table col.c-action { width: 12%; }
+.base-table th, .base-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.base-table tbody tr:last-child th, .base-table tbody tr:last-child td { border-bottom: 0; }
+.base-table th { background: var(--surface-soft); font-weight: 650; white-space: nowrap; }
+.base-table th.sortable { cursor: pointer; user-select: none; }
+.base-table th.sortable:hover { color: var(--accent); }
+.base-table th.sorted { color: var(--accent-dark); }
+.base-table th .sort-arrow { color: var(--accent); }
+.base-table tbody tr:hover { background: #f4f7fc; }
+.base-table td.num, .base-table th.num { text-align: right; white-space: nowrap; }
+/* Длинные document_id (например «СТО 456-2020») переносим в 2–3 строки. */
+.base-table td:first-child { font-family: var(--mono); font-size: 12.5px; overflow-wrap: anywhere; }
+.base-table td.action { text-align: center; }
+.base-table .btn { padding: 4px 10px; font-size: 12.5px; white-space: nowrap; }
+.base-filter { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); }
+.base-filter select {
+  padding: 6px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  font: inherit; font-size: 13.5px; background: var(--surface);
+}
+
 /* ---------- Настройки ---------- */
 .settings-toolbar {
   display: flex;

@@ -71,6 +71,9 @@
     if (name === "documents") {
       updateGates();
     }
+    if (name === "base") {
+      loadBaseDocs();
+    }
   }
 
   document.querySelectorAll(".tab").forEach(function (button) {
@@ -213,6 +216,174 @@
     } catch (error) {
       box.textContent = "Ошибка: " + error.message;
     }
+  });
+
+  /* ---------- «Документы в базе»: таблица + сортировка + фильтр + удаление ---------- */
+  var BASE_COLUMNS = [
+    { key: "document_id", label: "document_id" },
+    { key: "title", label: "Название" },
+    { key: "domain", label: "Область" },
+    { key: "document_type", label: "Тип" },
+    { key: "status", label: "Статус" },
+    { key: "count", label: "Фрагментов", num: true },
+  ];
+  var baseDocs = []; // последний successful loadBaseDocs
+  var baseWriteEnabled = true;
+  var baseSort = { key: "document_id", asc: true };
+  var baseTypeFilter = ""; // "" — все типы
+
+  function baseCompare(a, b) {
+    var key = baseSort.key;
+    var va = a[key], vb = b[key];
+    var cmp;
+    if (key === "count") cmp = (Number(va) || 0) - (Number(vb) || 0);
+    else cmp = String(va == null ? "" : va).localeCompare(String(vb == null ? "" : vb), "ru");
+    return baseSort.asc ? cmp : -cmp;
+  }
+
+  function renderBaseHead() {
+    var head = $("base-table-head");
+    head.innerHTML = "";
+    BASE_COLUMNS.forEach(function (column) {
+      var th = document.createElement("th");
+      th.textContent = column.label;
+      if (column.num) th.className = "num";
+      var arrow = document.createElement("span");
+      arrow.className = "sort-arrow";
+      arrow.textContent = baseSort.key === column.key ? (baseSort.asc ? " ▲" : " ▼") : "";
+      th.appendChild(arrow);
+      th.className = "sortable" + (column.num ? " num" : "");
+      if (baseSort.key === column.key) th.className += " sorted";
+      th.title = "Сортировать по «" + column.label + "»";
+      th.addEventListener("click", function () {
+        if (baseSort.key === column.key) baseSort.asc = !baseSort.asc;
+        else { baseSort.key = column.key; baseSort.asc = true; }
+        renderBaseTable();
+      });
+      head.appendChild(th);
+    });
+    var spare = document.createElement("th"); // колонка действия
+    spare.className = "action";
+    head.appendChild(spare);
+  }
+
+  function syncBaseTypeFilter() {
+    var select = $("base-type-filter");
+    var types = {};
+    baseDocs.forEach(function (doc) {
+      var t = doc.document_type == null ? "" : String(doc.document_type);
+      if (t) types[t] = true;
+    });
+    var names = Object.keys(types).sort(function (a, b) { return a.localeCompare(b, "ru"); });
+    if (baseTypeFilter && names.indexOf(baseTypeFilter) === -1) baseTypeFilter = "";
+    select.innerHTML = "";
+    var all = document.createElement("option");
+    all.value = "";
+    all.textContent = "все";
+    select.appendChild(all);
+    names.forEach(function (name) {
+      var option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    });
+    select.value = baseTypeFilter;
+  }
+
+  function renderBaseTable() {
+    var table = $("base-table");
+    var body = $("base-table-body");
+    var empty = $("base-empty");
+    syncBaseTypeFilter();
+    if (!baseDocs.length) {
+      table.hidden = true;
+      empty.hidden = false;
+      empty.textContent = "В базе пока нет документов.";
+      setStatus("base-status", "", "");
+      return;
+    }
+    var rows = baseDocs.filter(function (doc) {
+      return !baseTypeFilter || String(doc.document_type || "") === baseTypeFilter;
+    });
+    rows.sort(baseCompare);
+    renderBaseHead();
+    body.innerHTML = "";
+    rows.forEach(function (doc) { body.appendChild(baseDocRow(doc, baseWriteEnabled)); });
+    if (!rows.length) {
+      table.hidden = true;
+      empty.hidden = false;
+      empty.textContent = "Нет документов типа «" + baseTypeFilter + "».";
+    } else {
+      empty.hidden = true;
+      table.hidden = false;
+    }
+    setStatus("base-status", "Показано " + rows.length + " из " + baseDocs.length, "ok");
+  }
+
+  function baseDocRow(doc, writeEnabled) {
+    var row = document.createElement("tr");
+    BASE_COLUMNS.forEach(function (column) {
+      var cell = document.createElement("td");
+      cell.textContent = doc[column.key] == null ? "" : String(doc[column.key]);
+      if (column.num) cell.className = "num";
+      row.appendChild(cell);
+    });
+    var cell = document.createElement("td");
+    cell.className = "action";
+    var btn = document.createElement("button");
+    btn.className = "btn danger";
+    btn.textContent = "Удалить";
+    btn.disabled = !writeEnabled;
+    if (!writeEnabled) btn.title = "Запись в Qdrant запрещена настройкой (qdrant.write_enabled)";
+    btn.addEventListener("click", function () { deleteBaseDoc(doc.document_id); });
+    cell.appendChild(btn);
+    row.appendChild(cell);
+    return row;
+  }
+
+  async function loadBaseDocs() {
+    var table = $("base-table");
+    var empty = $("base-empty");
+    setStatus("base-status", "Загружаю…", "");
+    var docs;
+    try {
+      var results = await Promise.all([
+        api("/api/documents-in-base"),
+        api("/api/settings/status").catch(function () { return null; })
+      ]);
+      docs = results[0] || [];
+      if (results[1]) baseWriteEnabled = Boolean(results[1].write_enabled);
+    } catch (error) {
+      baseDocs = [];
+      setStatus("base-status", "Не удалось получить список: " + error.message, "err");
+      table.hidden = true;
+      empty.hidden = false;
+      empty.textContent = "";
+      return;
+    }
+    baseDocs = docs;
+    renderBaseTable();
+  }
+
+  async function deleteBaseDoc(documentId) {
+    var ok = window.confirm('Удалить документ «' + documentId + '» из базы?\n\n' +
+      "Все его чанки будут удалены из Qdrant. .md и регистрация сохранятся — " +
+      "документ можно вернуть переиндексацией.");
+    if (!ok) return;
+    setStatus("base-status", "Удаляю «" + documentId + "»…", "");
+    try {
+      var result = await api("/api/documents-in-base/" + encodeURIComponent(documentId), { method: "DELETE" });
+      await loadBaseDocs();
+      setStatus("base-status", "Удалено чанков: " + (result && result.deleted != null ? result.deleted : "?"), "ok");
+    } catch (error) {
+      setStatus("base-status", "Ошибка удаления «" + documentId + "»: " + error.message, "err");
+    }
+  }
+
+  $("base-refresh").addEventListener("click", loadBaseDocs);
+  $("base-type-filter").addEventListener("change", function () {
+    baseTypeFilter = this.value;
+    renderBaseTable();
   });
 
   function escapeHtml(value) {
@@ -434,13 +605,15 @@
     return "";
   }
 
-  // Автоопределение типа документа из обозначения (ГОСТ/СП/СО/СНиП/ПУЭ).
+  // Автоопределение типа из обозначения: префиксы — те же типы из конфига, что и
+  // в datalist (docTypes), сравнение регистронезависимое; более длинный префикс
+  // проверяется первым, иначе «СП» перекрывал бы «СПиМ», например.
   function deriveTypeFromId() {
     var text = $("reg-document_id").value.trim().toUpperCase();
-    var prefixes = ["ГОСТ", "СНиП", "ПУЭ", "СП", "СО"];
+    var prefixes = docTypes.slice().sort(function (a, b) { return b.length - a.length; });
     for (var i = 0; i < prefixes.length; i++) {
-      if (text.indexOf(prefixes[i]) === 0) {
-        fillInput("reg-document_type", prefixes[i]);
+      if (text.indexOf(prefixes[i].toUpperCase()) === 0) {
+        fillInput("reg-document_type", prefixes[i]); // регистр из конфига (СНиП, а не снип)
         return;
       }
     }
@@ -450,11 +623,12 @@
     if (!$("reg-document_type").value) deriveTypeFromId();
   });
 
-  /* ---------- типы документов: datalist + пользовательские (решение №50) ---------- */
-  // Дефолты зашиты в <datalist> index.html; добавленные вручную типы хранятся
-  // на бэкенде (document_types.yaml) и подмешиваются при загрузке страницы —
-  // поэтому доступны и для следующего документа, и в другом браузере.
-  var docTypes = []; // всё, что сейчас в datalist (дефолты + пользовательские)
+  /* ---------- типы документов: только из document_types.yaml (решение №50) ---------- */
+  // Единственный источник типов — <config_dir>/document_types.yaml (GET
+  // /api/settings/document-types); в HTML/JS списков типов нет. Свой тип, введённый
+  // вручную, сохраняется на бэк (POST) — доступен и для следующего документа, и в
+  // другом браузере.
+  var docTypes = []; // актуальный список типов (загружается loadDocumentTypes)
 
   function datalistHas(value) {
     var lower = String(value).trim().toLowerCase();
@@ -471,10 +645,11 @@
   async function loadDocumentTypes() {
     try {
       var result = await api("/api/settings/document-types");
-      ((result && result.types) || []).forEach(function (t) {
-        if (!datalistHas(t)) addTypeOption(t);
-      });
-    } catch (_) { /* сервер недоступен — остаются дефолты из HTML */ }
+      var list = $("document-type-list");
+      list.innerHTML = ""; // datalist строится только из конфига
+      docTypes = [];
+      ((result && result.types) || []).forEach(addTypeOption);
+    } catch (_) { /* сервер недоступен — datalist пуст; тип вводится вручную */ }
   }
 
   // Новый тип, введённый вручную, сохраняется сразу (change = фиксация значения).
@@ -833,6 +1008,6 @@
       loadMdPreview(true);
     }
   });
-  loadDocumentTypes(); // пользовательские типы документов в datalist (решение №50)
+  loadDocumentTypes(); // типы документов в datalist — из document_types.yaml (решение №50)
   switchTab("chat");
 })();

@@ -353,6 +353,23 @@ def documents_in_base():
         raise HTTPException(503, f"Qdrant недоступен: {exc}") from exc
 
 
+@app.delete("/api/documents-in-base/{document_id}")
+def delete_document_from_base(document_id: str):
+    """Удалить все чанки документа из Qdrant (вкладка «Документы в базе»).
+
+    Файловые артефакты (.md, _reg.yaml) сохраняются — документ можно
+    переиндексировать. Запись в Qdrant gated тем же write_enabled, что и
+    индексация.
+    """
+    if not cfg.write_enabled:
+        raise HTTPException(409, "Запись в Qdrant запрещена настройкой (qdrant.write_enabled)")
+    try:
+        deleted = qdrant_api.delete_document(cfg.qdrant_path, cfg.collection, document_id)
+    except Exception as exc:
+        raise HTTPException(503, f"Qdrant недоступен: {exc}") from exc
+    return {"document_id": document_id, "deleted": deleted}
+
+
 @app.get("/api/images/{doc_dir}/{rel_path:path}")
 def image(doc_dir: str, rel_path: str):
     if Path(doc_dir).name != doc_dir or Path(rel_path).is_absolute():

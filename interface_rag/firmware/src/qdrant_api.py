@@ -1,4 +1,5 @@
-"""Read-only helpers for the local Qdrant store.
+"""Helpers for the local Qdrant store (listing is read-only; deletion is the
+one sanctioned write, used by the "Documents in base" tab).
 
 A client is deliberately opened and closed inside every operation.  Local
 Qdrant uses an exclusive file lock, so retaining a client across requests
@@ -9,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from qdrant_client import QdrantClient
+from qdrant_client import QdrantClient, models
 
 
 def _client(qdrant_path: str | Path) -> QdrantClient:
@@ -65,6 +66,36 @@ def distinct_documents(
             if next_offset is None:
                 return list(documents.values())
             offset = next_offset
+    finally:
+        if client is not None:
+            client.close()
+
+
+def delete_document(
+    qdrant_path: str | Path,
+    collection: str,
+    document_id: str,
+) -> int:
+    """Delete all chunks of *document_id* from *collection*; return deleted count.
+
+    Same filter pattern as pre-reindex cleanup in create_index.py: points are
+    selected by the payload field ``document_id``.  Embedded Qdrant's delete()
+    reports no counters, so the affected points are counted first.
+    """
+    client = None
+    try:
+        client = _client(qdrant_path)
+        doc_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="document_id",
+                    match=models.MatchValue(value=document_id),
+                )
+            ]
+        )
+        deleted = int(client.count(collection_name=collection, count_filter=doc_filter).count)
+        client.delete(collection_name=collection, points_selector=doc_filter)
+        return deleted
     finally:
         if client is not None:
             client.close()
