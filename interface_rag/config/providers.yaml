@@ -143,7 +143,7 @@ providers:
       glm/glm-4.6v: vision
       am/free: chat
   zai-custom:
-    base_url: https://api.z.ai/api/paas/v4
+    base_url: https://api.z.ai/api/coding/paas/v4
     api_key_env: Z_AI_API_KEY
     models:
       glm-4.5: chat

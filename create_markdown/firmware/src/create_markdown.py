@@ -453,6 +453,21 @@ AI_MAX_CHARS = 80000
 # считается неполным (LLM молча пропустила фрагмент): чанк идёт в итог
 # без изменений — потеря текста недопустима.
 AI_MIN_OUTPUT_RATIO = 0.85
+# Параметры запросов AI-постобработки; переопределяются полями секции
+# ai_postprocess конфига (см. AI_TUNABLE_KEYS) — провайдеры с жёсткими
+# TPM/RPM-лимитами (z.ai) требуют меньших чанков/ответов и пауз.
+AI_MAX_TOKENS = 64000
+AI_REQUEST_INTERVAL_SEC = 0.0
+# 429 Too Many Requests: отдельный бюджет попыток с экспоненциальным
+# backoff (15/30/60/120с) либо по заголовку Retry-After — НЕ тратит общие
+# 3 попытки на 503/усечение/сетевые ошибки.
+AI_RATE_LIMIT_RETRIES = 5
+AI_RATE_LIMIT_BACKOFF_SEC = 15
+AI_RATE_LIMIT_BACKOFF_MAX_SEC = 120
+AI_TUNABLE_KEYS = (
+    "max_tokens", "chunk_max_chars", "request_interval_sec", "rate_limit_retries",
+    "stream",
+)
 YANDEX_MAX_PAGES = 200
 YANDEX_MAX_SIZE_MB = 10
 YANDEX_POLL_TIMEOUT = 600  # 10 минут
@@ -3858,11 +3873,107 @@ def _ai_result_or_original(result: str | None, chunk: str, context: str) -> str:
     return result
 
 
+def _ai_setting(config: dict, key: str, default):
+    """Тюнинг-параметр AI-секции: из вложенной ai_postprocess или из самой
+    секции ( callers передают и полный конфиг, и уже извлечённую секцию)."""
+    cfg = ((config.get("ai_postprocess") or config) if isinstance(config, dict) else {})
+    value = cfg.get(key, default)
+    return default if value is None else value
+
+
+def _retry_after_seconds(headers, attempt: int) -> float:
+    """Пауза после 429: заголовок Retry-After (секунды, с ограничением
+    сверху) либо экспоненциальный backoff base * 2**(attempt-1)."""
+    raw = ""
+    try:
+        raw = headers.get("Retry-After", "")
+    except Exception:
+        raw = ""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = AI_RATE_LIMIT_BACKOFF_SEC * (2 ** (attempt - 1))
+    return max(0.0, min(value, AI_RATE_LIMIT_BACKOFF_MAX_SEC))
+
+
+def _merge_ai_tunables(raw_section: dict, resolved: dict) -> dict:
+    """Сохранить тюнинг-параметры из секции ai_postprocess конфига при
+    разрешении роли: resolve_role возвращает только provider/model/base_url/
+    api_key_env/fallback, и без этого шага max_tokens/chunk_max_chars/
+    request_interval_sec/rate_limit_retries терялись бы."""
+    merged = dict(resolved)
+    for key in AI_TUNABLE_KEYS:
+        if key in raw_section:
+            merged[key] = raw_section[key]
+    return merged
+
+
+def _post_chat_completion(client, url: str, payload: dict, headers: dict, stream: bool):
+    """POST /chat/completions: обычный или SSE-стриминг (stream=true).
+
+    Стриминг держит коннект живым на долгих генерациях: z.ai coding-endpoint
+    обрывает не-стриминг запросы с ответами дольше ~2 минут («Server
+    disconnected without sending a response»). Возвращает
+    (status, body_text, content, finish_reason, resp_headers);
+    content=None только для HTTP-ошибок."""
+    if not stream:
+        resp = client.post(url, json=payload, headers=headers)
+        resp_headers = getattr(resp, "headers", {}) or {}
+        if resp.status_code >= 400:
+            return (resp.status_code, str(getattr(resp, "text", "") or "")[:200],
+                    None, None, resp_headers)
+        data = resp.json()
+        choice = data["choices"][0]
+        return (resp.status_code, "", choice["message"].get("content") or "",
+                choice.get("finish_reason"), resp_headers)
+    parts: list[str] = []
+    finish = None
+    saw_done = False
+    with client.stream("POST", url, json=payload, headers=headers) as resp:
+        resp_headers = getattr(resp, "headers", {}) or {}
+        if resp.status_code >= 400:
+            try:
+                resp.read()
+                body = str(getattr(resp, "text", "") or "")[:200]
+            except Exception:
+                body = ""
+            return resp.status_code, body, None, None, resp_headers
+        for line in resp.iter_lines():
+            if not line or not line.startswith("data:"):
+                continue
+            chunk_str = line[len("data:"):].strip()
+            if chunk_str == "[DONE]":
+                saw_done = True
+                break
+            try:
+                chunk = json.loads(chunk_str)
+            except ValueError:
+                continue
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta") or {}
+            piece = delta.get("content")
+            if piece:
+                parts.append(piece)
+            if choices[0].get("finish_reason"):
+                finish = choices[0]["finish_reason"]
+    if not saw_done and finish is None:
+        # Стрим оборвался до терминального события: content точно неполный.
+        # Молча вернуть усечённый markdown нельзя — считаем неудачей (ретрай).
+        raise RuntimeError("стрим оборван без [DONE]/finish_reason")
+    return resp.status_code, "", "".join(parts), finish, resp_headers
+
+
 def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
     """AI-постобработка через config-указанный провайдер.
 
-    Поддерживает DeepSeek и Provod (OpenAI-совместимый API).
+    Поддерживает OpenAI-совместимые API (DeepSeek, Provod, z.ai и др.).
     При отсутствии или ошибках primary переходит на fallback.
+    429 rate limit имеет отдельный бюджет попыток с backoff (см. константы);
+    429 от нехватки баланса (z.ai код 1113) не ретраится.
+    Тюнинг секции ai_postprocess: max_tokens, chunk_max_chars,
+    request_interval_sec, rate_limit_retries, stream (SSE-стриминг).
     """
     ai_cfg = config.get("ai_postprocess", config)
 
@@ -3905,35 +4016,68 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
                 {"role": "user", "content": text},
             ],
             "temperature": 0.0,
-            "max_tokens": 64000,
+            "max_tokens": int(_ai_setting(ai_cfg, "max_tokens", AI_MAX_TOKENS)),
         }
-        for attempt in range(3):
+        use_stream = bool(_ai_setting(ai_cfg, "stream", False))
+        if use_stream:
+            payload["stream"] = True
+        rate_max = int(_ai_setting(ai_cfg, "rate_limit_retries", AI_RATE_LIMIT_RETRIES))
+        attempt = 0       # общие неудачи: 503 / усечение ответа / сетевые ошибки
+        rate_attempt = 0  # 429 — собственный бюджет, attempt не тратит
+        while attempt < 3:
             try:
                 with httpx.Client(timeout=600) as client:
-                    resp = client.post(
+                    status, body, content, finish_reason, resp_headers = _post_chat_completion(
+                        client,
                         f"{url}/chat/completions",
-                        json=payload,
-                        headers=headers,
+                        payload,
+                        headers,
+                        use_stream,
                     )
-                if resp.status_code in (400, 401, 403):
-                    log.warning(f"  {prv}/{mdl}: HTTP {resp.status_code}, primary недоступен — переход к fallback")
+                if status in (400, 401, 403):
+                    log.warning(f"  {prv}/{mdl}: HTTP {status}, primary недоступен — переход к fallback")
                     return None
-                if resp.status_code == 503:
-                    log.warning(f"  {prv}/{mdl}: 503, попытка {attempt + 1}/3")
+                if status == 429:
+                    if re.search(
+                        r'"?1113"?|insufficient balance|no resource package',
+                        body, flags=re.IGNORECASE,
+                    ):
+                        # z.ai отдаёт нехватку баланса кодом 429 — backoff бессилен
+                        log.error(
+                            f"  {prv}/{mdl}: 429 {body} — баланс/пакет исчерпан, "
+                            f"повтор бессмысленен, переход к fallback"
+                        )
+                        return None
+                    rate_attempt += 1
+                    if rate_attempt >= rate_max:
+                        log.error(
+                            f"  {prv}/{mdl}: 429 Too Many Requests — бюджет "
+                            f"{rate_max} попыток исчерпан, переход к fallback"
+                        )
+                        return None
+                    wait = _retry_after_seconds(resp_headers, rate_attempt)
+                    log.warning(
+                        f"  {prv}/{mdl}: 429 rate limit "
+                        f"(попытка {rate_attempt}/{rate_max}), пауза {wait:.0f}с"
+                        + (f"; ответ: {body}" if body else "")
+                    )
+                    time.sleep(wait)
+                    continue
+                if status == 503:
+                    attempt += 1
+                    log.warning(f"  {prv}/{mdl}: 503, попытка {attempt}/3")
                     time.sleep(5)
                     continue
-                resp.raise_for_status()
-                data = resp.json()
-                choice = data["choices"][0]
-                finish_reason = choice.get("finish_reason")
+                if status >= 400:
+                    raise RuntimeError(f"HTTP {status} {body}")
                 if finish_reason == "length":
+                    attempt += 1
                     log.warning(
                         f"  {prv}/{mdl}: ответ усечён (finish_reason=length) — "
-                        f"считаю неудачей, попытка {attempt + 1}/3"
+                        f"считаю неудачей, попытка {attempt}/3"
                     )
                     time.sleep(5)
                     continue
-                content = choice["message"].get("content") or ""
                 content = re.sub(r"^```(?:markdown)?\s*\n?", "", content, flags=re.MULTILINE)
                 content = re.sub(r"\n```\s*$", "", content, flags=re.MULTILINE)
                 if _is_recognition_failure(content):
@@ -3941,7 +4085,8 @@ def _call_ai_api(text: str, config: dict, context: str = "") -> str | None:
                     return None
                 return content
             except Exception as e:
-                log.warning(f"  {prv}/{mdl}: {e}, попытка {attempt + 1}/3")
+                attempt += 1
+                log.warning(f"  {prv}/{mdl}: {e}, попытка {attempt}/3")
                 time.sleep(5)
         return None
 
@@ -4022,7 +4167,9 @@ def ai_postprocess_json_native(
         for value in vision_tables
         if value.get("table_num") and value.get("markdown")
     }
-    chunks = _chunk_text(md_text, max_chars=AI_MAX_CHARS)
+    max_chars = int(_ai_setting(config, "chunk_max_chars", AI_MAX_CHARS))
+    interval = max(0.0, float(_ai_setting(config, "request_interval_sec", AI_REQUEST_INTERVAL_SEC)))
+    chunks = _chunk_text(md_text, max_chars=max_chars)
     results: list[str] = []
     for index, chunk in enumerate(chunks):
         relevant: list[str] = []
@@ -4042,20 +4189,33 @@ def ai_postprocess_json_native(
                 + "\n\n".join(relevant)
             )
         response = _call_ai_api(prompt, config, f"{file_label} [ч.{index + 1}]")
+        if response is None:
+            log.error(
+                f"  ⚠ {file_label} [ч.{index + 1}]: AI не ответила — "
+                f"чанк сохранён без обработки"
+            )
         results.append(response if response is not None else chunk)
+        if interval and index < len(chunks) - 1:
+            time.sleep(interval)
     return "\n\n".join(results)
 
 
 def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
-    """AI-постобработка Markdown через Provod с чекпойнтингом."""
+    """AI-постобработка Markdown с чекпойтингом.
+
+    chunk_max_chars / request_interval_sec задаются в секции ai_postprocess
+    конфига — под лимиты конкретного провайдера (z.ai и т.п.)."""
     log.info(f"AI-постобработка ({file_label})")
 
-    max_chars = AI_MAX_CHARS
+    max_chars = int(_ai_setting(config, "chunk_max_chars", AI_MAX_CHARS))
+    interval = max(0.0, float(_ai_setting(config, "request_interval_sec", AI_REQUEST_INTERVAL_SEC)))
     chunks = _chunk_text(md_text, max_chars=max_chars)
     log.info(f"  Чанков: {len(chunks)}")
 
     if len(chunks) == 1:
         result = _call_ai_api(md_text, config, file_label)
+        if result is None:
+            log.error(f"  ⚠ {file_label}: AI не ответила — чанк сохранён без обработки")
         return result if result else md_text
 
     # Чекпойнт: промежуточные результаты
@@ -4089,6 +4249,11 @@ def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
                 context = "\n".join(prev_lines[-3:]) if len(prev_lines) >= 3 else chunks[i - 1].strip()
                 chunk = f"[Контекст из предыдущего чанка]\n{context}\n[Конец контекста]\n\n{chunk}"
             result = _call_ai_api(chunk, config, f"{file_label} [ч.{i + 1}]")
+            if result is None:
+                log.error(
+                    f"  ⚠ {file_label} [ч.{i + 1}]: AI не ответила — "
+                    f"чанк сохранён без обработки"
+                )
             results[i] = result if result else chunks[i]
             try:
                 ckpt_path.write_text(
@@ -4097,6 +4262,9 @@ def ai_postprocess(md_text: str, config: dict, file_label: str = "") -> str:
                 )
             except Exception as e:
                 log.warning(f"  Ошибка записи чекпойнта: {e}")
+            # Пауза только если впереди ещё живые запросы (rate limit на ключ)
+            if interval and any(r is None for r in results[i + 1:]):
+                time.sleep(interval)
         else:
             log.info(f"  Часть {i + 1}/{len(chunks)} — пропущена (из чекпойнта)")
 
@@ -6928,6 +7096,10 @@ def process_file(
             # промпт — объединённый
             ai_cfg = dict(config.get("ai_postprocess", config.get("postprocess", config)))
             ai_cfg["prompt"] = combined_prompt
+            ai_chunk_max = int(_ai_setting(ai_cfg, "chunk_max_chars", AI_MAX_CHARS))
+            ai_interval = max(0.0, float(
+                _ai_setting(ai_cfg, "request_interval_sec", AI_REQUEST_INTERVAL_SEC)
+            ))
 
             # 1. Загрузить все vision-таблицы как dict[id] = текст
             vision_tables: dict[str, str] = {}
@@ -6945,7 +7117,7 @@ def process_file(
                 )
 
             # 2. Чанковать ТОЛЬКО md_text
-            md_chunks = _chunk_text(md_text, AI_MAX_CHARS)
+            md_chunks = _chunk_text(md_text, ai_chunk_max)
 
             # Чекпойнтинг (как в ai_postprocess)
             ckpt_dir = Path("tmp") / ".ai_checkpoints"
@@ -7003,6 +7175,11 @@ def process_file(
 
                 log.info(f"  Часть {i + 1}/{len(md_chunks)} ({len(chunk_input)} символов)")
                 result = _call_ai_api(chunk_input, ai_cfg, f"{file_stem} [ч.{i + 1}]")
+                if result is None:
+                    log.error(
+                        f"  ⚠ {file_stem} [ч.{i + 1}]: AI не ответила — "
+                        f"чанк сохранён без обработки"
+                    )
                 candidate = _ai_result_or_original(result, chunk, f"{file_stem} [ч.{i + 1}]")
                 results[i] = _normalize_inline_latex_delimiters(candidate)
                 try:
@@ -7012,6 +7189,9 @@ def process_file(
                     )
                 except Exception:
                     pass
+                # Пауза только если впереди ещё живые запросы (rate limit на ключ)
+                if ai_interval and any(r is None for r in results[i + 1:]):
+                    time.sleep(ai_interval)
 
             md_text = "\n\n".join(r for r in results if r)
 
@@ -7150,8 +7330,11 @@ def main() -> None:
                 resolved_vision = resolve_role(vision_role, providers)
                 resolved_vision["prompt"] = config.get("table_vision", {}).get("prompt")
                 config["table_vision"] = resolved_vision
-            resolved_ai = resolve_role(ai_role, providers)
-            resolved_ai["prompt"] = config.get("ai_postprocess", {}).get("prompt")
+            # Тюнинг-параметры (max_tokens/chunk_max_chars/request_interval_sec/
+            # rate_limit_retries) переживают разрешение роли из providers.yaml.
+            raw_ai_section = config.get("ai_postprocess", {}) or {}
+            resolved_ai = _merge_ai_tunables(raw_ai_section, resolve_role(ai_role, providers))
+            resolved_ai["prompt"] = raw_ai_section.get("prompt")
             config["ai_postprocess"] = resolved_ai
             config["reg_extract"] = {
                 "prompt": config.get("reg_extract", {}).get("prompt")
