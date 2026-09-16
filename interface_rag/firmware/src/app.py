@@ -218,12 +218,20 @@ def index_document(sid, _payload: IndexRequest | None = None):
     return first.__dict__
 
 
-_STEM_RE = re.compile(r"^[\w.а-яА-ЯёЁ -]+$")
+_STEM_RE = re.compile(
+    r"^[^\x00-\x1f\x7f-\x9f\u2028\u2029\u200b-\u200f\u202a-\u202e\u2060-\u206f/\\]+$")
+# Чёрный список, а не белый: имена реальной базы содержат NBSP (\xa0),
+# запятые, скобки и т.п. — белый список [\w. -] отдавал 404 на
+# /api/files/markdown для существующих документов. Запрещены управляющие
+# символы C0/C1, DEL, разделители строк и невидимые format-символы
+# (zero-width/bidi). Безопасность пути обеспечивают проверки в _valid_stem
+# (.., /, \, ведущая точка) и resolve()-контроль вхождения в base_markdown
+# у вызывающих.
 
 
 def _valid_stem(stem: str) -> bool:
-    """stem валиден, если проходит regex, не начинается с '.' (скрытые каталоги)
-    и не содержит хода вверх по дереву (§13.1)."""
+    """stem валиден, если без управляющих символов и разделителей пути,
+    не начинается с '.' (скрытые каталоги) и не содержит хода вверх по дереву (§13.1)."""
     return (bool(stem) and not stem.startswith(".")
             and ".." not in stem and "/" not in stem and "\\" not in stem
             and bool(_STEM_RE.fullmatch(stem)))
@@ -320,7 +328,7 @@ def events(job_id):
 
 def _markdown_path(stem: str) -> Path:
     """Валидированный путь `<base_markdown>/<stem>/<stem>.md` (GET и PUT, §13.1)."""
-    if ".." in stem or "/" in stem or not re.fullmatch(r"[\w.а-яА-ЯёЁ -]+", stem):
+    if not _valid_stem(stem):
         raise HTTPException(404)
     path = (cfg.base_markdown / stem / f"{stem}.md").resolve()
     if cfg.base_markdown.resolve() not in path.parents or not path.is_file():

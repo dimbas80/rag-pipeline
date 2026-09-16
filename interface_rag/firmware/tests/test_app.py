@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import yaml
@@ -721,6 +722,69 @@ def test_markdown_put_updates_file(monkeypatch, tmp_path):
     # неизвестный stem → 404, traversal не проходит
     assert client.put("/api/files/markdown/nope", json={"content": "x"}).status_code == 404
     assert client.put("/api/files/markdown/../etc", json={"content": "x"}).status_code in (404, 307)
+
+
+# --- имена документов вне старого белого списка: NBSP, запятая, скобки ---
+# Регрессия: «ГОСТ Р 50571.5.52-2011» (неразрывный пробел \xa0) и
+# «Приказ N536 …Оборудования, работающего…» (запятая) — GET/PUT markdown
+# отдавали 404-JSON, из-за чего «Просмотр.md» молча пуст, а «Скачать.md»
+# скачивал JSON. Скобки покрывают «Циркуляр Ц-02-98(Э)…» и «N 87 (ред. …)».
+
+def test_valid_stem_accepts_real_document_names_with_special_chars():
+    assert app._valid_stem("ГОСТ Р\xa0 50571.5.52-2011 электропроводки") is True
+    assert app._valid_stem("Приказ N536 ФНП ПБ Оборудования, работающего под избыточным давлением") is True
+    assert app._valid_stem("Циркуляр Ц-02-98(Э) О проверке кабелей") is True
+
+
+def test_valid_stem_still_rejects_unsafe_names():
+    for bad in ("../evil", "a/b", "a\\b", "..", "", ".hidden", "x\x00y", "a\x1fb",
+                "x\x85y", "a\u200bz", "a\u202eb"):
+        assert app._valid_stem(bad) is False, f"ожидался отказ для stem={bad!r}"
+
+
+def test_markdown_get_serves_files_with_special_char_stems(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    stem = "Приказ N536 ФНП ПБ Оборудования, работающего под избыточным давлением"
+    doc_dir = tmp_path / "Markdown" / stem
+    doc_dir.mkdir(parents=True)
+    (doc_dir / f"{stem}.md").write_text("# Приказ N536\n", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.get("/api/files/markdown/" + quote(stem))
+    assert response.status_code == 200
+    assert "Приказ N536" in response.text
+    # скобки браузер (encodeURIComponent) не кодирует — проверяем «сырой» вариант
+    parens = "Циркуляр Ц-02-98(Э) О проверке кабелей"
+    parens_dir = tmp_path / "Markdown" / parens
+    parens_dir.mkdir(parents=True)
+    (parens_dir / f"{parens}.md").write_text("# Ц-02-98(Э)\n", encoding="utf-8")
+    assert "Ц-02-98(Э)" in client.get(f"/api/files/markdown/{parens}").text
+
+
+def test_markdown_put_updates_file_with_special_char_stem(monkeypatch, tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    monkeypatch.setattr(app, "cfg", cfg)
+    stem = "ГОСТ Р\xa0 50571.5.52-2011 электропроводки"
+    doc_dir = tmp_path / "Markdown" / stem
+    doc_dir.mkdir(parents=True)
+    (doc_dir / f"{stem}.md").write_text("старый текст", encoding="utf-8")
+    client = TestClient(app.app)
+    response = client.put("/api/files/markdown/" + quote(stem), json={"content": "# Новый текст\n"})
+    assert response.status_code == 200
+    assert (doc_dir / f"{stem}.md").read_text(encoding="utf-8") == "# Новый текст\n"
+
+
+def test_delete_result_accepts_special_char_stem(tmp_path):
+    cfg = _fake_cfg(tmp_path)
+    stem = "Приказ N536 ФНП ПБ Оборудования, работающего под избыточным давлением"
+    md_dir = cfg.base_markdown / stem
+    (md_dir / "image").mkdir(parents=True)
+    (md_dir / "table_images.json").write_text("{}", encoding="utf-8")
+    (md_dir / f"{stem}.md").write_text("# doc", encoding="utf-8")
+    result = app._delete_result(cfg, stem)
+    assert result["removed"] == 2
+    assert not (md_dir / "image").exists()
+    assert (md_dir / f"{stem}.md").is_file()
 
 
 # --- обзор каталогов сервера для выбора папок в UI ---
