@@ -1983,7 +1983,10 @@ def _apply_headings_to_md(md_text: str, headings: list[dict] | None = None) -> s
             continue
         pattern = r"\*\*" + re.escape(full_text) + r"\*\*"
         replacement = "#" * (level + 1) + " " + full_text
-        md_text = re.sub(pattern, replacement, md_text, count=1)
+        # callable-replacement: full_text из OCR может содержать бэкс-слэши
+        # (LaTeX от math-markdown, напр. \mathrm) — как шаблон re.sub они
+        # падают с re.error: bad escape (\m). Через лямбду текст литерален.
+        md_text = re.sub(pattern, lambda _m: replacement, md_text, count=1)
 
     return md_text
 

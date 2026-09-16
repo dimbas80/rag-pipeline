@@ -224,6 +224,30 @@ def test_apply_headings_special_chars_escaped():
     assert "### 3.2. Формула a+b (важно!)" in result
 
 
+def test_apply_headings_latex_backslash_in_text():
+    """Регресс (ГОСТ Р 50571.5.52-2011): LaTeX в full_text из math-markdown OCR.
+
+    Replacement в re.sub — шаблон: '\\mathrm' вызывал
+    re.error: bad escape \\m at position 11. Бэкс-слэши должны быть литеральными.
+    """
+    full_text = "3 $D _ {\\mathrm {e}}$ — внешний диаметр кабеля."
+    md = "текст\n\n**3 $D _ {\\mathrm {e}}$ — внешний диаметр кабеля.**\n"
+    headings = [{"level": 1, "full_text": full_text}]
+    result = create_markdown._apply_headings_to_md(md, headings)
+    assert f"## {full_text}" in result
+    assert f"**{full_text}**" not in result
+
+
+def test_apply_headings_backreference_sequence_literal():
+    """full_text с последовательностью вида \\1 — не backreference, литерал."""
+    full_text = "3.2 \\1 — ссылка на группу"
+    md = "**3.2 \\1 — ссылка на группу**\n"
+    headings = [{"level": 2, "full_text": full_text}]
+    result = create_markdown._apply_headings_to_md(md, headings)
+    assert f"### {full_text}" in result
+    assert f"**{full_text}**" not in result
+
+
 def test_apply_headings_empty_list():
     """headings пуст → md без изменений."""
     md = "**3. ЗАЩИТА**\n"
