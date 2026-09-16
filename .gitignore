@@ -10,6 +10,7 @@ deploy.conf
 workflows/
 docs/
 .hermes/
+AGENTS.md
 
 # Python
 __pycache__/
